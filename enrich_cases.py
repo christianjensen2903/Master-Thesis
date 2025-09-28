@@ -1,17 +1,21 @@
 import argparse
 import json
-import re
 from pathlib import Path
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup
 from typing import Any
-import requests
+from tqdm import tqdm
 
 
 def load_html(case_id: str) -> BeautifulSoup | None:
-    url = f"https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:{case_id}"
-    response = requests.get(url)
-    response.raise_for_status()
-    return BeautifulSoup(response.text, "html.parser")
+    file_path = Path(f"html/{case_id}.html")
+    if not file_path.exists():
+        print(f"HTML file for case {case_id} not found.")
+        return None
+
+    with file_path.open("r", encoding="utf-8") as file:
+        html_content = file.read()
+
+    return BeautifulSoup(html_content, "html.parser")
 
 
 def extract_sections_from_soup(soup: BeautifulSoup) -> dict[str, Any]:
@@ -39,6 +43,10 @@ def enrich_case(case_id: str, case_data: dict) -> dict:
         return case_data
 
     sections = extract_sections_from_soup(soup)
+    # meta["new_keywords"] = sections.get("keywords", "")
+    # meta["summary"] = sections.get("summary", "")
+    # meta["subject_of_the_case"] = sections.get("subject_of_the_case", "")
+    # meta["operative_part"] = sections.get("operative_part", "")
     meta["sections"] = sections
 
     case_data["meta"] = meta
@@ -74,7 +82,7 @@ def main() -> None:
         data = json.load(f)
 
     updated = {}
-    for case_id, case_data in list(data.items())[:10]:
+    for case_id, case_data in tqdm(list(data.items()), desc="Enriching cases"):
         updated[case_id] = enrich_case(case_id, case_data)
 
     with out_path.open("w", encoding="utf-8") as f:
