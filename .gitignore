@@ -2,3 +2,5 @@
 .mypy_cache
 .env
 html
+*.json
+*.xlsx
