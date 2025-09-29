@@ -1,44 +1,14 @@
 import pandas as pd
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import linear_kernel
 from tqdm import tqdm
+from langchain_core.retrievers import BaseRetriever
+from langchain_community.retrievers import TFIDFRetriever
+from langchain_core.documents import Document
 
 
-class TimeFilteredTFIDFRetriever:
-    def __init__(
-        self,
-        texts: list[str],
-        ids: list[str],
-        celex: list[str],
-        dates: list[pd.Timestamp],
-        lowercase=True,
-    ):
-        self.texts = [t if isinstance(t, str) else "" for t in texts]
-        self.ids = np.array(ids)
-        self.celex = np.array(celex)
-        self.dates = np.array(pd.to_datetime(dates))
-        self.vectorizer = TfidfVectorizer(lowercase=lowercase)
-        self.X = self.vectorizer.fit_transform(self.texts)
-
-    def _mask_for_query(self, q_celex: str, q_date: pd.Timestamp) -> np.ndarray:
-        return (self.dates <= q_date) & (self.celex != q_celex)
-
-    def get_topk(
-        self, query_text: str, q_celex: str, q_date: pd.Timestamp, k: int = 10
-    ) -> list[str]:
-        qv = self.vectorizer.transform(
-            [query_text if isinstance(query_text, str) else ""]
-        )
-        scores = linear_kernel(qv, self.X).ravel()
-        mask = self._mask_for_query(q_celex, q_date)
-        scores[~mask] = -1.0
-        order = np.argsort(-scores)
-        return self.ids[order][:k].tolist()
-
-
-def build_candidate_pool(df: pd.DataFrame) -> pd.DataFrame:
-    # Unique TO paragraphs
+def build_candidate_pool(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> pd.DataFrame:
+    """
+    Returns unique TO paragraphs. If cutoff_date is provided, only keep candidates strictly before it.
+    """
     cands = (
         df[["CELEX_TO", "NUMBER_TO", "DATE_TO", "TEXT_TO", "TITLE_TO", "to_id"]]
         .drop_duplicates("to_id")
@@ -55,6 +25,7 @@ def build_candidate_pool(df: pd.DataFrame) -> pd.DataFrame:
         inplace=True,
     )
     cands["DATE"] = pd.to_datetime(cands["DATE"])
+    cands = cands.loc[cands["DATE"] < cutoff_date].copy()
     return cands.reset_index(drop=True)
 
 
@@ -88,8 +59,13 @@ def build_queries(df: pd.DataFrame) -> pd.DataFrame:
     return queries.reset_index(drop=True)
 
 
+def build_rel_map(df: pd.DataFrame) -> dict[str, set[str]]:
+    """Ground truth: FROM para -> set(TO para ids)."""
+    return df.groupby("from_id")["to_id"].apply(lambda s: set(s.astype(str))).to_dict()
+
+
 def average_precision_at_k(ranked_ids: list[str], relevant: set[str], k: int) -> float:
-    if len(relevant) == 0:
+    if not relevant:
         return 0.0
     hits = 0
     precisions = []
@@ -97,16 +73,28 @@ def average_precision_at_k(ranked_ids: list[str], relevant: set[str], k: int) ->
         if rid in relevant:
             hits += 1
             precisions.append(hits / i)
-    return sum(precisions) / len(relevant) if precisions else 0.0
+    return (sum(precisions) / len(relevant)) if precisions else 0.0
 
 
 def eval_retriever(
-    retriever: TimeFilteredTFIDFRetriever,
+    retriever: BaseRetriever,
     queries: pd.DataFrame,
     rel_map: dict[str, set[str]],
     k_list: list[int],
     cutoff_date: pd.Timestamp,
+    cands: pd.DataFrame,
 ) -> pd.DataFrame:
+    """
+    - Evaluates only queries ON/AFTER the cutoff_date (typical temporal eval setup).
+    - Candidate pool is STRICTLY pre-cutoff (already enforced in `cands`).
+    - Citations (ground truth) to post-cutoff targets are ignored automatically because they’re not in the pool.
+    - Also excludes same-CELEX targets to prevent trivial self-matches.
+    """
+    cutoff_date = pd.to_datetime(cutoff_date)
+
+    # Allowed targets (strictly pre-cutoff)
+    allowed_ids: set[str] = set(cands["to_id"].astype(str))
+
     eval_mask = queries["DATE"] >= cutoff_date
     q_eval = queries.loc[eval_mask].copy()
 
@@ -114,33 +102,27 @@ def eval_retriever(
     num_used = 0
 
     for _, q in tqdm(q_eval.iterrows(), total=len(q_eval)):
-        qid = q["QID"]
-        qdate = q["DATE"]
-        qcelex = q["CELEX"]
-        qtext = q["TEXT"] if isinstance(q["TEXT"], str) else ""
+        qid: str = q["QID"]
+        qcelex: str = q["CELEX"]
+        qtext: str = q["TEXT"]
 
-        # Filter relevant to those available (<= date and not same celex)
-        mask = retriever._mask_for_query(qcelex, qdate)
-        allowed_ids = set(retriever.ids[mask].tolist())
-        relevant_all = rel_map.get(qid, set())
-        relevant_allowed = relevant_all & allowed_ids
+        relevant_all: set[str] = rel_map.get(qid, set())
+        relevant_allowed: set[str] = {rid for rid in relevant_all if rid in allowed_ids}
 
-        if len(relevant_allowed) == 0:
-            print(f"No relevant to_ids for query {qid}")
+        if not relevant_allowed:
+            # No usable ground truth under the pre-cutoff constraint → skip
             continue
 
         num_used += 1
 
-        # Rank once (with large K to cover max asked k)
-        max_k = max(k_list)
-        ranked = retriever.get_topk(qtext, qcelex, qdate, k=max_k)
+        ranked_docs = retriever.invoke(qtext)
+        ranked_ids = [doc.metadata["id"] for doc in ranked_docs]
 
         for k in k_list:
-            topk = ranked[:k]
-            num_hits = sum(1 for rid in topk if rid in relevant_allowed)
-            prec = num_hits / k
-            rec = num_hits / len(relevant_allowed)
-            ap = average_precision_at_k(ranked, relevant_allowed, k)
+            hits = sum(1 for rid in ranked_ids if rid in relevant_allowed)
+            prec = hits / k
+            rec = hits / len(relevant_allowed)
+            ap = average_precision_at_k(ranked_ids, relevant_allowed, k)
             rows.append(
                 {
                     "QID": qid,
@@ -149,13 +131,23 @@ def eval_retriever(
                     "Recall@k": rec,
                     "AP@k": ap,
                     "num_relevant": len(relevant_allowed),
-                    "query_date": qdate,
+                    "query_date": q["DATE"],
                     "query_celex": qcelex,
                 }
             )
 
     if not rows:
-        return pd.DataFrame([], columns=["k", "Precision@k", "Recall@k", "AP@k"])
+        return pd.DataFrame(
+            [],
+            columns=[
+                "k",
+                "Precision@k",
+                "Recall@k",
+                "MAP@k",
+                "Avg #Relevant",
+                "Queries evaluated",
+            ],
+        )
 
     df_rows = pd.DataFrame(rows)
     summary = (
@@ -176,26 +168,22 @@ def eval_retriever(
 
 
 def main():
-    cutoff_date = "2018-01-01"
+    cutoff_date = pd.Timestamp("2018-01-01")  # pre-2018 candidates only
     k_list = [10, 50, 100]
-    sample = None
+    sample: Optional[int] = None  # e.g., 500 for a quick run
 
     df = pd.read_csv("data/clean_data.csv")
-    # df = pd.read_excel("data/par-to-par-2.xlsx")
-    # df = df.dropna()
-    # Build IDs
+
+    # Normalize types / IDs
     df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
     df["DATE_TO"] = pd.to_datetime(df["DATE_TO"])
     df["from_id"] = df["CELEX_FROM"].astype(str) + "::" + df["NUMBER_FROM"].astype(str)
     df["to_id"] = df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
 
-    # Candidate paragraphs (TO)
-    cands = build_candidate_pool(df)
-    # Query paragraphs (FROM)
-    queries = build_queries(df)
-
+    # Build pools
+    cands = build_candidate_pool(df, cutoff_date=cutoff_date)  # STRICTLY pre-2018
+    queries = build_queries(df)  # all queries
     if sample and sample > 0:
-        # Apply sampling AFTER cutoff filtering to ensure the sample is from the evaluation subset
         mask_cut = queries["DATE"] >= cutoff_date
         qcut = queries.loc[mask_cut]
         queries = pd.concat(
@@ -205,20 +193,31 @@ def main():
             ]
         ).reset_index(drop=True)
 
-    # Ground truth map: query -> set of relevant to_ids
-    rel_map = (
-        df.groupby("from_id")["to_id"].apply(lambda s: set(s.astype(str))).to_dict()
-    )
+    rel_map = build_rel_map(df)
 
-    # Build retriever
-    retriever = TimeFilteredTFIDFRetriever(
-        texts=cands["TEXT"].fillna("").tolist(),
-        ids=cands["to_id"].tolist(),
-        celex=cands["CELEX"].astype(str).tolist(),
-        dates=pd.to_datetime(cands["DATE"]).tolist(),
+    retriever = TFIDFRetriever.from_documents(
+        documents=[
+            Document(
+                page_content=text, metadata={"id": id, "celex": celex, "date": date}
+            )
+            for text, id, celex, date in zip(
+                cands["TEXT"].tolist(),
+                cands["to_id"].tolist(),
+                cands["CELEX"].astype(str).tolist(),
+                pd.to_datetime(cands["DATE"]).tolist(),
+            )
+        ]
     )
+    retriever.k = max(k_list)
 
-    summary = eval_retriever(retriever, queries, rel_map, k_list, cutoff_date)
+    summary = eval_retriever(
+        retriever=retriever,
+        queries=queries,
+        rel_map=rel_map,
+        k_list=k_list,
+        cutoff_date=cutoff_date,
+        cands=cands,
+    )
     print(summary.to_string(index=False))
 
 
