@@ -10,8 +10,8 @@ from langchain_core.documents import Document
 def build_candidate_pool(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> list[Document]:
     """Build the candidate pool of unique target paragraphs strictly before a cutoff date."""
     cands = (
-        df[["CELEX_TO", "NUMBER_TO", "DATE_TO", "TEXT_TO", "TITLE_TO", "to_id"]]
-        .drop_duplicates("to_id")
+        df[["CELEX_TO", "NUMBER_TO", "DATE_TO", "TEXT_TO", "TITLE_TO", "TO_ID"]]
+        .drop_duplicates("TO_ID")
         .copy()
     )
     cands.rename(
@@ -29,13 +29,13 @@ def build_candidate_pool(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> list[Do
     return [
         Document(
             page_content=row["TEXT"],
-            metadata={"id": row["to_id"], "celex": row["CELEX"], "date": row["DATE"]},
+            metadata={"id": row["TO_ID"], "celex": row["CELEX"], "date": row["DATE"]},
         )
         for _, row in cands.reset_index(drop=True).iterrows()
     ]
 
 
-def build_queries(df: pd.DataFrame) -> pd.DataFrame:
+def build_queries(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> pd.DataFrame:
     """Build the unique query set from FROM-side paragraphs."""
     queries = (
         df[
@@ -45,10 +45,10 @@ def build_queries(df: pd.DataFrame) -> pd.DataFrame:
                 "DATE_FROM",
                 "TEXT_FROM",
                 "TITLE_FROM",
-                "from_id",
+                "FROM_ID",
             ]
         ]
-        .drop_duplicates("from_id")
+        .drop_duplicates("FROM_ID")
         .copy()
     )
     queries.rename(
@@ -58,17 +58,18 @@ def build_queries(df: pd.DataFrame) -> pd.DataFrame:
             "DATE_FROM": "DATE",
             "TEXT_FROM": "TEXT",
             "TITLE_FROM": "TITLE",
-            "from_id": "QID",
+            "FROM_ID": "QID",
         },
         inplace=True,
     )
     queries["DATE"] = pd.to_datetime(queries["DATE"])
+    queries = queries.loc[queries["DATE"] >= cutoff_date].copy()
     return queries.reset_index(drop=True)
 
 
 def build_rel_map(df: pd.DataFrame) -> dict[str, set[str]]:
     """Ground truth mapping from query id to the set of relevant target ids."""
-    return df.groupby("from_id")["to_id"].apply(lambda s: set(s.astype(str))).to_dict()
+    return df.groupby("FROM_ID")["TO_ID"].apply(lambda s: set(s.astype(str))).to_dict()
 
 
 def average_precision_at_k(ranked_ids: list[str], relevant: set[str], k: int) -> float:
@@ -183,12 +184,12 @@ def main() -> None:
     # Normalize types / IDs
     df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
     df["DATE_TO"] = pd.to_datetime(df["DATE_TO"])
-    df["from_id"] = df["CELEX_FROM"].astype(str) + "::" + df["NUMBER_FROM"].astype(str)
-    df["to_id"] = df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
+    df["FROM_ID"] = df["CELEX_FROM"].astype(str) + "::" + df["NUMBER_FROM"].astype(str)
+    df["TO_ID"] = df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
 
     # Build pools
     cands = build_candidate_pool(df, cutoff_date=cutoff_date)  # strictly pre-cutoff
-    queries = build_queries(df)  # all queries
+    queries = build_queries(df, cutoff_date=cutoff_date)
     print(f"Candidates: {len(cands)}, Queries: {len(queries)}")
 
     if sample and sample > 0:
@@ -204,7 +205,10 @@ def main() -> None:
 
     rel_map = build_rel_map(df)
 
-    retriever = TFIDFRetriever.from_documents(documents=cands)
+    retriever = TFIDFRetriever.from_documents(
+        documents=cands,
+        tfidf_params={"stop_words": "english", "strip_accents": "ascii"},
+    )
     # Retrieve the full ranking to compute full MAP
     retriever.k = len(cands)
 
