@@ -102,6 +102,7 @@ def eval_retriever(
 
     rows: list[dict[str, Any]] = []
     num_used = 0
+    ap_full_values: list[float] = []
 
     for _, q in tqdm(q_eval.iterrows(), total=len(q_eval)):
         qid: str = q["QID"]
@@ -121,6 +122,10 @@ def eval_retriever(
         ranked_ids_raw = [doc.metadata["id"] for doc in ranked_docs]
         ranked_ids = [rid for rid in ranked_ids_raw if rid in allowed_ids]
 
+        # Full-list AP (no truncation)
+        ap_full = average_precision_at_k(ranked_ids, relevant_allowed, len(ranked_ids))
+        ap_full_values.append(ap_full)
+
         for k in k_list:
             top_k_ids = ranked_ids[:k]
             hits = sum(1 for rid in top_k_ids if rid in relevant_allowed)
@@ -134,6 +139,7 @@ def eval_retriever(
                     "Precision@k": prec,
                     "Recall@k": rec,
                     "AP@k": ap,
+                    "AP_full": ap_full,
                     "num_relevant": len(relevant_allowed),
                     "query_date": q["DATE"],
                     "query_celex": qcelex,
@@ -148,11 +154,18 @@ def eval_retriever(
                 "Precision@k": "mean",
                 "Recall@k": "mean",
                 "AP@k": "mean",
+                "AP_full": "mean",
                 "num_relevant": "mean",
             }
         )
         .reset_index()
-        .rename(columns={"AP@k": "MAP@k", "num_relevant": "Avg #Relevant"})
+        .rename(
+            columns={
+                "AP@k": "MAP@k",
+                "AP_full": "MAP_full",
+                "num_relevant": "Avg #Relevant",
+            }
+        )
     )
     summary["Queries evaluated"] = num_used
     return summary
@@ -192,7 +205,8 @@ def main() -> None:
     rel_map = build_rel_map(df)
 
     retriever = TFIDFRetriever.from_documents(documents=cands)
-    retriever.k = max(k_list)
+    # Retrieve the full ranking to compute full MAP
+    retriever.k = len(cands)
 
     summary = eval_retriever(
         retriever=retriever,
@@ -203,6 +217,10 @@ def main() -> None:
         cands=cands,
     )
     print(summary.to_string(index=False))
+    # Also report Full MAP (untruncated)
+    if not summary.empty:
+        map_full = float(summary["MAP_full"].iloc[0])
+        print(f"\nFull MAP: {map_full:.4f}")
 
 
 if __name__ == "__main__":
