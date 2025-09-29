@@ -1,6 +1,8 @@
 .venv
 .mypy_cache
 .env
-html
+cases
+summaries
 *.json
 *.xlsx
+*.csv
