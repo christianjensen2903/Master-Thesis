@@ -1,11 +1,13 @@
+# pyright: reportMissingTypeStubs=false
 from typing import Any
+import math
 
 import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
 from langchain_core.documents import Document
 from retrievers import TFIDFRetriever, BaseRetriever, BM25Retriever, preprocess_utils
 from nltk.corpus import stopwords  # type: ignore
-import nltk
+import nltk  # type: ignore
 
 nltk.download("stopwords")
 
@@ -88,6 +90,27 @@ def average_precision_at_k(ranked_ids: list[str], relevant: set[str], k: int) ->
     return (sum(precisions) / len(relevant)) if precisions else 0.0
 
 
+def ndcg_at_k(ranked_ids: list[str], relevant: set[str], k: int) -> float:
+    """Compute nDCG@k for a ranked list with binary relevance.
+
+    Uses DCG with gains of 1 for relevant documents and 0 otherwise, and
+    discounts by log2(rank + 1). Normalizes by the ideal DCG at k.
+    """
+    if not relevant:
+        return 0.0
+
+    # DCG@k
+    dcg: float = 0.0
+    for i, rid in enumerate(ranked_ids[:k], start=1):
+        gain = 1.0 if rid in relevant else 0.0
+        dcg += gain / math.log2(i + 1)
+
+    # IDCG@k: best-case ranking has all relevant up front
+    ideal_hits = min(len(relevant), k)
+    idcg: float = sum(1.0 / math.log2(i + 1) for i in range(1, ideal_hits + 1))
+    return (dcg / idcg) if idcg > 0 else 0.0
+
+
 def eval_retriever(
     retriever: BaseRetriever,
     queries: pd.DataFrame,
@@ -128,6 +151,9 @@ def eval_retriever(
                 "k": k_list,
                 "Precision@k": 0.0,
                 "Recall@k": 0.0,
+                "F1@k": 0.0,
+                "nDCG@k": 0.0,
+                "MAP@k": 0.0,
                 "Avg #Relevant": 0.0,
                 "Queries evaluated": 0,
             }
@@ -152,12 +178,18 @@ def eval_retriever(
             hits = sum(1 for rid in top_k_ids if rid in relevant_allowed)
             prec = hits / k
             rec_k = hits / len(relevant_allowed)
+            f1_k = (2 * prec * rec_k / (prec + rec_k)) if (prec + rec_k) > 0 else 0.0
+            ap_k = average_precision_at_k(ranked_ids, relevant_allowed, k)
+            ndcg_k = ndcg_at_k(ranked_ids, relevant_allowed, k)
             rows.append(
                 {
                     "QID": rec["qid"],
                     "k": k,
                     "Precision@k": prec,
                     "Recall@k": rec_k,
+                    "F1@k": f1_k,
+                    "nDCG@k": ndcg_k,
+                    "AP@k": ap_k,
                     "num_relevant": len(relevant_allowed),
                     "query_date": rec["qdate"],
                     "query_celex": rec["qcelex"],
@@ -171,6 +203,9 @@ def eval_retriever(
             {
                 "Precision@k": "mean",
                 "Recall@k": "mean",
+                "F1@k": "mean",
+                "nDCG@k": "mean",
+                "AP@k": "mean",
                 "num_relevant": "mean",
             }
         )
@@ -178,6 +213,7 @@ def eval_retriever(
         .rename(
             columns={
                 "num_relevant": "Avg #Relevant",
+                "AP@k": "MAP@k",
             }
         )
     )
@@ -189,8 +225,7 @@ def main() -> None:
     """Run TF-IDF retrieval evaluation with temporal cutoff and report summary metrics."""
 
     cutoff_date = pd.Timestamp("2018-01-01")  # pre-2018 candidates only
-    k_list = [10, 50, 100]
-    sample: int | None = None  # e.g., 500 for a quick run
+    k_list = [5, 10, 50, 100]
 
     df = pd.read_csv("data/clean_data.csv")
 
@@ -205,17 +240,6 @@ def main() -> None:
     queries = build_queries(df, cutoff_date=cutoff_date)
     print(f"Candidates: {len(cands)}, Queries: {len(queries)}")
 
-    if sample and sample > 0:
-        mask_cut = queries["DATE"] >= cutoff_date
-        qcut = queries.loc[mask_cut]
-        queries = pd.concat(
-            [
-                queries.loc[~mask_cut],
-                qcut.sample(n=min(sample, len(qcut)), random_state=42),
-            ]
-        ).reset_index(drop=True)
-        print(f"Downsampled post-cutoff queries to {queries.loc[mask_cut].shape[0]}")
-
     rel_map = build_rel_map(df)
 
     retriever = BM25Retriever(
@@ -223,7 +247,19 @@ def main() -> None:
         preprocess=preprocess_utils.compose(
             preprocess_utils.lowercase(),
             preprocess_utils.remove_punctuation(),
-            preprocess_utils.stopword_filter(stopwords=set(stopwords.words("english"))),
+            preprocess_utils.stopword_filter(
+                stopwords=set(
+                    stopwords.words("english")
+                    + [
+                        "<DATE>",
+                        "<QUOTED_TEXT>",
+                        "<ECLI>",
+                        "<ECR>",
+                        "<PARAGRAPH>",
+                        "<CASE>",
+                    ]
+                ),
+            ),
         ),
     )
 
