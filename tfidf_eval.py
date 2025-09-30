@@ -2,9 +2,8 @@ from typing import Any
 
 import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
-from langchain_core.retrievers import BaseRetriever
-from langchain_community.retrievers import TFIDFRetriever
 from langchain_core.documents import Document
+from retrievers import TFIDFRetriever, BaseRetriever, BM25Retriever
 
 
 def build_candidate_pool(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> list[Document]:
@@ -101,49 +100,70 @@ def eval_retriever(
     eval_mask = queries["DATE"] >= cutoff_date
     q_eval = queries.loc[eval_mask].copy()
 
-    rows: list[dict[str, Any]] = []
-    num_used = 0
-    ap_full_values: list[float] = []
-
-    for _, q in tqdm(q_eval.iterrows(), total=len(q_eval)):
+    # Build the list of evaluable queries (must have at least one allowed relevant)
+    eval_records: list[dict[str, Any]] = []
+    for _, q in q_eval.iterrows():
         qid: str = q["QID"]
-        qcelex: str = q["CELEX"]
-        qtext: str = q["TEXT"]
-
         relevant_all: set[str] = rel_map.get(qid, set())
         relevant_allowed: set[str] = {rid for rid in relevant_all if rid in allowed_ids}
-
         if not relevant_allowed:
-            # No usable ground truth under the pre-cutoff constraint → skip
             continue
+        eval_records.append(
+            {
+                "qid": qid,
+                "qtext": str(q["TEXT"]),
+                "qcelex": str(q["CELEX"]),
+                "qdate": q["DATE"],
+                "relevant_allowed": relevant_allowed,
+            }
+        )
 
-        num_used += 1
+    if not eval_records:
+        return pd.DataFrame(
+            {
+                "k": k_list,
+                "Precision@k": 0.0,
+                "Recall@k": 0.0,
+                "MAP@k": 0.0,
+                "MAP_full": 0.0,
+                "Avg #Relevant": 0.0,
+                "Queries evaluated": 0,
+            }
+        )
 
-        ranked_docs = retriever.invoke(qtext)
+    # Batch retrieve a full ranking for each query
+    q_texts = [r["qtext"] for r in eval_records]
+    full_k = len(cands)
+    batch_ranked_docs = retriever.get_relevant_documents_batch(q_texts, k=full_k)
+
+    rows: list[dict[str, Any]] = []
+    num_used = len(eval_records)
+    for rec, ranked_docs in tqdm(
+        zip(eval_records, batch_ranked_docs), desc="Evaluating", total=len(eval_records)
+    ):
         ranked_ids_raw = [doc.metadata["id"] for doc in ranked_docs]
         ranked_ids = [rid for rid in ranked_ids_raw if rid in allowed_ids]
+        relevant_allowed = rec["relevant_allowed"]
 
-        # Full-list AP (no truncation)
         ap_full = average_precision_at_k(ranked_ids, relevant_allowed, len(ranked_ids))
-        ap_full_values.append(ap_full)
 
         for k in k_list:
             top_k_ids = ranked_ids[:k]
             hits = sum(1 for rid in top_k_ids if rid in relevant_allowed)
             prec = hits / k
-            rec = hits / len(relevant_allowed)
+            rec_k = hits / len(relevant_allowed)
             ap = average_precision_at_k(top_k_ids, relevant_allowed, k)
             rows.append(
                 {
-                    "QID": qid,
+                    "QID": rec["qid"],
                     "k": k,
                     "Precision@k": prec,
-                    "Recall@k": rec,
+                    "Recall@k": rec_k,
                     "AP@k": ap,
                     "AP_full": ap_full,
                     "num_relevant": len(relevant_allowed),
-                    "query_date": q["DATE"],
-                    "query_celex": qcelex,
+                    "query_date": rec["qdate"],
+                    "query_celex": rec["qcelex"],
                 }
             )
 
@@ -205,12 +225,10 @@ def main() -> None:
 
     rel_map = build_rel_map(df)
 
-    retriever = TFIDFRetriever.from_documents(
+    retriever = BM25Retriever(
         documents=cands,
-        tfidf_params={"stop_words": "english", "strip_accents": "ascii"},
+        # tfidf_params={"stop_words": "english"},
     )
-    # Retrieve the full ranking to compute full MAP
-    retriever.k = len(cands)
 
     summary = eval_retriever(
         retriever=retriever,

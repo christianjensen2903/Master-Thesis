@@ -6,3 +6,4 @@ summaries
 *.json
 *.xlsx
 *.csv
+*.pyc
