@@ -6,7 +6,7 @@ Uses scikit-learn's `TfidfVectorizer` and sparse matrix operations to score
 all documents against many queries at once.
 """
 
-from typing import Any
+from typing import Any, Callable
 import logging
 
 import numpy as np
@@ -43,10 +43,11 @@ class TFIDFRetriever(BaseRetriever):
         *,
         tfidf_params: dict[str, Any] | None = None,
         normalize_scores: bool = True,
+        preprocess: Callable[[str], str] | None = None,
     ) -> None:
-        super().__init__(documents)
+        super().__init__(documents, preprocess=preprocess)
         self._vectorizer = TfidfVectorizer(**(tfidf_params or {}))
-        corpus = [doc.page_content for doc in documents]
+        corpus = [self.preprocess(doc.page_content) for doc in documents]
         # Fit on the candidate corpus once
         self._doc_matrix: csr_matrix = self._vectorizer.fit_transform(corpus).tocsr()
         self._normalize_scores = normalize_scores
@@ -63,7 +64,10 @@ class TFIDFRetriever(BaseRetriever):
             return [[] for _ in queries]
 
         # Vectorize all queries at once using the fitted vocabulary
-        query_matrix: csr_matrix = self._vectorizer.transform(queries).tocsr()
+        preprocessed_queries = [self.preprocess(q) for q in queries]
+        query_matrix: csr_matrix = self._vectorizer.transform(
+            preprocessed_queries
+        ).tocsr()
 
         # Scores are cosine similarities because rows are L2-normalized by default
         scores: csr_matrix = query_matrix @ self._doc_matrix.T  # shape (Q, D)

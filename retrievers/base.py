@@ -8,7 +8,7 @@ performance and may rely on the default single-query wrapper.
 """
 
 from abc import ABC, abstractmethod
-from typing import Iterable
+from typing import Callable, Iterable
 import logging
 
 from langchain_core.documents import Document
@@ -26,7 +26,12 @@ class BaseRetriever(ABC):
     implementation.
     """
 
-    def __init__(self, documents: list[Document]) -> None:
+    def __init__(
+        self,
+        documents: list[Document],
+        *,
+        preprocess: Callable[[str], str] | None = None,
+    ) -> None:
         """Initialize the retriever with a fixed candidate set.
 
         Parameters
@@ -40,12 +45,31 @@ class BaseRetriever(ABC):
             logger.error(msg)
             raise ValueError(msg)
         self._documents: list[Document] = documents
+        # Preprocessing hook applied to raw text prior to tokenization/vectorization
+        # This enables custom stopword removal, stemming, normalization, etc.
+        self._preprocess: Callable[[str], str] = preprocess or (lambda s: s)
 
     @property
     def documents(self) -> list[Document]:
         """Return the underlying candidate documents."""
 
         return self._documents
+
+    def preprocess(self, text: str) -> str:
+        """Apply the configured preprocessing to raw text.
+
+        Parameters
+        ----------
+        text
+            The input text to normalize.
+
+        Returns
+        -------
+        str
+            The preprocessed text.
+        """
+
+        return self._preprocess(text)
 
     @abstractmethod
     def get_relevant_documents_batch(

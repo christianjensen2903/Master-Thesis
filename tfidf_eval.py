@@ -3,7 +3,11 @@ from typing import Any
 import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
 from langchain_core.documents import Document
-from retrievers import TFIDFRetriever, BaseRetriever, BM25Retriever
+from retrievers import TFIDFRetriever, BaseRetriever, BM25Retriever, preprocess_utils
+from nltk.corpus import stopwords  # type: ignore
+import nltk
+
+nltk.download("stopwords")
 
 
 def build_candidate_pool(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> list[Document]:
@@ -216,7 +220,11 @@ def main() -> None:
 
     retriever = BM25Retriever(
         documents=cands,
-        # tfidf_params={"stop_words": "english"},
+        preprocess=preprocess_utils.compose(
+            preprocess_utils.lowercase(),
+            preprocess_utils.remove_punctuation(),
+            preprocess_utils.stopword_filter(stopwords=set(stopwords.words("english"))),
+        ),
     )
 
     summary = eval_retriever(

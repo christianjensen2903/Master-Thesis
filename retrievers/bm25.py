@@ -69,9 +69,16 @@ class BM25Retriever(BaseRetriever):
         b: float = 0.75,
         epsilon: float = 0.25,
         show_progress: bool = True,
+        preprocess: Callable[[str], str] | None = None,
     ) -> None:
-        super().__init__(documents)
-        self._tokenizer: Callable[[str], list[str]] = tokenizer or _default_tokenizer
+        super().__init__(documents, preprocess=preprocess)
+        base_tokenizer: Callable[[str], list[str]] = tokenizer or _default_tokenizer
+
+        def _combined_tokenizer(text: str) -> list[str]:
+            processed = self.preprocess(text)
+            return base_tokenizer(processed)
+
+        self._tokenizer: Callable[[str], list[str]] = _combined_tokenizer
         self._show_progress = show_progress
 
         corpus_tokens: list[list[str]] = [

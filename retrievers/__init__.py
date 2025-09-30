@@ -7,5 +7,11 @@ includes TF-IDF and BM25 implementations optimized for batch querying.
 from .base import BaseRetriever  # type: ignore
 from .tfidf import TFIDFRetriever  # type: ignore
 from .bm25 import BM25Retriever  # type: ignore
+from . import preprocess as preprocess_utils  # type: ignore
 
-__all__ = ["BaseRetriever", "TFIDFRetriever", "BM25Retriever"]
+__all__ = [
+    "BaseRetriever",
+    "TFIDFRetriever",
+    "BM25Retriever",
+    "preprocess_utils",
+]
