@@ -29,12 +29,16 @@ def extract_sections_from_soup(soup: BeautifulSoup) -> dict[str, Any]:
     return results
 
 
+def extract_keywords(soup: BeautifulSoup) -> str:
+    # Find p tag with class "index"
+    p = soup.find("p", class_="index")
+    if p:
+        return p.get_text(strip=True, separator="\n") if p else ""
+    return ""
+
+
 def enrich_case(case_id: str, case_data: dict) -> dict:
     meta = case_data.get("meta", {}) or {}
-
-    # if "EN" not in files:
-    #     # skip non-English cases
-    #     return case_data
 
     soup = load_html(case_id)
 
@@ -43,11 +47,11 @@ def enrich_case(case_id: str, case_data: dict) -> dict:
         return case_data
 
     sections = extract_sections_from_soup(soup)
-    # meta["new_keywords"] = sections.get("keywords", "")
-    # meta["summary"] = sections.get("summary", "")
-    # meta["subject_of_the_case"] = sections.get("subject_of_the_case", "")
-    # meta["operative_part"] = sections.get("operative_part", "")
+    # if "keywords" not in sections:
+    #     sections["keywords"] = extract_keywords(soup)
     meta["sections"] = sections
+
+    # print(sections)
 
     case_data["meta"] = meta
     return case_data
@@ -84,6 +88,7 @@ def main() -> None:
     updated = {}
     for case_id, case_data in tqdm(list(data.items()), desc="Enriching cases"):
         updated[case_id] = enrich_case(case_id, case_data)
+    # enrich_case("62014CJ0526", data["62014CJ0526"])
 
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(updated, f, ensure_ascii=False, indent=4)
