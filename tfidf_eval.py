@@ -5,7 +5,13 @@ import math
 import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
 from langchain_core.documents import Document
-from retrievers import TFIDFRetriever, BaseRetriever, BM25Retriever, preprocess_utils
+from retrievers import (
+    TFIDFRetriever,
+    BaseRetriever,
+    BM25Retriever,
+    preprocess_utils,
+    SentenceBERTRetriever,
+)
 from nltk.corpus import stopwords  # type: ignore
 import nltk  # type: ignore
 
@@ -242,25 +248,28 @@ def main() -> None:
 
     rel_map = build_rel_map(df)
 
-    retriever = BM25Retriever(
-        documents=cands,
-        preprocess=preprocess_utils.compose(
-            preprocess_utils.lowercase(),
-            preprocess_utils.remove_punctuation(),
-            preprocess_utils.stopword_filter(
-                stopwords=set(
-                    stopwords.words("english")
-                    + [
-                        "<DATE>",
-                        "<QUOTED_TEXT>",
-                        "<ECLI>",
-                        "<ECR>",
-                        "<PARAGRAPH>",
-                        "<CASE>",
-                    ]
-                ),
-            ),
-        ),
+    # retriever = BM25Retriever(
+    #     documents=cands,
+    #     preprocess=preprocess_utils.compose(
+    #         preprocess_utils.lowercase(),
+    #         preprocess_utils.remove_punctuation(),
+    #         preprocess_utils.stopword_filter(
+    #             stopwords=set(
+    #                 stopwords.words("english")
+    #                 + [
+    #                     "<DATE>",
+    #                     "<QUOTED_TEXT>",
+    #                     "<ECLI>",
+    #                     "<ECR>",
+    #                     "<PARAGRAPH>",
+    #                     "<CASE>",
+    #                 ]
+    #             ),
+    #         ),
+    #     ),
+    # )
+    retriever = SentenceBERTRetriever(
+        documents=cands, model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
     summary = eval_retriever(
