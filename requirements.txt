@@ -1,0 +1,9 @@
+bs4==0.0.2
+datasets==4.1.0
+dotenv==0.9.9
+fake-useragent==2.2.0
+langchain-community==0.3.30
+matplotlib==3.10.6
+nltk==3.9.1
+sentence-transformers==5.1.0
+transformers==4.56.1
