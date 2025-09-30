@@ -9,11 +9,13 @@ from .tfidf import TFIDFRetriever  # type: ignore
 from .bm25 import BM25Retriever  # type: ignore
 from . import preprocess as preprocess_utils  # type: ignore
 from .sentence_bert import SentenceBERTRetriever  # type: ignore
+from .rf_link import RandomForestLinkRetriever  # type: ignore
 
 __all__ = [
     "BaseRetriever",
     "TFIDFRetriever",
     "BM25Retriever",
     "SentenceBERTRetriever",
+    "RandomForestLinkRetriever",
     "preprocess_utils",
 ]

@@ -11,11 +11,11 @@ from retrievers import (
     BM25Retriever,
     preprocess_utils,
     SentenceBERTRetriever,
+    RandomForestLinkRetriever,
 )
-from nltk.corpus import stopwords  # type: ignore
 import nltk  # type: ignore
 
-nltk.download("stopwords")
+nltk.download("stopwords", quiet=True)
 
 
 def build_candidate_pool(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> list[Document]:
@@ -173,7 +173,11 @@ def eval_retriever(
     rows: list[dict[str, Any]] = []
     num_used = len(eval_records)
     for rec, ranked_docs in tqdm(
-        zip(eval_records, batch_ranked_docs), desc="Evaluating", total=len(eval_records)
+        zip(eval_records, batch_ranked_docs),
+        desc="Evaluating",
+        total=len(eval_records),
+        dynamic_ncols=True,
+        leave=False,
     ):
         ranked_ids_raw = [doc.metadata["id"] for doc in ranked_docs]
         ranked_ids = [rid for rid in ranked_ids_raw if rid in allowed_ids]
@@ -268,8 +272,24 @@ def main() -> None:
     #         ),
     #     ),
     # )
-    retriever = SentenceBERTRetriever(
-        documents=cands, model_name="sentence-transformers/all-MiniLM-L6-v2"
+    # retriever = SentenceBERTRetriever(
+    #     documents=cands, model_name="sentence-transformers/all-MiniLM-L6-v2"
+    # )
+
+    # Provider: map exact TEXT -> (QID, DATE) so RF retriever can compute time/graph features
+    text_to_info = {
+        str(row["TEXT"]): (str(row["QID"]), pd.to_datetime(row["DATE"]))
+        for _, row in queries.iterrows()
+    }
+
+    def query_info_provider(query_text: str) -> tuple[str | None, pd.Timestamp | None]:
+        return text_to_info.get(query_text, (None, None))
+
+    # Use the RandomForest link retriever (artifacts must be trained & present)
+    retriever = RandomForestLinkRetriever(
+        documents=cands,
+        artifacts_dir="artifacts/rf_link",  # adjust if you saved elsewhere
+        query_info_provider=query_info_provider,
     )
 
     summary = eval_retriever(

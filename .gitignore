@@ -3,6 +3,7 @@
 .env
 cases
 summaries
+artifacts
 *.json
 *.xlsx
 *.csv
