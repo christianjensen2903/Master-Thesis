@@ -131,7 +131,6 @@ def eval_retriever(
 
     # Batch retrieve a full ranking for each query
     q_texts = [r["qtext"] for r in eval_records]
-    # Retrieve only up to the maximum k requested to avoid unnecessary computation
     max_k = max(k_list) if len(k_list) > 0 else 0
     batch_ranked_docs = retriever.get_relevant_documents_batch(q_texts, k=max_k)
 
@@ -215,7 +214,7 @@ def main() -> None:
 
     rel_map = build_rel_map(df)
 
-    retriever = TFIDFRetriever(
+    retriever = BM25Retriever(
         documents=cands,
         # tfidf_params={"stop_words": "english"},
     )
