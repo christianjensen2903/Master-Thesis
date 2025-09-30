@@ -124,8 +124,6 @@ def eval_retriever(
                 "k": k_list,
                 "Precision@k": 0.0,
                 "Recall@k": 0.0,
-                "MAP@k": 0.0,
-                "MAP_full": 0.0,
                 "Avg #Relevant": 0.0,
                 "Queries evaluated": 0,
             }
@@ -133,8 +131,9 @@ def eval_retriever(
 
     # Batch retrieve a full ranking for each query
     q_texts = [r["qtext"] for r in eval_records]
-    full_k = len(cands)
-    batch_ranked_docs = retriever.get_relevant_documents_batch(q_texts, k=full_k)
+    # Retrieve only up to the maximum k requested to avoid unnecessary computation
+    max_k = max(k_list) if len(k_list) > 0 else 0
+    batch_ranked_docs = retriever.get_relevant_documents_batch(q_texts, k=max_k)
 
     rows: list[dict[str, Any]] = []
     num_used = len(eval_records)
@@ -145,22 +144,17 @@ def eval_retriever(
         ranked_ids = [rid for rid in ranked_ids_raw if rid in allowed_ids]
         relevant_allowed = rec["relevant_allowed"]
 
-        ap_full = average_precision_at_k(ranked_ids, relevant_allowed, len(ranked_ids))
-
         for k in k_list:
             top_k_ids = ranked_ids[:k]
             hits = sum(1 for rid in top_k_ids if rid in relevant_allowed)
             prec = hits / k
             rec_k = hits / len(relevant_allowed)
-            ap = average_precision_at_k(top_k_ids, relevant_allowed, k)
             rows.append(
                 {
                     "QID": rec["qid"],
                     "k": k,
                     "Precision@k": prec,
                     "Recall@k": rec_k,
-                    "AP@k": ap,
-                    "AP_full": ap_full,
                     "num_relevant": len(relevant_allowed),
                     "query_date": rec["qdate"],
                     "query_celex": rec["qcelex"],
@@ -174,16 +168,12 @@ def eval_retriever(
             {
                 "Precision@k": "mean",
                 "Recall@k": "mean",
-                "AP@k": "mean",
-                "AP_full": "mean",
                 "num_relevant": "mean",
             }
         )
         .reset_index()
         .rename(
             columns={
-                "AP@k": "MAP@k",
-                "AP_full": "MAP_full",
                 "num_relevant": "Avg #Relevant",
             }
         )
@@ -225,7 +215,7 @@ def main() -> None:
 
     rel_map = build_rel_map(df)
 
-    retriever = BM25Retriever(
+    retriever = TFIDFRetriever(
         documents=cands,
         # tfidf_params={"stop_words": "english"},
     )
@@ -239,10 +229,6 @@ def main() -> None:
         cands=cands,
     )
     print(summary.to_string(index=False))
-    # Also report Full MAP (untruncated)
-    if not summary.empty:
-        map_full = float(summary["MAP_full"].iloc[0])
-        print(f"\nFull MAP: {map_full:.4f}")
 
 
 if __name__ == "__main__":
