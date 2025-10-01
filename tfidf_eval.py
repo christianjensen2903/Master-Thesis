@@ -11,8 +11,8 @@ from retrievers import (
     BM25Retriever,
     preprocess_utils,
     SentenceBERTRetriever,
-    RandomForestLinkRetriever,
 )
+from nltk.corpus import stopwords  # type: ignore
 import nltk  # type: ignore
 
 nltk.download("stopwords", quiet=True)
@@ -78,9 +78,17 @@ def build_queries(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> pd.DataFrame:
     return queries.reset_index(drop=True)
 
 
-def build_rel_map(df: pd.DataFrame) -> dict[str, set[str]]:
-    """Ground truth mapping from query id to the set of relevant target ids."""
-    return df.groupby("FROM_ID")["TO_ID"].apply(lambda s: set(s.astype(str))).to_dict()
+def build_rel_map(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> dict[str, set[str]]:
+    """Ground truth mapping from query id to the set of relevant target ids.
+
+    Only includes targets with dates strictly before the cutoff date.
+    """
+    df_filtered = df.loc[df["DATE_TO"] < cutoff_date].copy()
+    return (
+        df_filtered.groupby("FROM_ID")["TO_ID"]
+        .apply(lambda s: set(s.astype(str)))
+        .to_dict()
+    )
 
 
 def average_precision_at_k(ranked_ids: list[str], relevant: set[str], k: int) -> float:
@@ -122,24 +130,14 @@ def eval_retriever(
     queries: pd.DataFrame,
     rel_map: dict[str, set[str]],
     k_list: list[int],
-    cutoff_date: pd.Timestamp,
-    cands: list[Document],
 ) -> pd.DataFrame:
-    cutoff_date = pd.to_datetime(cutoff_date)
 
-    # Allowed targets (strictly pre-cutoff)
-    allowed_ids: set[str] = set(doc.metadata["id"] for doc in cands)
-
-    eval_mask = queries["DATE"] >= cutoff_date
-    q_eval = queries.loc[eval_mask].copy()
-
-    # Build the list of evaluable queries (must have at least one allowed relevant)
+    # Build the list of evaluable queries (must have at least one relevant)
     eval_records: list[dict[str, Any]] = []
-    for _, q in q_eval.iterrows():
+    for _, q in queries.iterrows():
         qid: str = q["QID"]
-        relevant_all: set[str] = rel_map.get(qid, set())
-        relevant_allowed: set[str] = {rid for rid in relevant_all if rid in allowed_ids}
-        if not relevant_allowed:
+        relevant: set[str] = rel_map.get(qid, set())
+        if not relevant:
             continue
         eval_records.append(
             {
@@ -147,7 +145,7 @@ def eval_retriever(
                 "qtext": str(q["TEXT"]),
                 "qcelex": str(q["CELEX"]),
                 "qdate": q["DATE"],
-                "relevant_allowed": relevant_allowed,
+                "relevant": relevant,
             }
         )
 
@@ -179,18 +177,17 @@ def eval_retriever(
         dynamic_ncols=True,
         leave=False,
     ):
-        ranked_ids_raw = [doc.metadata["id"] for doc in ranked_docs]
-        ranked_ids = [rid for rid in ranked_ids_raw if rid in allowed_ids]
-        relevant_allowed = rec["relevant_allowed"]
+        ranked_ids = [doc.metadata["id"] for doc in ranked_docs]
+        relevant = rec["relevant"]
 
         for k in k_list:
             top_k_ids = ranked_ids[:k]
-            hits = sum(1 for rid in top_k_ids if rid in relevant_allowed)
+            hits = sum(1 for rid in top_k_ids if rid in relevant)
             prec = hits / k
-            rec_k = hits / len(relevant_allowed)
+            rec_k = hits / len(relevant)
             f1_k = (2 * prec * rec_k / (prec + rec_k)) if (prec + rec_k) > 0 else 0.0
-            ap_k = average_precision_at_k(ranked_ids, relevant_allowed, k)
-            ndcg_k = ndcg_at_k(ranked_ids, relevant_allowed, k)
+            ap_k = average_precision_at_k(ranked_ids, relevant, k)
+            ndcg_k = ndcg_at_k(ranked_ids, relevant, k)
             rows.append(
                 {
                     "QID": rec["qid"],
@@ -200,7 +197,7 @@ def eval_retriever(
                     "F1@k": f1_k,
                     "nDCG@k": ndcg_k,
                     "AP@k": ap_k,
-                    "num_relevant": len(relevant_allowed),
+                    "num_relevant": len(relevant),
                     "query_date": rec["qdate"],
                     "query_celex": rec["qcelex"],
                 }
@@ -250,55 +247,34 @@ def main() -> None:
     queries = build_queries(df, cutoff_date=cutoff_date)
     print(f"Candidates: {len(cands)}, Queries: {len(queries)}")
 
-    rel_map = build_rel_map(df)
+    rel_map = build_rel_map(df, cutoff_date=cutoff_date)
 
-    # retriever = BM25Retriever(
-    #     documents=cands,
-    #     preprocess=preprocess_utils.compose(
-    #         preprocess_utils.lowercase(),
-    #         preprocess_utils.remove_punctuation(),
-    #         preprocess_utils.stopword_filter(
-    #             stopwords=set(
-    #                 stopwords.words("english")
-    #                 + [
-    #                     "<DATE>",
-    #                     "<QUOTED_TEXT>",
-    #                     "<ECLI>",
-    #                     "<ECR>",
-    #                     "<PARAGRAPH>",
-    #                     "<CASE>",
-    #                 ]
-    #             ),
-    #         ),
-    #     ),
-    # )
+    retriever = BM25Retriever(
+        documents=cands,
+        preprocess=preprocess_utils.compose(
+            preprocess_utils.lowercase(),
+            preprocess_utils.remove_punctuation(),
+            preprocess_utils.stopword_filter(
+                stopwords=set(
+                    stopwords.words("english")
+                    + [
+                        "<DATE>",
+                        "<QUOTED_TEXT>",
+                        "<ECLI>",
+                        "<ECR>",
+                        "<PARAGRAPH>",
+                        "<CASE>",
+                    ]
+                ),
+            ),
+        ),
+    )
     # retriever = SentenceBERTRetriever(
     #     documents=cands, model_name="sentence-transformers/all-MiniLM-L6-v2"
     # )
 
-    # Provider: map exact TEXT -> (QID, DATE) so RF retriever can compute time/graph features
-    text_to_info = {
-        str(row["TEXT"]): (str(row["QID"]), pd.to_datetime(row["DATE"]))
-        for _, row in queries.iterrows()
-    }
-
-    def query_info_provider(query_text: str) -> tuple[str | None, pd.Timestamp | None]:
-        return text_to_info.get(query_text, (None, None))
-
-    # Use the RandomForest link retriever (artifacts must be trained & present)
-    retriever = RandomForestLinkRetriever(
-        documents=cands,
-        artifacts_dir="artifacts/rf_link",  # adjust if you saved elsewhere
-        query_info_provider=query_info_provider,
-    )
-
     summary = eval_retriever(
-        retriever=retriever,
-        queries=queries,
-        rel_map=rel_map,
-        k_list=k_list,
-        cutoff_date=cutoff_date,
-        cands=cands,
+        retriever=retriever, queries=queries, rel_map=rel_map, k_list=k_list
     )
     print(summary.to_string(index=False))
 
