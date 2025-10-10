@@ -1,4 +1,3 @@
-# pyright: reportMissingTypeStubs=false
 import pandas as pd  # type: ignore
 from langchain_core.documents import Document
 from retrievers import (
@@ -88,31 +87,30 @@ def build_rel_map(df: pd.DataFrame, cutoff_date: pd.Timestamp) -> dict[str, set[
     )
 
 
-def main() -> None:
-    """Run retrieval evaluation with temporal cutoff and report summary metrics."""
+def example_single_model() -> None:
+    """Example: Evaluate a single retriever model."""
+    print("=" * 80)
+    print("EXAMPLE 1: Single Model Evaluation")
+    print("=" * 80)
 
-    cutoff_date = pd.Timestamp("2018-01-01")  # pre-2018 candidates only
+    cutoff_date = pd.Timestamp("2018-01-01")
     k_list = [5, 10, 50, 100]
 
+    # Load data
     df = pd.read_csv("data/clean_data.csv")
-
-    # Normalize types / IDs
     df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
     df["DATE_TO"] = pd.to_datetime(df["DATE_TO"])
     df["FROM_ID"] = df["CELEX_FROM"].astype(str) + "::" + df["NUMBER_FROM"].astype(str)
     df["TO_ID"] = df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
 
-    # Build pools
-    cands = build_candidate_pool(df, cutoff_date=cutoff_date)  # strictly pre-cutoff
+    # Build evaluation data
+    cands = build_candidate_pool(df, cutoff_date=cutoff_date)
     queries = build_queries(df, cutoff_date=cutoff_date)
-    print(f"Candidates: {len(cands)}, Queries: {len(queries)}")
-
     rel_map = build_rel_map(df, cutoff_date=cutoff_date)
 
-    # Initialize evaluator
-    evaluator = Evaluator(k_values=k_list, show_progress=True)
+    print(f"Candidates: {len(cands)}, Queries: {len(queries)}")
 
-    # Option 1: Evaluate a single retriever
+    # Create and configure a retriever
     retriever = BM25Retriever(
         documents=cands,
         preprocess=preprocess_utils.compose(
@@ -134,25 +132,22 @@ def main() -> None:
         ),
     )
 
+    # Initialize evaluator
+    evaluator = Evaluator(k_values=k_list, show_progress=True)
+
+    # Evaluate
     summary = evaluator.evaluate(
         retriever=retriever, queries=queries, relevance_map=rel_map
     )
-    print("\n=== BM25 Results ===")
+
+    print("\n=== BM25 Summary Results ===")
     print(summary.to_string(index=False))
 
-    # Option 2: Compare multiple retrievers (commented out for performance)
-    # retrievers_dict = {
-    #     "BM25": retriever,
-    #     "TF-IDF": TFIDFRetriever(documents=cands, preprocess=retriever._preprocess),
-    #     "SentenceBERT": SentenceBERTRetriever(
-    #         documents=cands, model_name="sentence-transformers/all-MiniLM-L6-v2"
-    #     ),
-    # }
-    # comparison = evaluator.evaluate_multiple(
-    #     retrievers=retrievers_dict, queries=queries, relevance_map=rel_map
-    # )
-    # print("\n=== Model Comparison ===")
-    # print(comparison.to_string(index=False))
+
+def main() -> None:
+    """Run all examples."""
+    # Example 1: Single model evaluation
+    example_single_model()
 
 
 if __name__ == "__main__":

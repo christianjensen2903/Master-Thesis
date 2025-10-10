@@ -13,5 +13,5 @@ Follow the following rules:
 
 - For any Python file, ALWAYS add typing annotations to each function or class. Include explicit return types (including None where appropriate)
 - Always use the new type annotations i.e. list instead of List, dict instead of Dict, x | None instead of Optional etc.
-- Please follow PEP 257 docstring convention.
+- Only provide docstring if function is not easy understandable based on name
 - Don't do safe importing with try except. Always just assume libraries is installed

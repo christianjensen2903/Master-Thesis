@@ -4,18 +4,16 @@ This package exposes a simple, typed interface for retrieval models and
 includes TF-IDF and BM25 implementations optimized for batch querying.
 """
 
-from .base import BaseRetriever  # type: ignore
-from .tfidf import TFIDFRetriever  # type: ignore
-from .bm25 import BM25Retriever  # type: ignore
-from . import preprocess as preprocess_utils  # type: ignore
-from .sentence_bert import SentenceBERTRetriever  # type: ignore
-from .rf_link import RandomForestLinkRetriever  # type: ignore
+from .base import BaseRetriever
+from .tfidf import TFIDFRetriever
+from .bm25 import BM25Retriever
+from . import preprocess as preprocess_utils
+from .sentence_bert import SentenceBERTRetriever
 
 __all__ = [
     "BaseRetriever",
     "TFIDFRetriever",
     "BM25Retriever",
     "SentenceBERTRetriever",
-    "RandomForestLinkRetriever",
     "preprocess_utils",
 ]
