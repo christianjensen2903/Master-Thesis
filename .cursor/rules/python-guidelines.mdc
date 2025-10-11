@@ -15,3 +15,5 @@ Follow the following rules:
 - Always use the new type annotations i.e. list instead of List, dict instead of Dict, x | None instead of Optional etc.
 - Only provide docstring if function is not easy understandable based on name
 - Don't do safe importing with try except. Always just assume libraries is installed
+
+Remember to always use the virtual env (.venv)
