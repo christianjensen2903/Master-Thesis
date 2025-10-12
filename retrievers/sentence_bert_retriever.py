@@ -4,22 +4,24 @@ from sentence_transformers import SentenceTransformer
 import pandas as pd  # type: ignore
 
 
-class SentenceBERTRetriever(pt.Transformer):
+class SentenceBertRetriever(pt.Transformer):
     def __init__(
         self,
         documents_df: pd.DataFrame,
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        model_name: str,
         use_gpu: bool = False,
     ) -> None:
         self.model = SentenceTransformer(model_name)
         self.documents_df = documents_df.reset_index(drop=True)
         self.use_gpu = use_gpu
+        self.model_name = model_name
         self.index: faiss.Index
         self._build_index()
 
     def _build_index(self) -> None:
-        print("Encoding documents with SentenceBERT...")
+        print(f"Encoding documents with {self.model_name}...")
         doc_texts = self.documents_df["text"].tolist()
+
         embeddings = self.model.encode(doc_texts, show_progress_bar=True)
         embeddings = embeddings.astype("float32")
 

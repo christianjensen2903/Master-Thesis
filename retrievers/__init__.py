@@ -1,5 +1,7 @@
-from .sentence_bert import SentenceBERTRetriever
+from .sentence_bert_retriever import SentenceBertRetriever
+from .huggingface_retriever import HuggingFaceRetriever
 
 __all__ = [
-    "SentenceBERTRetriever",
+    "SentenceBertRetriever",
+    "HuggingFaceRetriever",
 ]

@@ -1,11 +1,11 @@
 import pandas as pd  # type: ignore
 import pyterrier as pt  # type: ignore
 from utils import load_and_prepare_data
-from retrievers import SentenceBERTRetriever
+from retrievers import HuggingFaceRetriever
 
 
 def evaluate(
-    models: list[pt.terrier.Retriever],
+    models: list[pt.Transformer],
     model_names: list[str],
     queries_df: pd.DataFrame,
     qrels_df: pd.DataFrame,
@@ -41,22 +41,30 @@ def main() -> None:
     documents_df, queries_df, qrels_df = load_and_prepare_data(csv_path, cutoff_date)
 
     # BM25 retriever
-    index = pt.IndexFactory.of(index_path)
-    bm25 = pt.rewrite.tokenise("utf") >> pt.terrier.Retriever(
-        index, wmodel="BM25", verbose=True
-    )
+    # index = pt.IndexFactory.of(index_path)
+    # bm25 = pt.rewrite.tokenise("utf") >> pt.terrier.Retriever(
+    #     index, wmodel="BM25", verbose=True
+    # )
 
-    # SentenceBERT FAISS retriever
-    sbert_faiss = SentenceBERTRetriever(
+    # # Dense retrievers
+    # sbert = DenseRetriever(
+    #     documents_df=documents_df,
+    #     model_name="sentence-transformers/all-MiniLM-L6-v2",
+    #     use_gpu=False,
+    # )
+
+    legalbert = HuggingFaceRetriever(
         documents_df=documents_df,
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_name="nlpaueb/legal-bert-base-uncased",
         use_gpu=False,
     )
 
-    models = [bm25, sbert_faiss]
-    model_names = ["BM25", "SBERT"]
+    # models = [bm25, sbert, legalbert]
+    # model_names = ["BM25", "SBERT", "LegalBERT"]
+    models = [legalbert]
+    model_names = ["LegalBERT"]
 
-    results = evaluate(models, model_names, queries_df, qrels_df, k_values)
+    results = evaluate(models, model_names, queries_df, qrels_df, k_values)  # type: ignore
 
     print("\n" + "=" * 80)
     print("EVALUATION RESULTS")
