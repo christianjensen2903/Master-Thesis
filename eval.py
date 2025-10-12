@@ -1,7 +1,7 @@
 import pandas as pd  # type: ignore
 import pyterrier as pt  # type: ignore
 from utils import load_and_prepare_data
-from retrievers import HuggingFaceRetriever
+from retrievers import DenseRetriever
 
 
 def evaluate(
@@ -53,7 +53,7 @@ def main() -> None:
     #     use_gpu=False,
     # )
 
-    legalbert = HuggingFaceRetriever(
+    legalbert = DenseRetriever(
         documents_df=documents_df,
         model_name="nlpaueb/legal-bert-base-uncased",
         use_gpu=False,

@@ -4,7 +4,7 @@ from sentence_transformers import SentenceTransformer
 import pandas as pd  # type: ignore
 
 
-class SentenceBertRetriever(pt.Transformer):
+class DenseRetriever(pt.Transformer):
     def __init__(
         self,
         documents_df: pd.DataFrame,
