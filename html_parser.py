@@ -161,7 +161,7 @@ class ModernJudgementParser(BaseJudgementParser):
 
     def _extract_table_format(self, soup: bs) -> dict[int, str]:
         """Extract paragraphs from the newer table-based format."""
-        pars = []
+        pars: list[str] = []
         pars_temp = soup.find_all("p", attrs={"id": re.compile(r"point\d")})
 
         for p in pars_temp:
@@ -443,7 +443,28 @@ class JudgementParser:
             return None
 
         with open(normalized_path, encoding="utf-8") as file:
-            return bs(file.read(), "lxml")
+            content = file.read()
+            parser_feature = "xml" if self._is_xml_document(content) else "lxml"
+            return bs(content, parser_feature)
+
+    def _is_xml_document(self, content: str) -> bool:
+        """Heuristically determine if the document is XML/XHTML.
+
+        Uses simple checks for XML declaration and common XHTML namespace markers
+        to select the XML parser when appropriate in order to avoid warnings and
+        ensure correct parsing.
+        """
+        stripped = content.lstrip()
+        if stripped.startswith("<?xml"):
+            return True
+        if "http://www.w3.org/1999/xhtml" in content:
+            return True
+        # Some EUR-Lex files are XHTML without an explicit XML declaration
+        if re.search(
+            r"<html[^>]+xmlns=\"http://www.w3.org/1999/xhtml\"", content, re.IGNORECASE
+        ):
+            return True
+        return False
 
     def extract_paragraphs(self, path: str) -> dict[int, str]:
         """Extract paragraphs using the appropriate parser."""
@@ -453,6 +474,8 @@ class JudgementParser:
 
         # Try each parser in order
         for parser in self.parsers:
+            print(parser.__class__.__name__)
+            print(parser.can_parse(soup))
             if parser.can_parse(soup):
                 return parser.extract_paragraphs(soup)
 
@@ -470,7 +493,7 @@ if __name__ == "__main__":
 
     # Randomly select a case file
     random_case = random.choice(case_files)
-    random_case = "cases/62007TJ0335.html"
+    random_case = "cases/62016TJ0757.html"
     print(f"Processing random case: {random_case}\n")
 
     parser = JudgementParser()
