@@ -59,11 +59,14 @@ class ModernJudgementParser(BaseJudgementParser):
     # CSS classes that indicate the end of judgment content
     STOP_CLASSES = [
         "C04Titre1",
+        "C03Titre1",  # e.g., Conclusion heading
         "S40Titre",
         "C41DispositifIntroduction",
         "C30Dispositifalinea",
         "C77Signatures",
-        "C42FootnoteLangue",
+        "C42FootnoteLangue",  # some docs use 42
+        "C40FootnoteLangue",  # some docs use 40 (e.g., 62009CC0397)
+        "Cfootnotetext",  # individual footnote paragraphs
     ]
 
     # CSS classes for numbered paragraphs (various formats)
@@ -207,7 +210,12 @@ class ModernJudgementParser(BaseJudgementParser):
         if not raw_classes:
             return False
         classes = [raw_classes] if isinstance(raw_classes, str) else list(raw_classes)
-        return any(stop_class in classes for stop_class in self.STOP_CLASSES)
+        # Explicit stop classes
+        if any(stop_class in classes for stop_class in self.STOP_CLASSES):
+            return True
+
+        # Generic section headings (e.g., Titres/Titre*) should also stop collection
+        return self._is_section_heading(tag)
 
     def _has_any_numbered_class(self, tag: Tag) -> bool:
         """Check if a tag has any of the numbered paragraph classes."""
@@ -218,6 +226,22 @@ class ModernJudgementParser(BaseJudgementParser):
         return any(
             num_class in classes for num_class in self.NUMBERED_PARAGRAPH_CLASSES
         )
+
+    def _is_section_heading(self, tag: Tag) -> bool:
+        """Heuristically detect section headings by class name.
+
+        Many CJEU documents mark major/minor headings with class names containing
+        'Titre' or 'Titresansnumero'. These should not be appended to numbered
+        paragraph bodies and should terminate sibling aggregation.
+        """
+        raw_classes = tag.get("class")
+        if not raw_classes:
+            return False
+        classes = [raw_classes] if isinstance(raw_classes, str) else list(raw_classes)
+        for class_name in classes:
+            if ("Titre" in class_name) or ("Titresansnumero" in class_name):
+                return True
+        return False
 
 
 class LegacyEurLexParser(BaseJudgementParser):
@@ -526,7 +550,7 @@ if __name__ == "__main__":
 
     # Randomly select a case file
     random_case = random.choice(case_files)
-    random_case = "cases/62005CJ0046.html"
+    random_case = "cases/62009CC0397.html"
 
     parser = JudgementParser()
     paragraphs = parser.extract_paragraphs(random_case)
@@ -536,5 +560,6 @@ if __name__ == "__main__":
         print(text)
         print("\n" + "=" * 100 + "\n")
 
+    print(f"Processed random case: {random_case}\n")
     celex = random_case.split("/")[-1].split(".")[0]
     print(f"CELEX: {celex}\n")
