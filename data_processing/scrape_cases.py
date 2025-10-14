@@ -8,6 +8,7 @@ import os
 import aiohttp
 import aiofiles  # type: ignore
 from fake_useragent import UserAgent
+from collections.abc import Iterable
 
 
 dotenv.load_dotenv()
@@ -15,7 +16,9 @@ dotenv.load_dotenv()
 
 ua = UserAgent()
 
-BASE_URL = "https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:{case_id}"
+BASE_URL_TEMPLATE = (
+    "https://eur-lex.europa.eu/legal-content/{lang}/TXT/HTML/?uri=CELEX:{case_id}"
+)
 
 # Basic retry/backoff settings (tunable)
 MAX_RETRIES = 5
@@ -67,6 +70,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Randomize per-request delay (adds jitter)",
     )
+    p.add_argument(
+        "--languages",
+        type=str,
+        default=(
+            "EN,FR,DE,IT,ES,NL,PL,PT,RO,BG,CS,DA,ET,EL,GA,HR,LV,LT,HU,MT,SK,SL,FI,SV"
+        ),
+        help=(
+            "Comma-separated language codes to try in order (default tries EN then major fallbacks)"
+        ),
+    )
+    p.add_argument(
+        "--rescrape-errors",
+        action="store_true",
+        help=(
+            "If set, only re-download items whose existing HTML contains the EUR-Lex 'document does not exist' error"
+        ),
+    )
+    p.add_argument(
+        "--scan-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory to scan for .html files; if provided, case IDs are taken from filenames. With --rescrape-errors, only files that look like the EUR-Lex error page are queued."
+        ),
+    )
 
     return p.parse_args()
 
@@ -115,6 +143,65 @@ async def fetch_with_retries(
         sleep_for = min(MAX_BACKOFF, backoff) + jitter
         await asyncio.sleep(sleep_for)
         backoff *= 2  # exponential
+    # If the loop exits without returning, signal failure explicitly
+    raise RuntimeError("Exhausted retries without receiving content")
+
+
+def parse_languages_arg(languages_arg: str) -> list[str]:
+    return [lang.strip().upper() for lang in languages_arg.split(",") if lang.strip()]
+
+
+def build_url(case_id: str, lang: str) -> str:
+    return BASE_URL_TEMPLATE.format(lang=lang, case_id=case_id)
+
+
+def html_is_error_document(content: bytes) -> bool:
+    # EUR-Lex uses a stable error container id regardless of UI language
+    return (
+        b'id="errorDocumentView"' in content
+        or b"The requested document does not exist" in content
+    )
+
+
+async def try_languages_for_case(
+    session: aiohttp.ClientSession,
+    case_id: str,
+    languages: Iterable[str],
+) -> tuple[bytes | None, str | None]:
+    headers_base = {
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    for lang in languages:
+        headers = {
+            **headers_base,
+            "User-Agent": ua.random,
+            "Accept-Language": f"{lang.lower()}-*,{lang.lower()};q=0.9,en;q=0.6",
+        }
+        url = build_url(case_id, lang)
+        try:
+            content = await fetch_with_retries(session, url, headers)
+        except Exception:
+            content = b""
+        if content and not html_is_error_document(content):
+            return content, lang
+    return None, None
+
+
+def discover_case_ids_from_dir(scan_dir: Path, only_errors: bool) -> list[str]:
+    case_ids: list[str] = []
+    if not scan_dir.exists():
+        return case_ids
+    for p in sorted(scan_dir.glob("*.html")):
+        try:
+            if only_errors:
+                content = p.read_bytes()
+                if not html_is_error_document(content):
+                    continue
+            case_ids.append(p.stem)
+        except Exception:
+            # Skip unreadable files silently
+            continue
+    return case_ids
 
 
 async def worker(
@@ -125,7 +212,9 @@ async def worker(
     delay: float,
     randomize_delay: bool,
     total: int,
-):
+    languages: list[str],
+    rescrape_errors: bool,
+) -> None:
     i = 0
     while True:
         item = await queue.get()
@@ -134,13 +223,30 @@ async def worker(
             break
         idx, case_id = item
         i += 1
-        url = BASE_URL.format(case_id=case_id)
-        headers = {"User-Agent": ua.random, "Accept": "text/html,application/xhtml+xml"}
         try:
-            content = await fetch_with_retries(session, url, headers)
             out_path = out_dir / f"{case_id}.html"
+            if rescrape_errors and out_path.exists():
+                try:
+                    existing = out_path.read_bytes()
+                    if existing and not html_is_error_document(existing):
+                        print(
+                            f"[{idx}/{total}] Worker-{name} skip {case_id}: existing file is valid"
+                        )
+                        continue
+                except Exception:
+                    pass
+
+            content, used_lang = await try_languages_for_case(
+                session=session, case_id=case_id, languages=languages
+            )
+            if content is None:
+                raise RuntimeError("No available language produced a valid document")
+
             await save_bytes(out_path, content)
-            print(f"[{idx}/{total}] Worker-{name} saved {case_id} -> {out_path}")
+            lang_note = f" (lang={used_lang})" if used_lang else ""
+            print(
+                f"[{idx}/{total}] Worker-{name} saved {case_id}{lang_note} -> {out_path}"
+            )
         except Exception as e:
             print(f"[{idx}/{total}] Worker-{name} error for {case_id}: {e}")
         finally:
@@ -153,9 +259,12 @@ async def worker(
             queue.task_done()
 
 
-async def main_async(args: argparse.Namespace):
-    data = json.loads(args.input.read_text(encoding="utf-8"))
-    case_items = list(data.keys())
+async def main_async(args: argparse.Namespace) -> None:
+    if args.scan_dir is not None:
+        case_items = discover_case_ids_from_dir(args.scan_dir, args.rescrape_errors)
+    else:
+        data = json.loads(args.input.read_text(encoding="utf-8"))
+        case_items = list(data.keys())
     if args.limit and args.limit > 0:
         case_items = case_items[: args.limit]
     total = len(case_items)
@@ -172,6 +281,8 @@ async def main_async(args: argparse.Namespace):
 
         out_dir = args.out_dir
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        languages = parse_languages_arg(args.languages)
 
         queue: asyncio.Queue = asyncio.Queue()
         for idx, case_id in enumerate(case_items, 1):
@@ -190,6 +301,8 @@ async def main_async(args: argparse.Namespace):
                         args.delay,
                         args.randomize_delay,
                         total,
+                        languages,
+                        args.rescrape_errors,
                     )
                 )
             )
@@ -202,7 +315,7 @@ async def main_async(args: argparse.Namespace):
         await asyncio.gather(*workers, return_exceptions=True)
 
 
-def main():
+def main() -> None:
     args = parse_args()
     try:
         asyncio.run(main_async(args))
