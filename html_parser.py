@@ -277,6 +277,147 @@ class LegacyEurLexParser(BaseJudgementParser):
         return paragraphs
 
 
+class OperativePartParser(BaseJudgementParser):
+    """Parser for pages that only contain an Operative part rendered via tables."""
+
+    def can_parse(self, soup: bs) -> bool:
+        """Detects an Operative part section (tables or numeric-only paragraphs)."""
+        # Look for the Operative part heading
+        heading = soup.find("p", class_="C12DispositifIntroduction")
+        if not heading:
+            return False
+
+        # Check if any following <p> contains a <table> with numbered first cell
+        for p_tag in heading.find_all_next("p"):
+            table = p_tag.find("table")
+            if not table:
+                # Stop if we've reached a new major section after the operative part
+                raw_classes = p_tag.get("class")
+                if raw_classes:
+                    class_list: list[str] = (
+                        [raw_classes]
+                        if isinstance(raw_classes, str)
+                        else list(raw_classes)
+                    )
+                    if ("C04Titre1" in class_list) or ("C77Signatures" in class_list):
+                        break
+                continue
+
+            first_td = table.find("td")
+            if not first_td:
+                continue
+            first_td_text = " ".join(first_td.stripped_strings)
+            if re.match(r"^\s*\d+\.?\s*$", first_td_text):
+                return True
+
+        # Fallback: detect numeric-only paragraph pattern like '1.' followed by text
+        numeric_seen = False
+        for p_tag in heading.find_all_next("p"):
+            # Stop at next major sections
+            raw_classes = p_tag.get("class")
+            if raw_classes:
+                class_list2: list[str] = (
+                    [raw_classes] if isinstance(raw_classes, str) else list(raw_classes)
+                )
+                if ("C04Titre1" in class_list2) or ("C77Signatures" in class_list2):
+                    break
+
+            text = " ".join(p_tag.stripped_strings)
+            if re.match(r"^\s*\d+\.?\s*$", text):
+                numeric_seen = True
+                continue
+            if numeric_seen and text:
+                return True
+
+        return False
+
+    def extract_paragraphs(self, soup: bs) -> dict[int, str]:
+        """Extract numbered operative points from tables or numeric-only paragraphs."""
+        heading = soup.find("p", class_="C12DispositifIntroduction")
+        if not heading:
+            return {}
+
+        points: dict[int, str] = {}
+
+        # First attempt: table-based extraction
+        found_table = False
+        for p_tag in heading.find_all_next("p"):
+            # Stop conditions after the operative part
+            raw_classes = p_tag.get("class")
+            class_list: list[str] = []
+            if raw_classes:
+                class_list = (
+                    [raw_classes] if isinstance(raw_classes, str) else list(raw_classes)
+                )
+            if any(c in {"C04Titre1", "C77Signatures"} for c in class_list):
+                break
+
+            table = p_tag.find("table")
+            if not table:
+                continue
+
+            found_table = True
+            # Each table typically contains one TR with three TDs: number, spacer, text
+            for tr in table.find_all("tr"):
+                tds = tr.find_all("td")
+                if not tds:
+                    continue
+                number_text = " ".join(tds[0].stripped_strings)
+                match = re.search(r"(\d+)", number_text)
+                if not match:
+                    continue
+                number = int(match.group(1))
+
+                # Text is usually in the last TD; extract clean text
+                text_td = tds[-1]
+                text = " ".join(text_td.stripped_strings).strip()
+                if text:
+                    points[number] = text
+
+        if found_table and points:
+            ordered_numbers = sorted(points.keys())
+            return {i: points[i] for i in ordered_numbers}
+
+        # Fallback: numeric-only paragraph extraction (e.g., '1.' then text in subsequent <p>)
+        current_number: int | None = None
+        current_text_parts: list[str] = []
+        for p_tag in heading.find_all_next("p"):
+            raw_classes = p_tag.get("class")
+            class_list3: list[str] = []
+            if raw_classes:
+                class_list3 = (
+                    [raw_classes] if isinstance(raw_classes, str) else list(raw_classes)
+                )
+            if any(c in {"C04Titre1", "C77Signatures"} for c in class_list3):
+                break
+
+            text = " ".join(p_tag.stripped_strings).strip()
+            if not text:
+                continue
+
+            match_num = re.match(r"^(\d+)\.\s*$", text)
+            if match_num:
+                # Commit previous
+                if current_number is not None and current_text_parts:
+                    points[current_number] = " ".join(current_text_parts)
+                current_number = int(match_num.group(1))
+                current_text_parts = []
+                continue
+
+            # Continuation of current number
+            if current_number is not None:
+                current_text_parts.append(text)
+
+        # Commit last
+        if current_number is not None and current_text_parts:
+            points[current_number] = " ".join(current_text_parts)
+
+        if not points:
+            return {}
+        ordered_numbers = sorted(points.keys())
+        return {i: points[i] for i in ordered_numbers}
+
+
 class JudgementParser:
     """Main parser that routes to the appropriate format-specific parser."""
 
@@ -284,6 +425,7 @@ class JudgementParser:
         self.parsers: list[BaseJudgementParser] = [
             LegacyEurLexParser(),
             ModernJudgementParser(),
+            OperativePartParser(),
         ]
 
     def _normalize_path(self, path: str) -> str:
@@ -327,8 +469,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Randomly select a case file
-    # random_case = random.choice(case_files)
-    random_case = "cases/61972CJ0077.html"
+    random_case = random.choice(case_files)
+    random_case = "cases/62007TJ0335.html"
     print(f"Processing random case: {random_case}\n")
 
     parser = JudgementParser()
