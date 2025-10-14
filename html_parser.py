@@ -84,6 +84,10 @@ class ModernJudgementParser(BaseJudgementParser):
         return False
 
     def extract_paragraphs(self, soup: bs) -> dict[int, str]:
+        # Table-based format: presence of <p id="pointN"> markers (and often class="count")
+        if soup.find("p", attrs={"id": re.compile(r"^point\d+$")}):
+            return self._extract_table_format(soup)
+
         # Find all paragraph elements
         all_paragraphs = soup.find_all("p")
         if not all_paragraphs:
@@ -93,10 +97,6 @@ class ModernJudgementParser(BaseJudgementParser):
         start_paragraph = self._find_starting_paragraph(all_paragraphs)
         if not start_paragraph:
             return {}
-
-        # Check for table-based format (newer format)
-        if start_paragraph.get("count"):
-            return self._extract_table_format(soup)
 
         # Collect all numbered paragraph markers
         numbered_paragraphs = self._collect_numbered_paragraphs(start_paragraph)
@@ -161,17 +161,28 @@ class ModernJudgementParser(BaseJudgementParser):
 
     def _extract_table_format(self, soup: bs) -> dict[int, str]:
         """Extract paragraphs from the newer table-based format."""
-        pars: list[str] = []
-        pars_temp = soup.find_all("p", attrs={"id": re.compile(r"point\d")})
+        paragraphs: list[str] = []
+        point_markers = soup.find_all("p", attrs={"id": re.compile(r"^point\d+$")})
 
-        for p in pars_temp:
-            row_parent = p.find_parent("tr")
-            if row_parent:
-                p_text = row_parent.find("p", attrs={"class": "normal"})
-                if p_text:
-                    pars.append(self._get_text(p_text))
+        for marker in point_markers:
+            row_parent = marker.find_parent("tr")
+            if not row_parent:
+                continue
 
-        return {par_no: text for par_no, text in enumerate(pars, start=1)}
+            # Only consider the immediate TDs of this row to avoid nested table TDs
+            tds = row_parent.find_all("td", recursive=False)
+            if len(tds) < 2:
+                continue
+
+            # Content is in the last TD of the row
+            content_td = tds[-1]
+
+            # Simpler and more robust: take all text within the content cell
+            # This captures the header and any nested bullet tables in order
+            combined: str = " ".join(content_td.stripped_strings).strip()
+            paragraphs.append(combined)
+
+        return {par_no: text for par_no, text in enumerate(paragraphs, start=1)}
 
     def _find_starting_paragraph(self, paragraphs: list[Tag]) -> Tag | None:
         # Look for first numbered paragraph
@@ -499,7 +510,7 @@ if __name__ == "__main__":
     parser = JudgementParser()
     paragraphs = parser.extract_paragraphs(random_case)
 
-    for number, text in paragraphs.items():
+    for number, text in list(paragraphs.items()):
         print(f"{number}:")
         print(text)
         print("\n" + "=" * 100 + "\n")
