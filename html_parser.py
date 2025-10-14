@@ -291,10 +291,32 @@ class LegacyEurLexParser(BaseJudgementParser):
 class OperativePartParser(BaseJudgementParser):
     """Parser for pages that only contain an Operative part rendered via tables."""
 
+    # Some documents use C12DispositifIntroduction, others use C09DispositifIntroduction
+    HEADING_CLASSES = [
+        "C12DispositifIntroduction",
+        "C09DispositifIntroduction",
+    ]
+
+    def _find_operative_heading(self, soup: bs) -> Tag | None:
+        """Locate the operative part heading, supporting multiple class variants."""
+        # Prefer class-based detection
+        for class_name in self.HEADING_CLASSES:
+            heading = soup.find("p", class_=class_name)
+            if heading:
+                return heading
+
+        # Fallback to text-based detection
+        for p_tag in soup.find_all("p"):
+            text = " ".join(p_tag.stripped_strings)
+            if text and "operative part" in text.lower():
+                return p_tag
+
+        return None
+
     def can_parse(self, soup: bs) -> bool:
         """Detects an Operative part section (tables or numeric-only paragraphs)."""
         # Look for the Operative part heading
-        heading = soup.find("p", class_="C12DispositifIntroduction")
+        heading = self._find_operative_heading(soup)
         if not heading:
             return False
 
@@ -344,7 +366,7 @@ class OperativePartParser(BaseJudgementParser):
 
     def extract_paragraphs(self, soup: bs) -> dict[int, str]:
         """Extract numbered operative points from tables or numeric-only paragraphs."""
-        heading = soup.find("p", class_="C12DispositifIntroduction")
+        heading = self._find_operative_heading(soup)
         if not heading:
             return {}
 
@@ -504,8 +526,7 @@ if __name__ == "__main__":
 
     # Randomly select a case file
     random_case = random.choice(case_files)
-    random_case = "cases/62016TJ0757.html"
-    print(f"Processing random case: {random_case}\n")
+    random_case = "cases/62005CJ0046.html"
 
     parser = JudgementParser()
     paragraphs = parser.extract_paragraphs(random_case)
@@ -514,3 +535,6 @@ if __name__ == "__main__":
         print(f"{number}:")
         print(text)
         print("\n" + "=" * 100 + "\n")
+
+    celex = random_case.split("/")[-1].split(".")[0]
+    print(f"CELEX: {celex}\n")
