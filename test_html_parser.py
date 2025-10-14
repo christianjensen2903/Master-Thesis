@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from typing import Any
 import pytest  # type: ignore
-from html_parser import ECJProcessor
+from html_parser import JudgementParser
 
 
 def load_test_cases() -> dict[str, dict[str, Any]]:
@@ -29,8 +29,8 @@ def test_paragraph_extraction(celex: str) -> None:
     expected_paragraphs = test_case["paragraphs"]
 
     # Parse the HTML file
-    parser = ECJProcessor(test_case["path"])  # type: ignore
-    actual_paragraphs = parser.read_paragraphs()
+    parser = JudgementParser()
+    actual_paragraphs = parser.extract_paragraphs(test_case["path"])  # type: ignore
 
     # Convert keys to strings for comparison (JSON keys are always strings)
     actual_paragraphs_str = {str(k): v for k, v in actual_paragraphs.items()}

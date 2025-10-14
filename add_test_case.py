@@ -19,7 +19,7 @@ import sys
 import argparse
 import json
 from pathlib import Path
-from html_parser import ECJProcessor
+from html_parser import JudgementParser
 
 
 def find_case_file(celex: str) -> str | None:
@@ -42,8 +42,8 @@ def find_case_file(celex: str) -> str | None:
 
 def extract_paragraphs(path: str) -> dict[int, str]:
     """Extract paragraphs from a case file."""
-    parser = ECJProcessor(path)
-    return parser.read_paragraphs()
+    parser = JudgementParser()
+    return parser.extract_paragraphs(path)
 
 
 def show_verification_info(celex: str, paragraphs: dict[int, str]) -> None:
