@@ -208,7 +208,7 @@ def _parse_target_fragment(fragment: str) -> TargetLocation:
     )
 
 
-def _parse_pairs_from_axioms(xml_root: ET.Element) -> list[Citation]:
+def _parse_pairs_from_axioms(xml_root: ET.Element, celex: str) -> list[Citation]:
     pairs: list[Citation] = []
 
     # OWL axiom nodes carry annotatedSource/annotatedTarget and fragment_* data.
@@ -222,6 +222,7 @@ def _parse_pairs_from_axioms(xml_root: ET.Element) -> list[Citation]:
         annotated_target = None
         fragment_source = None
         fragment_target = None
+        annotated_property = None
 
         for child in desc:
             lname = _local(child.tag)
@@ -229,27 +230,52 @@ def _parse_pairs_from_axioms(xml_root: ET.Element) -> list[Citation]:
                 annotated_source = _extract_resource(child)
             elif lname == "annotatedTarget":
                 annotated_target = _extract_resource(child)
+            elif lname == "annotatedProperty":
+                annotated_property = _extract_resource(child)
             elif lname == "fragment_citing_source":
                 fragment_source = _text(child)
             elif lname == "fragment_cited_target":
                 fragment_target = _text(child)
 
-        print(annotated_source, annotated_target, fragment_source, fragment_target)
+        # Only consider citations where the annotated property is work_cites_work
+        if (
+            annotated_property != f"{CDM_NS}work_cites_work"
+            and annotated_property != f"{CDM_NS}cites"
+        ):
+            continue
 
-        # Require CELEX URIs on both ends and paragraph fragments on both
+        # Require CELEX URIs on both ends; fragments are optional
         if not annotated_source or not annotated_target:
             continue
         if "/celex/" not in annotated_source or "/celex/" not in annotated_target:
-            continue
-        if not fragment_source or not fragment_target:
-
             continue
 
         from_celex = unquote(annotated_source.rsplit("/", 1)[-1])
         to_celex = unquote(annotated_target.rsplit("/", 1)[-1])
 
-        source_pages, source_pars, source_cols = _parse_source_fragment(fragment_source)
-        target_loc = _parse_target_fragment(fragment_target)
+        if from_celex != celex:
+            continue
+
+        # Parse available fragments; default missing ones to empty structured values
+        if fragment_source:
+            source_pages, source_pars, source_cols = _parse_source_fragment(
+                fragment_source
+            )
+        else:
+            source_pages, source_pars, source_cols = [], [], []
+
+        if fragment_target:
+            target_loc = _parse_target_fragment(fragment_target)
+        else:
+            target_loc = TargetLocation(
+                article=None,
+                paragraph=None,
+                point=None,
+                line=None,
+                page=None,
+                column=None,
+                raw="",
+            )
         if not (source_pars or source_pages or source_cols) and (
             target_loc.article is None
             and target_loc.paragraph is None
@@ -269,8 +295,8 @@ def _parse_pairs_from_axioms(xml_root: ET.Element) -> list[Citation]:
                 source_columns=source_cols,
                 celex_to=to_celex,
                 target_location=target_loc,
-                fragment_source=fragment_source,
-                fragment_target=fragment_target,
+                fragment_source=fragment_source or "",
+                fragment_target=fragment_target or "",
             )
         )
 
@@ -278,12 +304,13 @@ def _parse_pairs_from_axioms(xml_root: ET.Element) -> list[Citation]:
 
 
 def extract_pairs_from_file(path: Path) -> tuple[list[Citation], dict[str, str]]:
+
     tree = ET.parse(path)
     root = tree.getroot()
     date_map = _parse_date_map(root)
     # Only keep pairs where the annotated source CELEX matches the current file's CELEX
     file_celex = path.stem
-    all_pairs = _parse_pairs_from_axioms(root)
+    all_pairs = _parse_pairs_from_axioms(root, file_celex)
     pairs = [p for p in all_pairs if p.celex_from == file_celex]
     return pairs, date_map
 
@@ -490,3 +517,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+    # print all pairs for 61970CJ0003
+    # rdf_dir = Path("eurlex_rdf")
+    # # rdf_file = rdf_dir / "61970CJ0003.rdf"
+    # rdf_file = rdf_dir / "62020CJ0692.rdf"
+    # pairs, _ = extract_pairs_from_file(rdf_file)
+    # print(pairs)
