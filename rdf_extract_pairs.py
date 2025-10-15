@@ -234,6 +234,8 @@ def _parse_pairs_from_axioms(xml_root: ET.Element) -> list[Citation]:
             elif lname == "fragment_cited_target":
                 fragment_target = _text(child)
 
+        print(annotated_source, annotated_target, fragment_source, fragment_target)
+
         # Require CELEX URIs on both ends and paragraph fragments on both
         if not annotated_source or not annotated_target:
             continue
@@ -474,77 +476,16 @@ def main() -> None:
 
     # Decide output format by extension: .jsonl -> line-delimited, else structured JSON
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.suffix.lower() == ".jsonl":
-        # legacy line-delimited output
-        def write_jsonl(*, entries: Iterable[dict[str, object]]) -> None:
-            with out_path.open("w", encoding="utf-8") as f:
-                for row in entries:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-        # Produce the legacy flat rows
-        flat_rows: list[dict[str, object]] = []
-        for p in all_pairs:
-            flat_rows.append(
-                {
-                    "CELEX_FROM": p.celex_from,
-                    "TITLE_FROM": None,
-                    # Back-compat: NUMBER_FROM remains paragraph if available, else page, else column
-                    "NUMBER_FROM": (
-                        p.source_paragraphs[0]
-                        if p.source_paragraphs
-                        else (
-                            p.source_pages[0]
-                            if p.source_pages
-                            else (p.source_columns[0] if p.source_columns else None)
-                        )
-                    ),
-                    "DATE_FROM": date_index.get(p.celex_from),
-                    "TEXT_FROM": p.fragment_source,
-                    "CELEX_TO": p.celex_to,
-                    "TITLE_TO": None,
-                    "NUMBER_TO": (
-                        # Prefer paragraph, then article, then point, then line, then page, then column
-                        p.target_location.paragraph
-                        if p.target_location.paragraph is not None
-                        else (
-                            p.target_location.article
-                            if p.target_location.article is not None
-                            else (
-                                p.target_location.point
-                                if p.target_location.point is not None
-                                else (
-                                    p.target_location.line
-                                    if p.target_location.line is not None
-                                    else (
-                                        p.target_location.page
-                                        if p.target_location.page is not None
-                                        else p.target_location.column
-                                    )
-                                )
-                            )
-                        )
-                    ),
-                    "TEXT_TO": p.fragment_target,
-                    "DATE_TO": date_index.get(p.celex_to),
-                    # New fields (additive): expose disambiguated locations
-                    "PAGES_FROM": p.source_pages if p.source_pages else None,
-                    "COLUMNS_FROM": p.source_columns if p.source_columns else None,
-                    "PAGE_TO": p.target_location.page,
-                    "COLUMN_TO": p.target_location.column,
-                }
-            )
-        write_jsonl(entries=flat_rows)
-        print(f"Wrote {len(flat_rows)} rows to {out_path}")
-    else:
-        # Build structured JSON similar to par-to-par.json
-        data = build_par_to_par_json(
-            all_pairs=all_pairs,
-            date_index=date_index,
-            xml_roots_by_file=xml_roots_by_file,
-        )
-        with out_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        print(f"Wrote {len(data)} CELEX entries to {out_path}")
+    # Build structured JSON similar to par-to-par.json
+    data = build_par_to_par_json(
+        all_pairs=all_pairs,
+        date_index=date_index,
+        xml_roots_by_file=xml_roots_by_file,
+    )
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    print(f"Wrote {len(data)} CELEX entries to {out_path}")
 
 
 if __name__ == "__main__":
