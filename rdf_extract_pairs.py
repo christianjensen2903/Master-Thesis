@@ -8,7 +8,7 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Iterable
 from urllib.parse import unquote
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore
 
 
 CDM_NS = "http://publications.europa.eu/ontology/cdm#"
@@ -473,6 +473,47 @@ def build_par_to_par_json(
     return result
 
 
+def _build_entry_from_root(
+    xml_root: ET.Element, file_celex: str
+) -> tuple[str, dict[str, object]] | None:
+    pairs = _parse_pairs_from_axioms(xml_root, file_celex)
+    if not pairs:
+        return None
+
+    refs: list[dict[str, object]] = []
+    for pair in pairs:
+        refs.append(
+            {
+                "target": pair.celex_to,
+                "source": {
+                    "pages": pair.source_pages,
+                    "paragraphs": pair.source_paragraphs,
+                    "columns": pair.source_columns,
+                    "raw": pair.fragment_source,
+                },
+                "target_location": {
+                    "article": pair.target_location.article,
+                    "paragraph": pair.target_location.paragraph,
+                    "point": pair.target_location.point,
+                    "line": pair.target_location.line,
+                    "page": pair.target_location.page,
+                    "column": pair.target_location.column,
+                    "raw": pair.target_location.raw,
+                },
+            }
+        )
+
+    meta: dict[str, object] = {}
+    date_map = _parse_date_map(xml_root)
+    if file_celex in date_map:
+        meta["date"] = date_map[file_celex]
+
+    enrich = _extract_meta_for_sources(xml_root, {file_celex}).get(file_celex, {})
+    meta.update(enrich)
+
+    return file_celex, {"meta": meta, "references": refs}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract paragraph-to-paragraph metadata pairs from EUR-Lex RDF files"
@@ -489,6 +530,12 @@ def parse_args() -> argparse.Namespace:
         default=Path("data/parsed_par_pairs.json"),
         help="Output JSON or JSONL file path (auto by extension)",
     )
+    parser.add_argument(
+        "--flush-interval",
+        type=int,
+        default=100,
+        help="Number of CELEX entries between file flushes (default: 100)",
+    )
     return parser.parse_args()
 
 
@@ -497,35 +544,68 @@ def main() -> None:
     rdf_dir: Path = args.rdf_dir
     out_path: Path = args.output
 
-    date_index = build_celex_date_index(rdf_dir)
-
-    all_pairs: list[Citation] = []
-    xml_roots_by_file: dict[Path, ET.Element] = {}
-    for rdf_file in tqdm(
-        _iter_files(rdf_dir),
-        desc="Extracting pairs",
-        total=_get_number_of_files(rdf_dir),
-    ):
-        try:
-            pairs, _ = extract_pairs_from_file(rdf_file)
-            # Cache root for meta extraction
-            xml_roots_by_file[rdf_file] = ET.parse(rdf_file).getroot()
-        except ET.ParseError:
-            continue
-        all_pairs.extend(pairs)
-
-    # Decide output format by extension: .jsonl -> line-delimited, else structured JSON
+    # Stream to disk to avoid high RAM usage
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    is_jsonl = out_path.suffix.lower() == ".jsonl"
 
-    # Build structured JSON similar to par-to-par.json
-    data = build_par_to_par_json(
-        all_pairs=all_pairs,
-        date_index=date_index,
-        xml_roots_by_file=xml_roots_by_file,
-    )
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    print(f"Wrote {len(data)} CELEX entries to {out_path}")
+    entries_written: int = 0
+    flush_interval: int = max(1, int(args.flush_interval))  # periodic flushes
+
+    if is_jsonl:
+        with out_path.open("w", encoding="utf-8") as f:
+            for rdf_file in tqdm(
+                _iter_files(rdf_dir),
+                desc="Extracting pairs",
+                total=_get_number_of_files(rdf_dir),
+            ):
+                try:
+                    root = ET.parse(rdf_file).getroot()
+                except ET.ParseError:
+                    continue
+                file_celex = rdf_file.stem
+                built = _build_entry_from_root(root, file_celex)
+                if not built:
+                    continue
+                celex_key, entry_obj = built
+                line_obj = {
+                    "celex": celex_key,
+                    "meta": entry_obj["meta"],
+                    "references": entry_obj["references"],
+                }
+                f.write(json.dumps(line_obj, ensure_ascii=False) + "\n")
+                entries_written += 1
+                if entries_written % flush_interval == 0:
+                    f.flush()
+        print(f"Wrote {entries_written} CELEX entries to {out_path} (JSONL)")
+    else:
+        with out_path.open("w", encoding="utf-8") as f:
+            f.write("{\n")
+            first: bool = True
+            for rdf_file in tqdm(
+                _iter_files(rdf_dir),
+                desc="Extracting pairs",
+                total=_get_number_of_files(rdf_dir),
+            ):
+                try:
+                    root = ET.parse(rdf_file).getroot()
+                except ET.ParseError:
+                    continue
+                file_celex = rdf_file.stem
+                built = _build_entry_from_root(root, file_celex)
+                if not built:
+                    continue
+                celex_key, entry_obj = built
+                if not first:
+                    f.write(",\n")
+                f.write(json.dumps(celex_key))
+                f.write(": ")
+                f.write(json.dumps(entry_obj, ensure_ascii=False))
+                first = False
+                entries_written += 1
+                if entries_written % flush_interval == 0:
+                    f.flush()
+            f.write("\n}\n")
+        print(f"Wrote {entries_written} CELEX entries to {out_path}")
 
 
 if __name__ == "__main__":

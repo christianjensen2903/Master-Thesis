@@ -9,3 +9,4 @@ artifacts
 *.csv
 *.pyc
 eurlex_rdf
+*.jsonl
