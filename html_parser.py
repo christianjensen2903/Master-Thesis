@@ -168,6 +168,9 @@ class ModernJudgementParser(BaseJudgementParser):
         point_markers = soup.find_all("p", attrs={"id": re.compile(r"^point\d+$")})
 
         for marker in point_markers:
+            # Skip nested markers that belong to sub-points inside a parent paragraph's content cell
+            if self._is_nested_point_marker(marker):
+                continue
             row_parent = marker.find_parent("tr")
             if not row_parent:
                 continue
@@ -186,6 +189,21 @@ class ModernJudgementParser(BaseJudgementParser):
             paragraphs.append(combined)
 
         return {par_no: text for par_no, text in enumerate(paragraphs, start=1)}
+
+    def _is_nested_point_marker(self, marker: Tag) -> bool:
+        """Return True if the marker is inside the content cell of another numbered row.
+
+        Heuristic: if any ancestor TD has a previous sibling TD that itself contains
+        a `p` with id matching ^point\d+$, then this marker is nested inside that
+        row's content cell and should not be treated as a top-level paragraph marker.
+        """
+        for td in marker.find_parents("td"):
+            prev_td = td.find_previous_sibling("td")
+            if not prev_td:
+                continue
+            if prev_td.find("p", attrs={"id": re.compile(r"^point\d+$")}):
+                return True
+        return False
 
     def _find_starting_paragraph(self, paragraphs: list[Tag]) -> Tag | None:
         # Look for first numbered paragraph
@@ -550,7 +568,8 @@ if __name__ == "__main__":
 
     # Randomly select a case file
     random_case = random.choice(case_files)
-    random_case = "cases/62009CC0397.html"
+    random_case = "cases/61995TJ0217.html"
+    # random_case = "cases/61983CC0126.html" # AG opinion. Wait to see if subpoints are supported.
 
     parser = JudgementParser()
     paragraphs = parser.extract_paragraphs(random_case)
