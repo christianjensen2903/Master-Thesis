@@ -8,6 +8,7 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Iterable
 from urllib.parse import unquote
+from tqdm import tqdm
 
 
 CDM_NS = "http://publications.europa.eu/ontology/cdm#"
@@ -58,6 +59,10 @@ def _iter_files(rdf_dir: Path) -> Iterable[Path]:
     for p in sorted(rdf_dir.glob("*.rdf")):
         if p.is_file():
             yield p
+
+
+def _get_number_of_files(rdf_dir: Path) -> int:
+    return len(list(rdf_dir.glob("*.rdf"))) if rdf_dir.is_dir() else 0
 
 
 def _parse_date_map(xml_root: ET.Element) -> dict[str, str]:
@@ -317,7 +322,11 @@ def extract_pairs_from_file(path: Path) -> tuple[list[Citation], dict[str, str]]
 
 def build_celex_date_index(rdf_dir: Path) -> dict[str, str]:
     index: dict[str, str] = {}
-    for rdf_file in _iter_files(rdf_dir):
+    for rdf_file in tqdm(
+        _iter_files(rdf_dir),
+        desc="Building celex date index",
+        total=_get_number_of_files(rdf_dir),
+    ):
         try:
             pairs, date_map = extract_pairs_from_file(rdf_file)
         except ET.ParseError:
@@ -492,7 +501,11 @@ def main() -> None:
 
     all_pairs: list[Citation] = []
     xml_roots_by_file: dict[Path, ET.Element] = {}
-    for rdf_file in _iter_files(rdf_dir):
+    for rdf_file in tqdm(
+        _iter_files(rdf_dir),
+        desc="Extracting pairs",
+        total=_get_number_of_files(rdf_dir),
+    ):
         try:
             pairs, _ = extract_pairs_from_file(rdf_file)
             # Cache root for meta extraction
