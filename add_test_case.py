@@ -11,8 +11,7 @@ Example:
 This will:
 1. Parse the case using ECJProcessor
 2. Show you the extracted paragraphs for verification
-3. Ask for confirmation
-4. Add to test_cases.json if confirmed
+3. Add to test_cases.json
 """
 
 import sys
@@ -119,11 +118,7 @@ def add_to_test_cases(celex: str, path: str, paragraphs: dict[int, str]) -> None
 
     # Check if case already exists
     if celex in test_cases:
-        print(f"\n⚠️  WARNING: {celex} already exists in test_cases.json")
-        response = input("Do you want to overwrite it? (yes/no): ").strip().lower()
-        if response not in ("yes", "y"):
-            print("Cancelled.")
-            return
+        print(f"\nℹ️  {celex} already exists in test_cases.json; overwriting.")
 
     # Convert paragraph numbers to strings (JSON requires string keys)
     paragraphs_str = {str(k): v for k, v in sorted(paragraphs.items())}
@@ -163,11 +158,7 @@ After running this script, run the tests to verify:
         help="Path to HTML file (if not provided, will search in cases/ and summaries/)",
     )
 
-    parser.add_argument(
-        "--no-confirm",
-        action="store_true",
-        help="Skip confirmation prompt and add directly",
-    )
+    # Confirmation prompts have been removed to support non-interactive use
 
     args = parser.parse_args()
 
@@ -205,14 +196,6 @@ After running this script, run the tests to verify:
 
     # Show verification info
     show_verification_info(args.celex, paragraphs)
-
-    # Ask for confirmation unless --no-confirm
-    if not args.no_confirm:
-        print("\nHave you manually verified that these paragraphs are correct?")
-        response = input("Add this test case? (yes/no): ").strip().lower()
-        if response not in ("yes", "y"):
-            print("Cancelled.")
-            sys.exit(0)
 
     # Add to test cases
     add_to_test_cases(args.celex, path, paragraphs)
