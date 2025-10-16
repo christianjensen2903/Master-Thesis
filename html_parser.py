@@ -285,17 +285,30 @@ class LegacyEurLexParser(BaseJudgementParser):
         if not h2_tag:
             return {}
 
-        # Find the em tag after the h2
+        # Find the em tag after the h2; some simplified pages do not wrap in <em>
         em_tag = h2_tag.find_next_sibling("em")
-        if not em_tag:
-            return {}
 
-        # Find all p tags within the em section
-        p_tags = em_tag.find_all("p", recursive=False)
+        # Collect paragraph tags: prefer <em> container, otherwise scan sibling <p> until next section
+        p_tags: list[Tag] = []
+        if em_tag:
+            p_tags = list(em_tag.find_all("p", recursive=False))
+        else:
+            sibling = h2_tag.find_next_sibling()
+            while sibling:
+                if isinstance(sibling, Tag):
+                    # Stop at next major section heading or operative part anchor
+                    if sibling.name == "h2":
+                        break
+                    if sibling.name == "a" and sibling.get("name") in {"DI"}:
+                        break
+                    if sibling.name == "p":
+                        p_tags.append(sibling)
+                sibling = sibling.find_next_sibling()
 
-        paragraphs = {}
-        current_number = None
-        current_text_parts = []
+        paragraphs: dict[int, str] = {}
+        current_number: int | None = None
+        current_text_parts: list[str] = []
+        last_committed_number: int | None = None
 
         for p_tag in p_tags:
             text = self._get_text(p_tag).strip()
@@ -303,16 +316,45 @@ class LegacyEurLexParser(BaseJudgementParser):
                 continue
 
             # Check if this paragraph starts with a number
-            match = re.match(r"^(\d+)\s+(.+)", text)
+            match = re.match(r"^\s*(\d+)[\.\)]?\s+(.+)", text)
 
             if match:
-                # Save previous paragraph if exists
-                if current_number is not None and current_text_parts:
-                    paragraphs[current_number] = " ".join(current_text_parts)
+                proposed_num = int(match.group(1))
+                proposed_text = match.group(2)
 
-                # Start new paragraph
-                current_number = int(match.group(1))
-                current_text_parts = [match.group(2)]
+                # Start at 1 only; otherwise treat as continuation until we see '1'
+                if current_number is None and last_committed_number is None:
+                    if proposed_num == 1:
+                        current_number = 1
+                        current_text_parts = [proposed_text]
+                        continue
+                    # Skip stray numbered items before the first main paragraph
+                    current_text_parts.append(text)
+                    continue
+
+                # Normal progression must be strictly increasing by 1
+                expected_next = (
+                    (current_number + 1)
+                    if current_number is not None
+                    else (
+                        (last_committed_number + 1)
+                        if last_committed_number is not None
+                        else 1
+                    )
+                )
+
+                if proposed_num == expected_next:
+                    # Commit previous
+                    if current_number is not None and current_text_parts:
+                        paragraphs[current_number] = " ".join(current_text_parts)
+                        last_committed_number = current_number
+
+                    # Start new top-level paragraph
+                    current_number = proposed_num
+                    current_text_parts = [proposed_text]
+                else:
+                    # Nested/sub-point numbering; treat as continuation
+                    current_text_parts.append(text)
             elif current_number is not None:
                 # This is a subsection or continuation
                 # Check if it's a subsection header (all caps, starts with "AS TO")
@@ -568,7 +610,7 @@ if __name__ == "__main__":
 
     # Randomly select a case file
     random_case = random.choice(case_files)
-    random_case = "cases/61995TJ0217.html"
+    random_case = "cases/62007CJ0521.html"
     # random_case = "cases/61983CC0126.html" # AG opinion. Wait to see if subpoints are supported.
 
     parser = JudgementParser()
