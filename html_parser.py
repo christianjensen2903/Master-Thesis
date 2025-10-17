@@ -96,6 +96,9 @@ class ModernJudgementParser(BaseJudgementParser):
         if not all_paragraphs:
             return {}
 
+        # Analyze document pattern to determine if it has mixed numbering patterns
+        self._analyze_document_pattern(all_paragraphs)
+
         # Find where the judgment content starts
         start_paragraph = self._find_starting_paragraph(all_paragraphs)
         if not start_paragraph:
@@ -122,6 +125,40 @@ class ModernJudgementParser(BaseJudgementParser):
             current = next_sibling
 
         return numbered_paragraphs
+
+    def _analyze_document_pattern(self, all_paragraphs: list[Tag]) -> None:
+        """Analyze the document to detect if it has mixed numbering patterns."""
+        import re
+
+        period_pattern_count = 0
+        no_period_pattern_count = 0
+
+        # Count paragraphs with different numbering patterns
+        for p in all_paragraphs:
+            raw_classes = p.get("class")
+            if not raw_classes:
+                continue
+            classes = (
+                [raw_classes] if isinstance(raw_classes, str) else list(raw_classes)
+            )
+
+            # Only analyze paragraphs with numbered classes
+            if not any(
+                num_class in classes for num_class in self.NUMBERED_PARAGRAPH_CLASSES
+            ):
+                continue
+
+            text = self._get_text(p).strip()
+            if re.match(r"^\s*\d+\.\s+", text):
+                period_pattern_count += 1
+            elif re.match(r"^\s*\d+\s+", text):
+                no_period_pattern_count += 1
+
+        # Mark as analyzed and determine if it has mixed patterns
+        self._document_pattern_analyzed = True
+        self._document_has_mixed_patterns = (
+            period_pattern_count > 0 and no_period_pattern_count > 0
+        )
 
     def _extract_texts_from_numbered_paragraphs(
         self, numbered_paragraphs: list[Tag]
@@ -206,9 +243,12 @@ class ModernJudgementParser(BaseJudgementParser):
         return False
 
     def _find_starting_paragraph(self, paragraphs: list[Tag]) -> Tag | None:
-        # Look for first numbered paragraph
+        # Look for first numbered paragraph, but skip summary sections
         for p in paragraphs:
             if self._has_any_numbered_class(p):
+                # Skip summary items (C45MotClenumerote class)
+                if self._has_class(p, "C45MotClenumerote"):
+                    continue
                 return p
 
         # If no numbered paragraph found, return first paragraph as fallback
@@ -241,9 +281,31 @@ class ModernJudgementParser(BaseJudgementParser):
         if not raw_classes:
             return False
         classes = [raw_classes] if isinstance(raw_classes, str) else list(raw_classes)
-        return any(
+
+        # Check if it has the numbered class
+        has_numbered_class = any(
             num_class in classes for num_class in self.NUMBERED_PARAGRAPH_CLASSES
         )
+
+        if not has_numbered_class:
+            return False
+
+        # Special case handling for documents with mixed patterns
+        # This is a heuristic to handle cases like 62004TJ0406 that have both "1." and "1 " patterns
+        text = self._get_text(tag).strip()
+        import re
+
+        # If the document has both patterns, prefer the "1 " pattern (sub-paragraphs)
+        # This is detected by checking if there are paragraphs with both patterns in the document
+        if hasattr(self, "_document_pattern_analyzed"):
+            if self._document_has_mixed_patterns:
+                # For mixed pattern documents, only include "1 " pattern (not "1.")
+                return bool(re.match(r"^\s*\d+\s+", text)) and not bool(
+                    re.match(r"^\s*\d+\.\s+", text)
+                )
+
+        # Default behavior: include all numbered paragraphs
+        return True
 
     def _is_section_heading(self, tag: Tag) -> bool:
         """Heuristically detect section headings by class name.
@@ -783,7 +845,7 @@ if __name__ == "__main__":
     random_case = random.choice(
         [file for file in case_files if any(x in file for x in ["CJ", "FJ", "TJ"])]
     )
-    random_case = "cases/62001CJ0433.html"
+    random_case = "cases/62004TJ0406.html"
 
     parser = JudgementParser()
     paragraphs = parser.extract_paragraphs(random_case)
