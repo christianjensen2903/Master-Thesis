@@ -194,7 +194,7 @@ class ModernJudgementParser(BaseJudgementParser):
         """Return True if the marker is inside the content cell of another numbered row.
 
         Heuristic: if any ancestor TD has a previous sibling TD that itself contains
-        a `p` with id matching ^point\d+$, then this marker is nested inside that
+        a `p` with id matching ^point\\d+$, then this marker is nested inside that
         row's content cell and should not be treated as a top-level paragraph marker.
         """
         for td in marker.find_parents("td"):
@@ -372,6 +372,82 @@ class LegacyEurLexParser(BaseJudgementParser):
         return paragraphs
 
 
+class NestedDocumentParser(BaseJudgementParser):
+    """Parser for documents with nested HTML content inside document_content div."""
+
+    def can_parse(self, soup: bs) -> bool:
+        """Check if this document has nested HTML content."""
+        # Look for document_content div with nested HTML
+        doc_content = soup.find("div", id="document_content")
+        if not doc_content:
+            return False
+
+        # Check if there's a nested HTML tag inside (case insensitive)
+        nested_html = doc_content.find("html") or doc_content.find("HTML")
+        if not nested_html:
+            return False
+
+        # Check if the nested HTML has numbered paragraphs (case insensitive)
+        nested_body = nested_html.find("body") or nested_html.find("BODY")
+        if not nested_body:
+            return False
+
+        # Look for numbered paragraph classes in the nested content
+        for cls in ["C01PointnumeroteAltN", "C01PointAltN"]:
+            if nested_body.find("p", class_=cls):
+                return True
+
+        # Also check if the content is actually HTML text that needs to be parsed
+        all_ps = nested_body.find_all("p")
+        if len(all_ps) == 0:
+            body_text = str(nested_body)
+            # Try to parse the body content as HTML
+            from bs4 import BeautifulSoup
+
+            inner_soup = BeautifulSoup(body_text, "html.parser")
+
+            # Check for numbered paragraph classes in the re-parsed content
+            for cls in ["C01PointnumeroteAltN", "C01PointAltN"]:
+                if inner_soup.find("p", class_=cls):
+                    return True
+
+        return False
+
+    def extract_paragraphs(self, soup: bs) -> dict[int, str]:
+        """Extract paragraphs from nested HTML content."""
+        doc_content = soup.find("div", id="document_content")
+        if not doc_content:
+            return {}
+
+        nested_html = doc_content.find("html") or doc_content.find("HTML")
+        if not nested_html:
+            return {}
+
+        nested_body = nested_html.find("body") or nested_html.find("BODY")
+        if not nested_body:
+            return {}
+
+        # Check if we need to re-parse the body content as HTML
+        body_ps = nested_body.find_all("p")
+        if len(body_ps) == 0:
+            # The body content is HTML text that needs to be re-parsed
+            body_text = str(nested_body)
+            from bs4 import BeautifulSoup
+
+            inner_soup = BeautifulSoup(body_text, "html.parser")
+            # Use the ModernJudgementParser logic on the re-parsed content
+            modern_parser = ModernJudgementParser()
+            return modern_parser.extract_paragraphs(inner_soup)
+        else:
+            # Create a new BeautifulSoup object from the nested body content
+            from bs4 import BeautifulSoup
+
+            body_soup = BeautifulSoup(str(nested_body), "html.parser")
+            # Use the ModernJudgementParser logic on the nested content
+            modern_parser = ModernJudgementParser()
+            return modern_parser.extract_paragraphs(body_soup)
+
+
 class OperativePartParser(BaseJudgementParser):
     """Parser for pages that only contain an Operative part rendered via tables."""
 
@@ -540,6 +616,7 @@ class JudgementParser:
 
     def __init__(self) -> None:
         self.parsers: list[BaseJudgementParser] = [
+            NestedDocumentParser(),
             LegacyEurLexParser(),
             ModernJudgementParser(),
             OperativePartParser(),
@@ -591,8 +668,6 @@ class JudgementParser:
 
         # Try each parser in order
         for parser in self.parsers:
-            print(parser.__class__.__name__)
-            print(parser.can_parse(soup))
             if parser.can_parse(soup):
                 return parser.extract_paragraphs(soup)
 
@@ -609,9 +684,10 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Randomly select a case file
-    random_case = random.choice(case_files)
-    random_case = "cases/62007CJ0521.html"
-    # random_case = "cases/61983CC0126.html" # AG opinion. Wait to see if subpoints are supported.
+    random_case = random.choice(
+        [file for file in case_files if any(x in file for x in ["CJ", "FJ", "TJ"])]
+    )
+    random_case = "cases/62013TJ0528.html"
 
     parser = JudgementParser()
     paragraphs = parser.extract_paragraphs(random_case)
