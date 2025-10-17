@@ -4,6 +4,7 @@ import httpx
 from pathlib import Path
 from typing import Final
 import xml.etree.ElementTree as ET
+from urllib.parse import quote
 
 
 CELEX_RDF_BASE: Final[str] = "https://publications.europa.eu/resource/celex/"
@@ -40,7 +41,9 @@ def parse_celex_ids_from_search_xml(xml_text: str) -> list[str]:
 
 
 def build_celex_rdf_url(celex: str, language: str | None = None) -> str:
-    base = f"{CELEX_RDF_BASE}{celex}"
+    # URL encode the CELEX ID to handle special characters like parentheses
+    encoded_celex = quote(celex, safe="")
+    base = f"{CELEX_RDF_BASE}{encoded_celex}"
     if language:
         return f"{base}?language={language}"
     return base

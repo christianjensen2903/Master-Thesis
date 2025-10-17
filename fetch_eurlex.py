@@ -16,7 +16,6 @@ from eur_lex_rdf import (
 )
 
 
-# TODO: FM_CODED = JUDG AND DD >= 20170101 ORDER BY DD ASC
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fetch EUR-Lex SOAP search results as XML"
