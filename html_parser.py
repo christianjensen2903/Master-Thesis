@@ -448,6 +448,101 @@ class NestedDocumentParser(BaseJudgementParser):
             return modern_parser.extract_paragraphs(body_soup)
 
 
+class DtDdParser(BaseJudgementParser):
+    """Parser for cases that use <dt> and <dd> tags for numbered paragraphs."""
+
+    def can_parse(self, soup: bs) -> bool:
+        """Check if this document uses dt/dd format for numbered paragraphs."""
+        # Look for dt tags that contain numbers
+        dt_tags = soup.find_all("dt")
+        for dt in dt_tags:
+            text = self._get_text(dt).strip()
+            # Check if it starts with a number
+            if re.match(r"^\s*\d+\s*$", text):
+                return True
+        return False
+
+    def extract_paragraphs(self, soup: bs) -> dict[int, str]:
+        """Extract paragraphs from dt/dd structure."""
+        paragraphs: dict[int, str] = {}
+
+        # Find all dt tags
+        dt_tags = soup.find_all("dt")
+
+        for dt in dt_tags:
+            dt_text = self._get_text(dt).strip()
+
+            # Check if this dt contains a number
+            match = re.match(r"^\s*(\d+)\s*$", dt_text)
+            if not match:
+                continue
+
+            paragraph_number = int(match.group(1))
+
+            # The content follows after the </dt> tag
+            # We need to collect all text until the next <dt> tag
+            content_parts = []
+            current = dt.next_sibling
+
+            while current:
+                if isinstance(current, Tag):
+                    # Stop if we hit another dt tag
+                    if current.name == "dt":
+                        break
+
+                    # Skip section headings and other non-content elements
+                    if self._is_section_heading_or_non_content(current):
+                        current = current.next_sibling
+                        continue
+
+                    # Collect text from this tag
+                    tag_text = self._get_text(current).strip()
+                    if tag_text:
+                        content_parts.append(tag_text)
+                elif isinstance(current, str):
+                    # Collect text content, but filter out section headings
+                    text = current.strip()
+                    if text and not self._is_section_heading_text(text):
+                        content_parts.append(text)
+
+                current = current.next_sibling
+
+            if content_parts:
+                paragraphs[paragraph_number] = " ".join(content_parts)
+
+        return paragraphs
+
+    def _is_section_heading_or_non_content(self, tag: Tag) -> bool:
+        """Check if a tag is a section heading or other non-content element that should be filtered out."""
+        # Check for bold tags that contain short text (likely section headings)
+        if tag.name == "b":
+            text = self._get_text(tag).strip()
+            # If it's short and bold, it's likely a section heading
+            if len(text) < 100:
+                return True
+
+        # Check for dt tags that contain section headings (like "Relevant provisions")
+        if tag.name == "dt":
+            text = self._get_text(tag).strip()
+            # If it's not a number, it's likely a section heading
+            if not re.match(r"^\s*\d+\s*$", text):
+                return True
+
+        # Check for empty dd tags
+        if tag.name == "dd" and not self._get_text(tag).strip():
+            return True
+
+        return False
+
+    def _is_section_heading_text(self, text: str) -> bool:
+        """Check if standalone text is a section heading that should be filtered out."""
+        text = text.strip()
+        # Filter out very short standalone text that might be section headings
+        if len(text) < 50:
+            return True
+        return False
+
+
 class OperativePartParser(BaseJudgementParser):
     """Parser for pages that only contain an Operative part rendered via tables."""
 
@@ -618,6 +713,7 @@ class JudgementParser:
         self.parsers: list[BaseJudgementParser] = [
             NestedDocumentParser(),
             LegacyEurLexParser(),
+            DtDdParser(),
             ModernJudgementParser(),
             OperativePartParser(),
         ]
@@ -687,7 +783,7 @@ if __name__ == "__main__":
     random_case = random.choice(
         [file for file in case_files if any(x in file for x in ["CJ", "FJ", "TJ"])]
     )
-    random_case = "cases/62013TJ0528.html"
+    random_case = "cases/62001CJ0433.html"
 
     parser = JudgementParser()
     paragraphs = parser.extract_paragraphs(random_case)
