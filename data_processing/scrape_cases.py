@@ -57,14 +57,24 @@ class CaseScraper:
         session: aiohttp.ClientSession,
         case_id: str,
     ) -> bytes | None:
-        """Fetch summary content in English."""
+        """Fetch summary content with fallbacks: EN _SUM, EN _INF, FR _SUM."""
+        # TODO: Fetch native if not available in other languages
         headers = self._build_headers("text/html,application/xhtml+xml")
-        url = f"https://eur-lex.europa.eu/legal-content/EN/TXT/HTML/?uri=CELEX:{case_id}_SUM"
-        content, status = await self.fetch_single(session, url, headers)
-        if status == 404:
-            return None
-
-        return content
+        attempts = [
+            ("EN", "_SUM"),
+            ("EN", "_INF"),
+            ("EN", "_RES"),
+            ("FR", "_SUM"),
+        ]
+        for lang, suffix in attempts:
+            url = (
+                f"https://eur-lex.europa.eu/legal-content/{lang}/TXT/HTML/"
+                f"?uri=CELEX:{case_id}{suffix}"
+            )
+            content, status = await self.fetch_single(session, url, headers)
+            if content and status != 404:
+                return content
+        return None
 
     async def fetch_metadata(
         self,
@@ -95,6 +105,7 @@ class CaseScraper:
         return None
 
     async def scrape_case(self, case_id: str, out_dir: Path) -> None:
+        # TODO: Clean function by removing reading of files
         conn = aiohttp.TCPConnector(limit=6, ttl_dns_cache=300, force_close=False)
         timeout = aiohttp.ClientTimeout(total=60)
         async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
@@ -102,32 +113,52 @@ class CaseScraper:
             celex_dir = out_dir / case_id
             celex_dir.mkdir(parents=True, exist_ok=True)
 
-            summary_content = await self.fetch_summary(session, case_id)
-            if not summary_content:
-                print(f"Skipped {case_id}/summary.html - no valid content found")
-                return
+            summary_path = celex_dir / "summary.html"
+            if not summary_path.exists():
+                summary_content = await self.fetch_summary(session, case_id)
+                if not summary_content:
+                    print(f"Skipped {case_id}/summary.html - no valid content found")
+                else:
+                    await self.save_bytes(summary_path, summary_content)
 
-            await self.save_bytes(celex_dir / "summary.html", summary_content)
+            metadata_path = celex_dir / "metadata.xml"
+            if not metadata_path.exists():
+                metadata_content = await self.fetch_metadata(session, case_id)
+                if not metadata_content:
+                    print(f"Skipped {case_id}/metadata.xml - no valid content found")
+                else:
+                    await self.save_bytes(metadata_path, metadata_content)
+            else:
+                # Read metadata from file
+                with open(metadata_path, "rb") as f:
+                    metadata_content = f.read()
 
-            metadata_content = await self.fetch_metadata(session, case_id)
-            if not metadata_content:
-                print(f"Skipped {case_id}/metadata.xml - no valid content found")
-                return
+            content_found = False
+            for lang in ["eng", "fra"]:
+                judgment_path = celex_dir / f"{lang}_judgment.html"
+                if not judgment_path.exists():
+                    content = await self.fetch_judgment(session, case_id, lang)
+                    if not content:
+                        continue
+                    content_found = True
+                    await self.save_bytes(judgment_path, content)
 
-            await self.save_bytes(celex_dir / "metadata.xml", metadata_content)
-
-            authentic_lang = self.extract_authentic_language(metadata_content)
-
-            languages_to_try = set(["eng", "fra"])
-            if authentic_lang:
-                languages_to_try.add(authentic_lang.lower())
-
-            for lang in languages_to_try:
-                content = await self.fetch_judgment(session, case_id, lang)
-                if not content:
-                    continue
-
-                await self.save_bytes(celex_dir / f"{lang}_judgment.html", content)
+            if not content_found:
+                authentic_lang = self.extract_authentic_language(metadata_content)
+                if not authentic_lang:
+                    print(f"Skipped {case_id}/judgment.html - no valid content found")
+                    return
+                judgment_path = celex_dir / f"{authentic_lang}_judgment.html"
+                if not judgment_path.exists():
+                    content = await self.fetch_judgment(
+                        session, case_id, authentic_lang
+                    )
+                    if not content:
+                        print(
+                            f"Skipped {case_id}/judgment.html - no valid content found"
+                        )
+                        return
+                    await self.save_bytes(judgment_path, content)
 
 
 def main() -> None:
@@ -135,7 +166,9 @@ def main() -> None:
     proxy = None
     scraper = CaseScraper(proxy=proxy)
     try:
-        asyncio.run(scraper.scrape_case(case_id="62014CJ0005", out_dir=Path("html")))
+        asyncio.run(
+            scraper.scrape_case(case_id="62019CJ0280", out_dir=Path("judgments"))
+        )
     except KeyboardInterrupt:
         print("Interrupted by user.")
 
