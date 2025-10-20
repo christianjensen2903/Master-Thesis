@@ -7,7 +7,7 @@ import random
 
 from tqdm import tqdm  # type: ignore
 
-from scrape_cases import CaseScraper
+from case_scraper import CaseScraper
 
 
 async def _bounded_scrape(
