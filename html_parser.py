@@ -34,6 +34,7 @@ from abc import ABC, abstractmethod
 from bs4 import BeautifulSoup as bs
 from bs4 import Tag
 from bs4.element import NavigableString
+from enum import Enum
 
 
 class BaseJudgementParser(ABC):
@@ -333,6 +334,12 @@ class ModernJudgementParser(BaseJudgementParser):
         return False
 
 
+class NumberingPattern(Enum):
+    DOT = "dot"
+    SPACE = "space"
+    PARENTHESIS = "parenthesis"
+
+
 class LegacyEurLexParser(BaseJudgementParser):
     """Parser for legacy EUR-Lex format (older cases, simple HTML structure)."""
 
@@ -342,6 +349,31 @@ class LegacyEurLexParser(BaseJudgementParser):
         grounds_section = soup.find("a", attrs={"name": "MO"})
         if grounds_section:
             return True
+        return False
+
+    def _detect_numbering_pattern(self, tag: Tag) -> NumberingPattern:
+        text = self._get_text(tag).strip()
+        if re.match(r"^\s*\d+\.", text):
+            return NumberingPattern.DOT
+        elif re.match(r"^\s*\d+\)", text):
+            return NumberingPattern.PARENTHESIS
+        elif re.match(r"^\s*\d+", text):
+            return NumberingPattern.SPACE
+        return NumberingPattern.SPACE
+
+    def _matches_pattern(self, text: str, pattern_type: NumberingPattern) -> bool:
+        """Check if text matches the specified numbering pattern."""
+
+        if pattern_type == NumberingPattern.DOT:
+            return bool(re.match(r"^\s*\d+\.", text))
+        elif pattern_type == NumberingPattern.SPACE:
+            return bool(
+                re.match(r"^\s*\d+", text)
+                and not re.match(r"^\s*\d+\.", text)
+                and not re.match(r"^\s*\d+\)", text)
+            )
+        elif pattern_type == NumberingPattern.PARENTHESIS:
+            return bool(re.match(r"^\s*\d+\)", text))
         return False
 
     def extract_paragraphs(self, soup: bs) -> dict[int, str]:
@@ -375,6 +407,8 @@ class LegacyEurLexParser(BaseJudgementParser):
         outer_counter: int = 0
         inner_counter: int = 0
         mode: str = "outer"  # "outer" or "inner"
+        inner_pattern: NumberingPattern | None = None
+        outer_pattern: NumberingPattern | None = None
 
         for p_tag in p_tags:
             text = self._get_text(p_tag).strip()
@@ -392,45 +426,92 @@ class LegacyEurLexParser(BaseJudgementParser):
                 #     f"Proposed number: {proposed_num}, outer_counter: {outer_counter}, inner_counter: {inner_counter}, mode: {mode}"
                 # )
 
+                if outer_pattern is None:
+                    outer_pattern = self._detect_numbering_pattern(p_tag)
+
                 if mode == "outer":
 
                     if outer_counter == 0:
                         outer_counter = proposed_num
                         paragraphs[outer_counter] = text
+
                         continue
                     elif (
                         proposed_num == outer_counter + 1
                         or proposed_num == outer_counter + 2
                     ):
-                        outer_counter = proposed_num
-                        paragraphs[outer_counter] = text
+                        # Check if this matches the outer pattern
+                        if self._matches_pattern(text, outer_pattern):
+                            outer_counter = proposed_num
+                            paragraphs[outer_counter] = text
+                        else:
+                            # Doesn't match outer pattern, treat as inner
+                            paragraphs[outer_counter] += " " + text
+                            mode = "inner"
+                            inner_counter = proposed_num
+
+                            if inner_pattern is None:
+                                inner_pattern = self._detect_numbering_pattern(p_tag)
                     else:
-                        paragraphs[outer_counter] += " " + text
-                        mode = "inner"
-                        inner_counter = proposed_num
+                        if inner_pattern is None:
+                            inner_pattern = self._detect_numbering_pattern(p_tag)
+                        # Check if this matches inner pattern
+                        if self._matches_pattern(text, inner_pattern):
+                            paragraphs[outer_counter] += " " + text
+                            mode = "inner"
+                            inner_counter = proposed_num
+                        else:
+                            # Doesn't match inner pattern either, add to current paragraph
+                            paragraphs[outer_counter] += " " + text
 
                     if proposed_text.strip().endswith(":"):
                         mode = "inner"
                 else:
-                    # First check if this could be the next outer paragraph
+                    # We're in inner mode
                     if proposed_num == inner_counter + 1:
-                        inner_counter = proposed_num
-                        paragraphs[outer_counter] += " " + text
+                        if inner_pattern is None:
+                            inner_pattern = self._detect_numbering_pattern(p_tag)
+
+                        # Check if this matches inner pattern
+                        if self._matches_pattern(text, inner_pattern):
+                            inner_counter = proposed_num
+                            paragraphs[outer_counter] += " " + text
+                        else:
+                            # Doesn't match inner pattern, might be next outer
+                            if self._matches_pattern(text, outer_pattern) and (
+                                proposed_num == outer_counter + 1
+                                or proposed_num == outer_counter + 2
+                            ):
+                                mode = "outer"
+                                outer_counter = proposed_num
+                                paragraphs[outer_counter] = text
+                                if proposed_text.strip().endswith(":"):
+                                    mode = "inner"
+                            else:
+                                paragraphs[outer_counter] += " " + text
                     elif (
                         proposed_num == outer_counter + 1
                         or proposed_num == outer_counter + 2
                     ):
-                        # This is actually the next outer paragraph, switch back to outer mode
-                        mode = "outer"
-                        outer_counter = proposed_num
-                        paragraphs[outer_counter] = text
-                        # Check if this new outer paragraph starts inner mode
-                        if proposed_text.strip().endswith(":"):
-                            mode = "inner"
-
+                        # This could be the next outer paragraph
+                        if self._matches_pattern(text, outer_pattern):
+                            mode = "outer"
+                            outer_counter = proposed_num
+                            paragraphs[outer_counter] = text
+                            if proposed_text.strip().endswith(":"):
+                                mode = "inner"
+                        else:
+                            # Doesn't match outer pattern, treat as inner
+                            paragraphs[outer_counter] += " " + text
+                            inner_counter = proposed_num
                     else:
-                        paragraphs[outer_counter] += " " + text
-                        inner_counter = proposed_num
+                        # Check if this matches inner pattern
+                        if self._matches_pattern(text, inner_pattern):
+                            paragraphs[outer_counter] += " " + text
+                            inner_counter = proposed_num
+                        else:
+                            # Doesn't match any pattern, add to current paragraph
+                            paragraphs[outer_counter] += " " + text
 
             elif outer_counter in paragraphs:
                 # Non-numbered paragraph - add to current paragraph
@@ -1036,7 +1117,7 @@ if __name__ == "__main__":
     #     soup = parser._load_html(random_case)
 
     # 61976CJ0085
-    random_case = "judgments/62009CJ0463/eng_judgment.html"
+    random_case = "judgments/61976CJ0085/eng_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
 
