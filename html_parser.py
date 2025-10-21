@@ -364,7 +364,9 @@ class LegacyEurLexParser(BaseJudgementParser):
                 sibling = sibling.find_next_sibling()
 
         paragraphs: dict[int, str] = {}
-        current_number: int | None = None
+        outer_counter: int | None = None
+        inner_counter: int = 0
+        inner_can_increase: bool = False
 
         for p_tag in p_tags:
             text = self._get_text(p_tag).strip()
@@ -372,19 +374,38 @@ class LegacyEurLexParser(BaseJudgementParser):
                 continue
 
             # Check if this paragraph starts with a number
-            match = re.match(r"^\s*(\d+)[\.\)]?\s*(.+)", text)
+            match = re.match(r"^\s*(\d+)\s*[\.\)]?\s*(.+)", text)
 
             if match:
                 proposed_num = int(match.group(1))
                 proposed_text = match.group(2)
 
-                if not current_number or proposed_num > current_number:
-                    current_number = proposed_num
-                    paragraphs[current_number] = proposed_text
-                elif current_number is not None:
-                    paragraphs[current_number] += " " + proposed_text
-            elif current_number in paragraphs:
-                paragraphs[current_number] += " " + text
+                if outer_counter is None:
+                    outer_counter = proposed_num
+                    paragraphs[outer_counter] = proposed_text
+                elif not inner_can_increase and proposed_num == inner_counter + 1:
+                    inner_counter += 1
+                    paragraphs[outer_counter] += " " + text
+                elif inner_can_increase and proposed_num > inner_counter:
+                    inner_counter = proposed_num
+                    paragraphs[outer_counter] += " " + text
+
+                elif (
+                    proposed_num == outer_counter + 1
+                    or proposed_num
+                    == outer_counter + 2  # Sometimes there is a paragraph missing
+                ):
+                    outer_counter = proposed_num
+                    paragraphs[outer_counter] = text
+                else:
+                    paragraphs[outer_counter] += " " + text
+
+                inner_can_increase = False
+
+            elif outer_counter in paragraphs:
+                paragraphs[outer_counter] += " " + text
+
+                inner_can_increase = text == "..."
 
         return paragraphs
 
@@ -986,7 +1007,7 @@ if __name__ == "__main__":
     #     soup = parser._load_html(random_case)
 
     # 61976CJ0085
-    random_case = "judgments/62007CJ0521/eng_judgment.html"
+    random_case = "judgments/61999CJ0274/eng_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
 
