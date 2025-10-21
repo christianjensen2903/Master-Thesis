@@ -338,13 +338,10 @@ class LegacyEurLexParser(BaseJudgementParser):
 
     def extract_paragraphs(self, soup: bs) -> dict[int, str]:
         """Extract paragraphs from the Grounds section."""
-        # Find the Grounds section
-        grounds_anchor = soup.find("a", attrs={"name": "MO"})
-        if not grounds_anchor:
-            return {}
 
         # Find the h2 header and the em tag containing the paragraphs
-        h2_tag = grounds_anchor.find_next_sibling("h2")
+        h2_tag = soup.find("h2", text=re.compile(r"grounds", re.IGNORECASE))
+
         if not h2_tag:
             return {}
 
@@ -362,16 +359,12 @@ class LegacyEurLexParser(BaseJudgementParser):
                     # Stop at next major section heading or operative part anchor
                     if sibling.name == "h2":
                         break
-                    if sibling.name == "a" and sibling.get("name") in {"DI"}:
-                        break
                     if sibling.name == "p":
                         p_tags.append(sibling)
                 sibling = sibling.find_next_sibling()
 
         paragraphs: dict[int, str] = {}
         current_number: int | None = None
-        current_text_parts: list[str] = []
-        last_committed_number: int | None = None
 
         for p_tag in p_tags:
             text = self._get_text(p_tag).strip()
@@ -379,58 +372,19 @@ class LegacyEurLexParser(BaseJudgementParser):
                 continue
 
             # Check if this paragraph starts with a number
-            match = re.match(r"^\s*(\d+)[\.\)]?\s+(.+)", text)
+            match = re.match(r"^\s*(\d+)[\.\)]?\s*(.+)", text)
 
             if match:
                 proposed_num = int(match.group(1))
                 proposed_text = match.group(2)
 
-                # Start at 1 only; otherwise treat as continuation until we see '1'
-                if current_number is None and last_committed_number is None:
-                    if proposed_num == 1:
-                        current_number = 1
-                        current_text_parts = [proposed_text]
-                        continue
-                    # Skip stray numbered items before the first main paragraph
-                    current_text_parts.append(text)
-                    continue
-
-                # Normal progression must be strictly increasing by 1
-                expected_next = (
-                    (current_number + 1)
-                    if current_number is not None
-                    else (
-                        (last_committed_number + 1)
-                        if last_committed_number is not None
-                        else 1
-                    )
-                )
-
-                if proposed_num == expected_next:
-                    # Commit previous
-                    if current_number is not None and current_text_parts:
-                        paragraphs[current_number] = " ".join(current_text_parts)
-                        last_committed_number = current_number
-
-                    # Start new top-level paragraph
+                if not current_number or proposed_num > current_number:
                     current_number = proposed_num
-                    current_text_parts = [proposed_text]
-                else:
-                    # Nested/sub-point numbering; treat as continuation
-                    current_text_parts.append(text)
-            elif current_number is not None:
-                # This is a subsection or continuation
-                # Check if it's a subsection header (all caps, starts with "AS TO")
-                if text.isupper() and ("AS TO" in text or "ON THE" in text):
-                    # Add as continuation with some separation
-                    current_text_parts.append(text)
-                else:
-                    # Regular continuation
-                    current_text_parts.append(text)
-
-        # Don't forget the last paragraph
-        if current_number is not None and current_text_parts:
-            paragraphs[current_number] = " ".join(current_text_parts)
+                    paragraphs[current_number] = proposed_text
+                elif current_number is not None:
+                    paragraphs[current_number] += " " + proposed_text
+            elif current_number in paragraphs:
+                paragraphs[current_number] += " " + text
 
         return paragraphs
 
@@ -514,6 +468,112 @@ class NestedDocumentParser(BaseJudgementParser):
 class DtDdParser(BaseJudgementParser):
     """Parser for cases that use <dt> and <dd> tags for numbered paragraphs."""
 
+    # Localized tokens for the judgment heading across EU languages (lowercased)
+    JUDGMENT_HEADINGS: list[str] = [
+        # EN
+        "judgment",
+        # FR
+        "arrêt",
+        # DE
+        "urteil",
+        # ES
+        "sentencia",
+        # IT
+        "sentenza",
+        # NL
+        "arrest",
+        # PT
+        "acórdão",
+        # PL
+        "wyrok",
+        # RO
+        "hotărâre",
+        # BG
+        "решение",
+        # CS
+        "rozsudek",
+        # DA
+        "dom",
+        # ET
+        "kohtuotsus",
+        # FI
+        "tuomio",
+        # EL
+        "απόφαση",
+        # HU
+        "ítélet",
+        # LV
+        "spriedums",
+        # LT
+        "sprendimas",
+        # MT (often Italian term is used)
+        "sentenza",
+        # SK
+        "rozsudok",
+        # SL
+        "sodba",
+        # SV
+        "dom",
+    ]
+
+    # Localized variants of the introduction to the operative part
+    STOP_PHRASES: list[str] = [
+        # EN
+        "on those grounds",
+        # FR
+        "par ces motifs",
+        # DE
+        "aus diesen gründen",
+        # ES
+        "por estos motivos",
+        "por esos motivos",
+        # IT
+        "per questi motivi",
+        # NL
+        "om die redenen",
+        # PT
+        "pelos fundamentos expostos",
+        # PL
+        "z tych względów",
+        # RO
+        "pentru aceste motive",
+        # BG
+        "по тези съображения",
+        # CS
+        "z těchto důvodů",
+        # DA
+        "af disse grunde",
+        # ET
+        "nendel põhjustel",
+        # FI
+        "näillä perusteilla",
+        # EL
+        "για τους λόγους αυτούς",
+        # HU
+        "ezen indokok alapján",
+        # LV
+        "šo apsvērumu dēļ",
+        # LT
+        "dėl šių priežasčių",
+        # MT
+        "għal dawn ir-raġunijiet",
+        # SK
+        "z týchto dôvodov",
+        # SL
+        "iz teh razlogov",
+        # SV
+        "på dessa grunder",
+    ]
+
+    def _strip_after_operative_intro(self, text: str) -> str:
+        """Strip any content from the start of an operative-intro phrase to the end."""
+        if not text:
+            return text
+        # Build a single regex alternation out of localized phrases; allow comma/colon/dash after
+        escaped = [re.escape(p) for p in self.STOP_PHRASES]
+        pattern = r"\s*(?:" + "|".join(escaped) + r")[\s\u00A0]*[,:\-–]?\s*.*$"
+        return re.sub(pattern, "", text, 0, re.IGNORECASE | re.UNICODE).strip()
+
     def can_parse(self, soup: bs) -> bool:
         """Check if this document uses dt/dd format for numbered paragraphs."""
         # Look for dt tags that contain numbers
@@ -556,22 +616,23 @@ class DtDdParser(BaseJudgementParser):
             if text:
                 paragraphs[idx] = text
 
-        # Ensure the final paragraph keeps text before 'On those grounds,' and strips the rest
+        # Ensure the final paragraph keeps text before the localized operative-intro phrase
         if paragraphs:
             last_idx = max(paragraphs.keys())
-            paragraphs[last_idx] = re.sub(
-                r"\s*On those grounds,.*$", "", paragraphs[last_idx], 0, re.IGNORECASE
-            ).strip()
+            paragraphs[last_idx] = self._strip_after_operative_intro(
+                paragraphs[last_idx]
+            )
 
         return paragraphs
 
     def _find_judgment_heading(self, soup: bs) -> Tag | None:
-        """Locate the 'Judgment' heading that marks the start of numbered paragraphs."""
-        # Prefer <h3> Judgment
-        for h3 in soup.find_all("h3"):
-            heading_text = self._get_text(h3).strip().lower()
-            if "judgment" in heading_text:
-                return h3
+        """Locate the localized 'Judgment' heading that marks the start of numbered paragraphs."""
+        # Prefer <h3> first
+        for tag_name in ("h3", "h2", "h4"):
+            for heading in soup.find_all(tag_name):
+                heading_text = self._get_text(heading).strip().lower()
+                if any(token in heading_text for token in self.JUDGMENT_HEADINGS):
+                    return heading
         return None
 
     def _get_dt_number(self, dt_tag: Tag) -> int | None:
@@ -898,19 +959,35 @@ class JudgementParser:
 
 if __name__ == "__main__":
     # Get all HTML files from the cases folder
-    # case_files = glob.glob("cases/*.html")
+    judgment_files = glob.glob("judgments/**/*.html", recursive=True)
 
-    # if not case_files:
-    #     print("No case files found in the cases folder.")
-    #     sys.exit(1)
+    if not judgment_files:
+        print("No judgment files found.")
+        sys.exit(1)
 
-    # # Randomly select a case file
-    # random_case = random.choice(
-    #     [file for file in case_files if any(x in file for x in ["CJ", "FJ", "TJ"])]
-    # )
-    random_case = "judgments/62000CJ0041/eng_judgment.html"
+    # Randomly select a judgment file
+    random_case = random.choice(
+        [file for file in judgment_files if any(x in file for x in ["CJ", "FJ", "TJ"])]
+    )
 
     parser = JudgementParser()
+
+    # Continue until it finds a case which can be parsed by DtDdParser
+    # dtd_parser = DtDdParser()
+    # soup = parser._load_html(random_case)
+    # while soup is None or not dtd_parser.can_parse(soup):
+    #     random_case = random.choice(
+    #         [
+    #             file
+    #             for file in judgment_files
+    #             if any(x in file for x in ["CJ", "FJ", "TJ"])
+    #         ]
+    #     )
+    #     soup = parser._load_html(random_case)
+
+    # 61976CJ0085
+    random_case = "judgments/62007CJ0521/eng_judgment.html"
+
     paragraphs = parser.extract_paragraphs(random_case)
 
     for number, text in list(paragraphs.items()):
@@ -919,5 +996,5 @@ if __name__ == "__main__":
         print("\n" + "=" * 100 + "\n")
 
     print(f"Processed random case: {random_case}\n")
-    celex = random_case.split("/")[-1].split(".")[0]
+    celex = random_case.split("/")[-2].split(".")[0]
     print(f"CELEX: {celex}\n")
