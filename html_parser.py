@@ -291,13 +291,15 @@ class ModernJudgementParser(BaseJudgementParser):
         if not has_numbered_class:
             return False
 
-        # Check if this is a subparagraph (like (a), (b), (c)) rather than a main numbered paragraph
+        # Check if this is a subparagraph rather than a main numbered paragraph
         text = self._get_text(tag).strip()
         import re
 
-        # If the text starts with a letter in parentheses like "(a)", "(b)", "(c)", treat it as a subparagraph
-        # Also handle cases where there might be a quote mark before the parentheses (including smart quotes)
-        if re.match(r"^\s*['\"\u2018\u2019\u201c\u201d]?\([a-z]\)\s*", text):
+        # Only treat as a numbered paragraph if it actually starts with a number
+        # This prevents paragraphs with the numbered class but no number from being treated as numbered
+        if re.match(r"^\s*\d+\s+", text):
+            return True
+        else:
             return False
 
         # Special case handling for documents with mixed patterns
