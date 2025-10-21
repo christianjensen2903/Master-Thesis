@@ -33,6 +33,7 @@ from abc import ABC, abstractmethod
 
 from bs4 import BeautifulSoup as bs
 from bs4 import Tag
+from bs4.element import NavigableString
 
 
 class BaseJudgementParser(ABC):
@@ -220,9 +221,9 @@ class ModernJudgementParser(BaseJudgementParser):
             # Content is in the last TD of the row
             content_td = tds[-1]
 
-            # Simpler and more robust: take all text within the content cell
-            # This captures the header and any nested bullet tables in order
-            combined: str = " ".join(content_td.stripped_strings).strip()
+            # Simpler and more robust: take all text within the content cell using get_text
+            # Using a separator preserves inline content from nested tags and links
+            combined: str = content_td.get_text(" ", strip=True)
             paragraphs.append(combined)
 
         return {par_no: text for par_no, text in enumerate(paragraphs, start=1)}
@@ -525,84 +526,146 @@ class DtDdParser(BaseJudgementParser):
         return False
 
     def extract_paragraphs(self, soup: bs) -> dict[int, str]:
-        """Extract paragraphs from dt/dd structure."""
+        """Extract paragraphs from dt/dd structure starting at H3 'Judgment'."""
         paragraphs: dict[int, str] = {}
 
-        # Find all dt tags
-        dt_tags = soup.find_all("dt")
+        # Locate the Judgment heading
+        judgment_heading = self._find_judgment_heading(soup)
+        if not judgment_heading:
+            return {}
 
-        for dt in dt_tags:
-            dt_text = self._get_text(dt).strip()
+        # Find the first outer paragraph start (dt == 1)
+        first_outer: Tag | None = None
+        for dt in judgment_heading.find_all_next("dt"):
+            if self._get_dt_number(dt) == 1:
+                first_outer = dt
+                break
 
-            # Check if this dt contains a number
-            match = re.match(r"^\s*(\d+)\s*$", dt_text)
-            if not match:
-                continue
+        if first_outer is None:
+            return {}
 
-            paragraph_number = int(match.group(1))
+        # Build the sequence of outer dt anchors using inner/outer disambiguation
+        outer_dts = self._find_outer_dt_sequence(first_outer)
+        if not outer_dts:
+            return {}
 
-            # The content follows after the </dt> tag
-            # We need to collect all text until the next <dt> tag
-            content_parts = []
-            current = dt.next_sibling
+        # Collect texts for each outer paragraph
+        for idx, dt_anchor in enumerate(outer_dts, start=1):
+            next_dt = outer_dts[idx] if idx < len(outer_dts) else None
+            text = self._collect_text_between(dt_anchor, next_dt)
+            if text:
+                paragraphs[idx] = text
 
-            while current:
-                if isinstance(current, Tag):
-                    # Stop if we hit another dt tag
-                    if current.name == "dt":
-                        break
-
-                    # Skip section headings and other non-content elements
-                    if self._is_section_heading_or_non_content(current):
-                        current = current.next_sibling
-                        continue
-
-                    # Collect text from this tag
-                    tag_text = self._get_text(current).strip()
-                    if tag_text:
-                        content_parts.append(tag_text)
-                elif isinstance(current, str):
-                    # Collect text content, but filter out section headings
-                    text = current.strip()
-                    if text and not self._is_section_heading_text(text):
-                        content_parts.append(text)
-
-                current = current.next_sibling
-
-            if content_parts:
-                paragraphs[paragraph_number] = " ".join(content_parts)
+        # Ensure the final paragraph keeps text before 'On those grounds,' and strips the rest
+        if paragraphs:
+            last_idx = max(paragraphs.keys())
+            paragraphs[last_idx] = re.sub(
+                r"\s*On those grounds,.*$", "", paragraphs[last_idx], 0, re.IGNORECASE
+            ).strip()
 
         return paragraphs
 
-    def _is_section_heading_or_non_content(self, tag: Tag) -> bool:
-        """Check if a tag is a section heading or other non-content element that should be filtered out."""
-        # Check for bold tags that contain short text (likely section headings)
-        if tag.name == "b":
-            text = self._get_text(tag).strip()
-            # If it's short and bold, it's likely a section heading
-            if len(text) < 100:
-                return True
+    def _find_judgment_heading(self, soup: bs) -> Tag | None:
+        """Locate the 'Judgment' heading that marks the start of numbered paragraphs."""
+        # Prefer <h3> Judgment
+        for h3 in soup.find_all("h3"):
+            heading_text = self._get_text(h3).strip().lower()
+            if "judgment" in heading_text:
+                return h3
+        return None
 
-        # Check for dt tags that contain section headings (like "Relevant provisions")
-        if tag.name == "dt":
-            text = self._get_text(tag).strip()
-            # If it's not a number, it's likely a section heading
-            if not re.match(r"^\s*\d+\s*$", text):
-                return True
+    def _get_dt_number(self, dt_tag: Tag) -> int | None:
+        """Return the integer value of a dt tag if it is a bare number (no punctuation)."""
+        text = self._get_text(dt_tag).strip()
+        match = re.fullmatch(r"\d+", text)
+        if not match:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
 
-        # Check for empty dd tags
-        if tag.name == "dd" and not self._get_text(tag).strip():
-            return True
+    def _collect_text_between(self, start_dt: Tag, end_dt: Tag | None) -> str:
+        """Collect text after start_dt until end_dt or the first <br> tag."""
+        parts: list[str] = []
+        for node in start_dt.next_elements:
+            # Stop at the next expected <dt>
+            if isinstance(node, Tag) and end_dt is not None and node is end_dt:
+                break
 
-        return False
+            # Stop at a line break
+            if isinstance(node, Tag) and node.name == "b":
+                break
 
-    def _is_section_heading_text(self, text: str) -> bool:
-        """Check if standalone text is a section heading that should be filtered out."""
-        text = text.strip()
-        # Filter out very short standalone text that might be section headings
-        if len(text) < 50:
-            return True
-        return False
+            if isinstance(node, NavigableString):
+                parent = node.parent
+                if not isinstance(parent, Tag):
+                    continue
+                if parent.name == "dt":
+                    # Skip the numeric marker itself
+                    continue
+                text = str(node).strip()
+                if text:
+                    parts.append(text)
+
+        combined = " ".join(parts)
+        combined = re.sub(r"\s+", " ", combined).strip()
+        return combined
+
+    def _find_outer_dt_sequence(self, first_outer: Tag) -> list[Tag]:
+        """Return ordered list of outer dt anchors using inner/outer counters.
+
+        Logic:
+        - Outer counter can only increase by 1.
+        - Inner counter must be strictly increasing.
+        - If a dt number equals both the next outer and a valid next inner, look ahead:
+          if the dt immediately following the next <b> has the same number, the current
+          dt is inner; otherwise, it's outer.
+        """
+        outers: list[Tag] = [first_outer]
+        first_num = self._get_dt_number(first_outer) or 1
+        outer_expected: int = first_num + 1
+        inner_last: int = 0
+
+        for dt in first_outer.find_all_next("dt"):
+            if dt is first_outer:
+                continue
+            num = self._get_dt_number(dt)
+            if num is None:
+                continue
+
+            if num == outer_expected:
+                # Ambiguous: could be inner (strictly increasing) or the next outer
+                if num > inner_last and self._next_b_followed_by_dt_number(
+                    dt, outer_expected
+                ):
+                    # Treat as inner
+                    inner_last = num
+                    continue
+                # Treat as outer
+                outers.append(dt)
+                outer_expected += 1
+                continue
+
+            # Strictly increasing inner numbering
+            if num > inner_last and num != outer_expected:
+                inner_last = num
+                continue
+
+            # Otherwise ignore (not valid progression for inner nor the next outer)
+            continue
+
+        return outers
+
+    def _next_b_followed_by_dt_number(self, start: Tag, number: int) -> bool:
+        """Check if the first <dt> after the next <b> has the given number."""
+        b_tag = start.find_next("b")
+        if not b_tag:
+            return False
+        next_dt = b_tag.find_next("dt")
+        if not next_dt:
+            return False
+        return self._get_dt_number(next_dt) == number
 
 
 class OperativePartParser(BaseJudgementParser):
@@ -835,17 +898,17 @@ class JudgementParser:
 
 if __name__ == "__main__":
     # Get all HTML files from the cases folder
-    case_files = glob.glob("cases/*.html")
+    # case_files = glob.glob("cases/*.html")
 
-    if not case_files:
-        print("No case files found in the cases folder.")
-        sys.exit(1)
+    # if not case_files:
+    #     print("No case files found in the cases folder.")
+    #     sys.exit(1)
 
-    # Randomly select a case file
-    random_case = random.choice(
-        [file for file in case_files if any(x in file for x in ["CJ", "FJ", "TJ"])]
-    )
-    random_case = "cases/62004TJ0406.html"
+    # # Randomly select a case file
+    # random_case = random.choice(
+    #     [file for file in case_files if any(x in file for x in ["CJ", "FJ", "TJ"])]
+    # )
+    random_case = "judgments/62000CJ0041/eng_judgment.html"
 
     parser = JudgementParser()
     paragraphs = parser.extract_paragraphs(random_case)

@@ -23,18 +23,12 @@ from html_parser import JudgementParser
 
 def find_case_file(celex: str) -> str | None:
     """Find the HTML file for a given CELEX number."""
-    cases_dir = Path("cases")
-    summaries_dir = Path("summaries")
+    cases_dir = Path("judgments")
 
     # Try cases directory first
-    case_file = cases_dir / f"{celex}.html"
+    case_file = cases_dir / celex / "eng_judgment.html"
     if case_file.exists():
         return str(case_file)
-
-    # Try summaries directory
-    summary_file = summaries_dir / f"{celex}.html"
-    if summary_file.exists():
-        return str(summary_file)
 
     return None
 
