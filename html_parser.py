@@ -364,9 +364,9 @@ class LegacyEurLexParser(BaseJudgementParser):
                 sibling = sibling.find_next_sibling()
 
         paragraphs: dict[int, str] = {}
-        outer_counter: int | None = None
+        outer_counter: int = 0
         inner_counter: int = 0
-        inner_can_increase: bool = False
+        mode: str = "outer"  # "outer" or "inner"
 
         for p_tag in p_tags:
             text = self._get_text(p_tag).strip()
@@ -380,32 +380,48 @@ class LegacyEurLexParser(BaseJudgementParser):
                 proposed_num = int(match.group(1))
                 proposed_text = match.group(2)
 
-                if outer_counter is None:
-                    outer_counter = proposed_num
-                    paragraphs[outer_counter] = proposed_text
-                elif not inner_can_increase and proposed_num == inner_counter + 1:
-                    inner_counter += 1
-                    paragraphs[outer_counter] += " " + text
-                elif inner_can_increase and proposed_num > inner_counter:
-                    inner_counter = proposed_num
-                    paragraphs[outer_counter] += " " + text
+                # print(
+                #     f"Proposed number: {proposed_num}, outer_counter: {outer_counter}, inner_counter: {inner_counter}, mode: {mode}"
+                # )
 
-                elif (
-                    proposed_num == outer_counter + 1
-                    or proposed_num
-                    == outer_counter + 2  # Sometimes there is a paragraph missing
-                ):
-                    outer_counter = proposed_num
-                    paragraphs[outer_counter] = text
+                if mode == "outer":
+                    if (
+                        proposed_num == outer_counter + 1
+                        or proposed_num == outer_counter + 2
+                    ):
+                        outer_counter = proposed_num
+                        paragraphs[outer_counter] = text
+                    else:
+                        paragraphs[outer_counter] += " " + text
+                        mode = "inner"
+                        inner_counter = proposed_num
+
+                    if proposed_text.strip().endswith(":"):
+                        mode = "inner"
                 else:
-                    paragraphs[outer_counter] += " " + text
+                    # First check if this could be the next outer paragraph
+                    if proposed_num == inner_counter + 1:
+                        inner_counter = proposed_num
+                        paragraphs[outer_counter] += " " + text
+                    elif (
+                        proposed_num == outer_counter + 1
+                        or proposed_num == outer_counter + 2
+                    ):
+                        # This is actually the next outer paragraph, switch back to outer mode
+                        mode = "outer"
+                        outer_counter = proposed_num
+                        paragraphs[outer_counter] = text
+                        # Check if this new outer paragraph starts inner mode
+                        if proposed_text.strip().endswith(":"):
+                            mode = "inner"
 
-                inner_can_increase = False
+                    else:
+                        paragraphs[outer_counter] += " " + text
+                        inner_counter = proposed_num
 
             elif outer_counter in paragraphs:
+                # Non-numbered paragraph - add to current paragraph
                 paragraphs[outer_counter] += " " + text
-
-                inner_can_increase = text == "..."
 
         return paragraphs
 
@@ -1011,10 +1027,10 @@ if __name__ == "__main__":
 
     paragraphs = parser.extract_paragraphs(random_case)
 
-    for number, text in list(paragraphs.items()):
-        print(f"{number}:")
-        print(text)
-        print("\n" + "=" * 100 + "\n")
+    # for number, text in list(paragraphs.items())[15:18]:
+    #     print(f"{number}:")
+    #     print(text)
+    #     print("\n" + "=" * 100 + "\n")
 
     print(f"Processed random case: {random_case}\n")
     celex = random_case.split("/")[-2].split(".")[0]
