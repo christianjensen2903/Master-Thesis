@@ -167,10 +167,21 @@ class ModernJudgementParser(BaseJudgementParser):
     ) -> dict[int, str]:
         """Extract text from numbered paragraphs and their following siblings."""
         result = {}
-        for i, paragraph in enumerate(numbered_paragraphs, start=1):
+        expected_number = 1
+
+        for paragraph in numbered_paragraphs:
+            # Extract the actual paragraph number from the text
+            actual_number = self._extract_paragraph_number(paragraph)
+
+            # Skip paragraphs that don't have the expected sequential number
+            if actual_number != expected_number:
+                continue
+
             full_text = self._extract_paragraph_with_siblings(paragraph)
             if full_text:
-                result[i] = full_text
+                result[expected_number] = full_text
+                expected_number += 1
+
         return result
 
     def _extract_paragraph_with_siblings(self, paragraph: Tag) -> str:
@@ -201,10 +212,34 @@ class ModernJudgementParser(BaseJudgementParser):
 
         return text_parts
 
+    def _extract_paragraph_number(self, paragraph: Tag) -> int | None:
+        """Extract the paragraph number from the paragraph text.
+
+        Returns the actual number found in the text, or None if no valid number is found.
+        """
+        import re
+
+        text = self._get_text(paragraph).strip()
+
+        # Try to match patterns like "1.", "1 ", "1)", etc.
+        patterns = [
+            r"^\s*(\d+)\.\s+",  # "1. " pattern
+            r"^\s*(\d+)\s+",  # "1 " pattern
+            r"^\s*(\d+)\)\s+",  # "1) " pattern
+        ]
+
+        for pattern in patterns:
+            match = re.match(pattern, text)
+            if match:
+                return int(match.group(1))
+
+        return None
+
     def _extract_table_format(self, soup: bs) -> dict[int, str]:
         """Extract paragraphs from the newer table-based format."""
-        paragraphs: list[str] = []
+        paragraphs: dict[int, str] = {}
         point_markers = soup.find_all("p", attrs={"id": re.compile(r"^point\d+$")})
+        expected_number = 1
 
         for marker in point_markers:
             # Skip nested markers that belong to sub-points inside a parent paragraph's content cell
@@ -219,15 +254,31 @@ class ModernJudgementParser(BaseJudgementParser):
             if len(tds) < 2:
                 continue
 
+            # Extract the actual paragraph number from the marker ID
+            marker_id = marker.get("id", "")
+            if not isinstance(marker_id, str):
+                continue
+            match = re.match(r"^point(\d+)$", marker_id)
+            if not match:
+                continue
+
+            actual_number = int(match.group(1))
+
+            # Skip if the number is not the expected sequential number
+            if actual_number != expected_number:
+                continue
+
             # Content is in the last TD of the row
             content_td = tds[-1]
 
             # Simpler and more robust: take all text within the content cell using get_text
             # Using a separator preserves inline content from nested tags and links
             combined: str = content_td.get_text(" ", strip=True)
-            paragraphs.append(combined)
+            if combined:
+                paragraphs[expected_number] = combined
+                expected_number += 1
 
-        return {par_no: text for par_no, text in enumerate(paragraphs, start=1)}
+        return paragraphs
 
     def _is_nested_point_marker(self, marker: Tag) -> bool:
         """Return True if the marker is inside the content cell of another numbered row.
@@ -303,20 +354,6 @@ class ModernJudgementParser(BaseJudgementParser):
         else:
             return False
 
-        # Special case handling for documents with mixed patterns
-        # This is a heuristic to handle cases like 62004TJ0406 that have both "1." and "1 " patterns
-        # If the document has both patterns, prefer the "1 " pattern (sub-paragraphs)
-        # This is detected by checking if there are paragraphs with both patterns in the document
-        if hasattr(self, "_document_pattern_analyzed"):
-            if self._document_has_mixed_patterns:
-                # For mixed pattern documents, only include "1 " pattern (not "1.")
-                return bool(re.match(r"^\s*\d+\s+", text)) and not bool(
-                    re.match(r"^\s*\d+\.\s+", text)
-                )
-
-        # Default behavior: include all numbered paragraphs
-        return True
-
     def _is_section_heading(self, tag: Tag) -> bool:
         """Heuristically detect section headings by class name.
 
@@ -353,11 +390,11 @@ class LegacyEurLexParser(BaseJudgementParser):
 
     def _detect_numbering_pattern(self, tag: Tag) -> NumberingPattern:
         text = self._get_text(tag).strip()
-        if re.match(r"^\s*\d+\.", text):
+        if re.match(r"^`?\s*\d+\.", text):
             return NumberingPattern.DOT
-        elif re.match(r"^\s*\d+\)", text):
+        elif re.match(r"^`?\s*\d+\)", text):
             return NumberingPattern.PARENTHESIS
-        elif re.match(r"^\s*\d+", text):
+        elif re.match(r"^`?\s*\d+", text):
             return NumberingPattern.SPACE
         return NumberingPattern.SPACE
 
@@ -365,15 +402,15 @@ class LegacyEurLexParser(BaseJudgementParser):
         """Check if text matches the specified numbering pattern."""
 
         if pattern_type == NumberingPattern.DOT:
-            return bool(re.match(r"^\s*\d+\.", text))
+            return bool(re.match(r"^`?\s*\d+\.", text))
         elif pattern_type == NumberingPattern.SPACE:
             return bool(
-                re.match(r"^\s*\d+", text)
-                and not re.match(r"^\s*\d+\.", text)
-                and not re.match(r"^\s*\d+\)", text)
+                re.match(r"^`?\s*\d+", text)
+                and not re.match(r"^`?\s*\d+\.", text)
+                and not re.match(r"^`?\s*\d+\)", text)
             )
         elif pattern_type == NumberingPattern.PARENTHESIS:
-            return bool(re.match(r"^\s*\d+\)", text))
+            return bool(re.match(r"^`?\s*\d+\)", text))
         return False
 
     def extract_paragraphs(self, soup: bs) -> dict[int, str]:
@@ -416,15 +453,15 @@ class LegacyEurLexParser(BaseJudgementParser):
                 continue
 
             # Check if this paragraph starts with a number
-            match = re.match(r"^\s*(\d+)\s*[\.\)]?\s*(.+)", text)
+            match = re.match(r"^`?\s*(\d+)\s*[\.\)]?\s*(.+)", text)
 
             if match:
                 proposed_num = int(match.group(1))
                 proposed_text = match.group(2)
 
-                # print(
-                #     f"Proposed number: {proposed_num}, outer_counter: {outer_counter}, inner_counter: {inner_counter}, mode: {mode}"
-                # )
+                print(
+                    f"Proposed number: {proposed_num}, outer_counter: {outer_counter}, inner_counter: {inner_counter}, mode: {mode}, outer_pattern: {outer_pattern}, inner_pattern: {inner_pattern}"
+                )
 
                 if outer_pattern is None:
                     outer_pattern = self._detect_numbering_pattern(p_tag)
@@ -1082,6 +1119,7 @@ class JudgementParser:
         # Try each parser in order
         for parser in self.parsers:
             if parser.can_parse(soup):
+
                 return parser.extract_paragraphs(soup)
 
         # No parser could handle this format
@@ -1117,7 +1155,7 @@ if __name__ == "__main__":
     #     soup = parser._load_html(random_case)
 
     # 61976CJ0085
-    random_case = "judgments/61976CJ0085/eng_judgment.html"
+    random_case = "judgments/61989CJ0260/eng_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
 
