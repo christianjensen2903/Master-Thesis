@@ -61,16 +61,8 @@ def test_paragraph_extraction(celex: str) -> None:
             mismatches.append(
                 {
                     "paragraph": para_num,
-                    "expected": (
-                        expected_text[:100] + "..."
-                        if len(expected_text) > 100
-                        else expected_text
-                    ),
-                    "actual": (
-                        actual_text[:100] + "..."
-                        if len(actual_text) > 100
-                        else actual_text
-                    ),
+                    "expected": expected_text,
+                    "actual": actual_text,
                 }
             )
 
