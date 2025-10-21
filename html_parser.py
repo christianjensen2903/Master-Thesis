@@ -897,6 +897,124 @@ class DtDdParser(BaseJudgementParser):
         return self._get_dt_number(next_dt) == number
 
 
+class ReportForHearingParser(BaseJudgementParser):
+    """Parser for Reports for the Hearing that use table-based format with coj-count and coj-normal classes."""
+
+    def can_parse(self, soup: bs) -> bool:
+        """Check if this document uses the Report for the Hearing format."""
+        # Look for the specific table structure with coj-count and coj-normal classes
+        coj_count_tags = soup.find_all("p", class_="coj-count")
+        coj_normal_tags = soup.find_all("p", class_="coj-normal")
+
+        # Must have both types of tags
+        if not coj_count_tags or not coj_normal_tags:
+            return False
+
+        # Check if we have numbered paragraphs (coj-count should contain numbers)
+        numbered_paragraphs = 0
+        for tag in coj_count_tags:
+            text = self._get_text(tag).strip()
+            # Check if it's a simple number like "1.", "2.", etc.
+            if re.match(r"^\s*\d+\.?\s*$", text):
+                numbered_paragraphs += 1
+
+        # Need at least a few numbered paragraphs to be considered a report
+        return numbered_paragraphs >= 3
+
+    def extract_paragraphs(self, soup: bs) -> dict[int, str]:
+        """Extract paragraphs from the Report for the Hearing format, starting from the Judgment section."""
+        paragraphs: dict[int, str] = {}
+
+        # Find the Judgment heading to start extraction from there
+        judgment_heading = self._find_judgment_heading(soup)
+        if not judgment_heading:
+            return {}
+
+        # Find all tables that come after the Judgment heading
+        tables = judgment_heading.find_all_next("table")
+
+        for table in tables:
+            # Look for the specific table structure with coj-count and coj-normal
+            coj_count = table.find("p", class_="coj-count")
+            coj_normal = table.find("p", class_="coj-normal")
+
+            if coj_count and coj_normal:
+                # Extract the paragraph number
+                count_text = self._get_text(coj_count).strip()
+
+                # Only process simple numbers (1, 2, 3, etc.) not sub-numbers like (1), (2), etc.
+                # Check if it's a simple number without parentheses or quotes
+                if re.match(r"^\s*\d+\s*$", count_text):
+                    paragraph_num = int(count_text.strip())
+
+                    # Extract all text from the coj-normal cell and its sibling tables
+                    normal_text = self._extract_full_paragraph_text(coj_normal, table)
+
+                    if normal_text.strip():
+                        # If we already have this paragraph number, append the text
+                        if paragraph_num in paragraphs:
+                            paragraphs[paragraph_num] += " " + normal_text
+                        else:
+                            paragraphs[paragraph_num] = normal_text
+
+        return paragraphs
+
+    def _extract_full_paragraph_text(
+        self, coj_normal_tag: Tag, parent_table: Tag
+    ) -> str:
+        """Extract all text from a coj-normal tag, including sibling sub-points."""
+        text_parts: list[str] = []
+
+        # Get the main text from the coj-normal tag
+        main_text = self._get_text(coj_normal_tag)
+        if main_text.strip():
+            text_parts.append(main_text.strip())
+
+        # Find the parent td element that contains both the coj-normal and nested tables
+        parent_td = coj_normal_tag.find_parent("td")
+        if parent_td:
+            # Find all sibling tables within the same td
+            sibling_tables = parent_td.find_all("table")
+
+            for sibling_table in sibling_tables:
+                # Skip the current table (the main paragraph table)
+                if sibling_table == parent_table:
+                    continue
+
+                nested_count = sibling_table.find("p", class_="coj-count")
+                nested_normal = sibling_table.find("p", class_="coj-normal")
+
+                if nested_count and nested_normal:
+                    nested_count_text = self._get_text(nested_count).strip()
+                    nested_normal_text = self._get_text(nested_normal)
+
+                    if nested_normal_text.strip():
+                        # Add the sub-point with its number
+                        text_parts.append(
+                            f"{nested_count_text} {nested_normal_text.strip()}"
+                        )
+
+        return " ".join(text_parts)
+
+    def _find_judgment_heading(self, soup: bs) -> Tag | None:
+        """Find the Judgment heading to start extraction from there."""
+        # Look for the "Judgment" heading (not "JUDGMENT OF THE COURT")
+        judgment_heading = soup.find(
+            "p", class_="coj-sum-title-1", string=re.compile(r"^Judgment$")
+        )
+        if judgment_heading:
+            return judgment_heading
+
+        # Fallback: look for any heading containing "Judgment"
+        judgment_heading = soup.find(
+            "p", class_="coj-sum-title-1", string=re.compile(r"Judgment")
+        )
+        if judgment_heading:
+            return judgment_heading
+
+        return None
+
+
 class OperativePartParser(BaseJudgementParser):
     """Parser for pages that only contain an Operative part rendered via tables."""
 
@@ -1069,6 +1187,7 @@ class JudgementParser:
             LegacyEurLexParser(),
             DtDdParser(),
             ModernJudgementParser(),
+            ReportForHearingParser(),
             OperativePartParser(),
         ]
 
@@ -1155,7 +1274,7 @@ if __name__ == "__main__":
     #     soup = parser._load_html(random_case)
 
     # 61976CJ0085
-    random_case = "judgments/61989CJ0260/eng_judgment.html"
+    random_case = "judgments/61987CJ0061/eng_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
 
