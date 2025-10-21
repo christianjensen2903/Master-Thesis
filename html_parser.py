@@ -417,7 +417,29 @@ class LegacyEurLexParser(BaseJudgementParser):
         """Extract paragraphs from the Grounds section."""
 
         # Find the h2 header and the em tag containing the paragraphs
-        h2_tag = soup.find("h2", text=re.compile(r"grounds", re.IGNORECASE))
+        # Support multiple languages for grounds section
+        grounds_patterns = [
+            r"grounds",  # English
+            r"motifs",  # French
+            r"gründe",  # German
+            r"motivos",  # Spanish
+            r"motivi",  # Italian
+            r"gronden",  # Dutch
+            r"fundamentação",  # Portuguese
+            r"uzasadnienie",  # Polish
+            r"fundamentare",  # Romanian
+            r"обосновение",  # Bulgarian
+            r"odůvodnění",  # Czech
+            r"põhjendused",  # Estonian
+            r"perustelut",  # Finnish
+            r"αιτιολόγηση",  # Greek
+        ]
+
+        h2_tag = None
+        for pattern in grounds_patterns:
+            h2_tag = soup.find("h2", string=re.compile(pattern, re.IGNORECASE))
+            if h2_tag:
+                break
 
         if not h2_tag:
             return {}
@@ -459,9 +481,9 @@ class LegacyEurLexParser(BaseJudgementParser):
                 proposed_num = int(match.group(1))
                 proposed_text = match.group(2)
 
-                print(
-                    f"Proposed number: {proposed_num}, outer_counter: {outer_counter}, inner_counter: {inner_counter}, mode: {mode}, outer_pattern: {outer_pattern}, inner_pattern: {inner_pattern}"
-                )
+                # print(
+                #     f"Proposed number: {proposed_num}, outer_counter: {outer_counter}, inner_counter: {inner_counter}, mode: {mode}, outer_pattern: {outer_pattern}, inner_pattern: {inner_pattern}"
+                # )
 
                 if outer_pattern is None:
                     outer_pattern = self._detect_numbering_pattern(p_tag)
@@ -504,10 +526,12 @@ class LegacyEurLexParser(BaseJudgementParser):
                     if proposed_text.strip().endswith(":"):
                         mode = "inner"
                 else:
+
+                    if inner_pattern is None:
+                        inner_pattern = self._detect_numbering_pattern(p_tag)
+
                     # We're in inner mode
                     if proposed_num == inner_counter + 1:
-                        if inner_pattern is None:
-                            inner_pattern = self._detect_numbering_pattern(p_tag)
 
                         # Check if this matches inner pattern
                         if self._matches_pattern(text, inner_pattern):
@@ -1274,7 +1298,7 @@ if __name__ == "__main__":
     #     soup = parser._load_html(random_case)
 
     # 61976CJ0085
-    random_case = "judgments/61987CJ0061/eng_judgment.html"
+    random_case = "judgments/61984CJ0190/fra_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
 
