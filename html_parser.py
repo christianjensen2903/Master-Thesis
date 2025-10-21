@@ -291,11 +291,17 @@ class ModernJudgementParser(BaseJudgementParser):
         if not has_numbered_class:
             return False
 
-        # Special case handling for documents with mixed patterns
-        # This is a heuristic to handle cases like 62004TJ0406 that have both "1." and "1 " patterns
+        # Check if this is a subparagraph (like (a), (b), (c)) rather than a main numbered paragraph
         text = self._get_text(tag).strip()
         import re
 
+        # If the text starts with a letter in parentheses like "(a)", "(b)", "(c)", treat it as a subparagraph
+        # Also handle cases where there might be a quote mark before the parentheses (including smart quotes)
+        if re.match(r"^\s*['\"\u2018\u2019\u201c\u201d]?\([a-z]\)\s*", text):
+            return False
+
+        # Special case handling for documents with mixed patterns
+        # This is a heuristic to handle cases like 62004TJ0406 that have both "1." and "1 " patterns
         # If the document has both patterns, prefer the "1 " pattern (sub-paragraphs)
         # This is detected by checking if there are paragraphs with both patterns in the document
         if hasattr(self, "_document_pattern_analyzed"):
@@ -1028,7 +1034,7 @@ if __name__ == "__main__":
     #     soup = parser._load_html(random_case)
 
     # 61976CJ0085
-    random_case = "judgments/61984CJ0222/eng_judgment.html"
+    random_case = "judgments/62009CJ0463/eng_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
 
