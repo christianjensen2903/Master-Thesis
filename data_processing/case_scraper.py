@@ -81,14 +81,15 @@ class CaseScraper:
         session: aiohttp.ClientSession,
         case_id: str,
     ) -> bytes | None:
-        """Fetch metadata content in English."""
+        """Fetch metadata content with fallbacks: EN, FR."""
         headers = self._build_headers("text/html,application/xhtml+xml,application/xml")
-        url = f"https://eur-lex.europa.eu/legal-content/EN/TXT/XML/?uri=CELEX:{case_id}"
-        content, status = await self.fetch_single(session, url, headers)
-        if status == 404:
-            return None
-
-        return content
+        attempts = ["EN", "FR"]
+        for lang in attempts:
+            url = f"https://eur-lex.europa.eu/legal-content/{lang}/TXT/XML/?uri=CELEX:{case_id}"
+            content, status = await self.fetch_single(session, url, headers)
+            if content and status != 404:
+                return content
+        return None
 
     async def fetch_judgment(
         self,
