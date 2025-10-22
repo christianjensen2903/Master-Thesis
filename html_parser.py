@@ -637,7 +637,12 @@ class LegacyEurLexParser(BaseJudgementParser):
                     ) and self._matches_pattern(text, outer_pattern)
 
                     if could_be_inner and could_be_outer:
-                        if self._is_last_number_of_kind(
+                        # If end with : it should be outer
+                        if proposed_text.strip().endswith(":"):
+                            mode = "outer"
+                            outer_counter = proposed_num
+                            paragraphs[outer_counter] = text
+                        elif self._is_last_number_of_kind(
                             current_index, proposed_num, p_tags, outer_pattern
                         ):
                             mode = "outer"
@@ -1380,14 +1385,14 @@ if __name__ == "__main__":
     #     soup = parser._load_html(random_case)
 
     # 61976CJ0085
-    random_case = "judgments/62006CJ0116/eng_judgment.html"
+    random_case = "judgments/62004CJ0418/eng_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
 
-    for number, text in list(paragraphs.items()):
-        print(f"{number}:")
-        print(text)
-        print("\n" + "=" * 100 + "\n")
+    # for number, text in list(paragraphs.items()):
+    #     print(f"{number}:")
+    #     print(text)
+    #     print("\n" + "=" * 100 + "\n")
 
     print(f"Processed random case: {random_case}\n")
     celex = random_case.split("/")[-2].split(".")[0]
