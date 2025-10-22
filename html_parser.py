@@ -397,10 +397,27 @@ class LegacyEurLexParser(BaseJudgementParser):
         r"αιτιολόγηση",  # Greek
     ]
 
+    COSTS_PATTERNS = [
+        r"decision on costs",  # English
+        r"décision sur les dépens",  # French
+        r"entscheidung über die kosten",  # German
+        r"decisión sobre las costas",  # Spanish
+        r"decisione sulle spese",  # Italian
+        r"beslissing over de kosten",  # Dutch
+        r"decisão sobre as custas",  # Portuguese
+        r"decyzja w sprawie kosztów",  # Polish
+        r"decizie privind cheltuielile",  # Romanian
+        r"решение за разходите",  # Bulgarian
+        r"rozhodnutí o nákladech",  # Czech
+        r"otsus kuludest",  # Estonian
+        r"päätös kuluista",  # Finnish
+        r"απόφαση για τα έξοδα",  # Greek
+    ]
+
     def can_parse(self, soup: bs) -> bool:
         """Check if this is the legacy EUR-Lex format."""
 
-        p_tags = self._collect_p_tags(soup)
+        p_tags = self._collect_grounds_p_tags(soup)
         return len(p_tags) > 1
 
     def _detect_numbering_pattern(self, tag: Tag) -> NumberingPattern:
@@ -493,31 +510,30 @@ class LegacyEurLexParser(BaseJudgementParser):
 
         return False  # No next +1 found
 
-    def _collect_p_tags(self, soup: bs) -> list[Tag]:
-        h2_tag = None
+    def _collect_grounds_p_tags(self, soup: bs) -> list[Tag]:
+        """Collect paragraphs from the Grounds section only."""
+        grounds_h2_tag = None
         for pattern in self.GROUNDS_PATTERNS:
             h2_tags = soup.find_all("h2")
             for tag in h2_tags:
                 if tag.string and re.match(pattern, tag.string, re.IGNORECASE):
-                    h2_tag = tag
+                    grounds_h2_tag = tag
                     break
-            if h2_tag:
+            if grounds_h2_tag:
                 break
 
-        if not h2_tag:
+        if not grounds_h2_tag:
             return []
 
-        em_tag = h2_tag.find_next_sibling("em")
-
-        # Collect paragraph tags: prefer <em> container, otherwise scan sibling <p> until next section
+        em_tag = grounds_h2_tag.find_next_sibling("em")
         p_tags: list[Tag] = []
         if em_tag:
             p_tags = list(em_tag.find_all("p", recursive=False))
         else:
-            sibling = h2_tag.find_next_sibling()
+            sibling = grounds_h2_tag.find_next_sibling()
             while sibling:
                 if isinstance(sibling, Tag):
-                    # Stop at next major section heading or operative part anchor
+                    # Stop at next major section heading
                     if sibling.name == "h2":
                         break
                     if sibling.name == "p":
@@ -526,10 +542,72 @@ class LegacyEurLexParser(BaseJudgementParser):
 
         return p_tags
 
-    def extract_paragraphs(self, soup: bs) -> dict[int, str]:
-        """Extract paragraphs from the Grounds section."""
+    def _collect_costs_p_tags(self, soup: bs) -> list[Tag]:
+        """Collect paragraphs from the Decision on costs section only."""
+        costs_h2_tag = None
+        for pattern in self.COSTS_PATTERNS:
+            h2_tags = soup.find_all("h2")
+            for tag in h2_tags:
+                if tag.string and re.match(pattern, tag.string, re.IGNORECASE):
+                    costs_h2_tag = tag
+                    break
+            if costs_h2_tag:
+                break
 
-        p_tags = self._collect_p_tags(soup)
+        if not costs_h2_tag:
+            return []
+
+        em_tag = costs_h2_tag.find_next_sibling("em")
+        p_tags: list[Tag] = []
+        if em_tag:
+            p_tags = list(em_tag.find_all("p", recursive=False))
+        else:
+            sibling = costs_h2_tag.find_next_sibling()
+            while sibling:
+                if isinstance(sibling, Tag):
+                    # Stop at next major section heading
+                    if sibling.name == "h2":
+                        break
+                    if sibling.name == "p":
+                        p_tags.append(sibling)
+                sibling = sibling.find_next_sibling()
+
+        return p_tags
+
+    def _collect_p_tags(self, soup: bs) -> list[Tag]:
+        """Collect paragraphs from both Grounds and Decision on costs sections."""
+        all_p_tags: list[Tag] = []
+        all_p_tags.extend(self._collect_grounds_p_tags(soup))
+        all_p_tags.extend(self._collect_costs_p_tags(soup))
+        return all_p_tags
+
+    def extract_paragraphs(self, soup: bs) -> dict[int, str]:
+        """Extract paragraphs from the Grounds and Decision on costs sections."""
+        # Process grounds section first
+        grounds_paragraphs = self._extract_paragraphs_from_section(
+            soup, self._collect_grounds_p_tags
+        )
+
+        # Process costs section
+        costs_paragraphs = self._extract_paragraphs_from_section(
+            soup, self._collect_costs_p_tags
+        )
+
+        # Combine both sections
+        all_paragraphs = {}
+        all_paragraphs.update(grounds_paragraphs)
+        all_paragraphs.update(costs_paragraphs)
+
+        return all_paragraphs
+
+    def _extract_paragraphs_from_section(
+        self, soup: bs, collect_method
+    ) -> dict[int, str]:
+        """Extract paragraphs from a specific section using the given collection method."""
+        p_tags = collect_method(soup)
+
+        if not p_tags:
+            return {}
 
         paragraphs: dict[int, str] = {}
         outer_counter: int = 0
@@ -549,10 +627,6 @@ class LegacyEurLexParser(BaseJudgementParser):
             if match:
                 proposed_num = int(match.group(1))
                 proposed_text = match.group(2)
-
-                # print(
-                #     f"Proposed number: {proposed_num}, outer_counter: {outer_counter}, inner_counter: {inner_counter}, mode: {mode}, outer_pattern: {outer_pattern}, inner_pattern: {inner_pattern}"
-                # )
 
                 if outer_pattern is None:
                     outer_pattern = self._detect_numbering_pattern(p_tag)
@@ -1567,8 +1641,8 @@ if __name__ == "__main__":
     #     )
     #     soup = parser._load_html(random_case)
 
-    # 61976CJ0085
-    random_case = "judgments/62012CJ0377/eng_judgment.html"
+    # Test with 61974CJ0008 which has costs section with paragraphs 16-17
+    random_case = "judgments/61974CJ0008/eng_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
 
