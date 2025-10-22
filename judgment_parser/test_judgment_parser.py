@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from typing import Any
 import pytest  # type: ignore
-from html_parser import JudgementParser
+from .main import JudgementParser
 
 
 def load_test_cases() -> dict[str, dict[str, Any]]:

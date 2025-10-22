@@ -18,7 +18,7 @@ import sys
 import argparse
 import json
 from pathlib import Path
-from html_parser import JudgementParser
+from .main import JudgementParser
 
 
 def find_case_file(celex: str) -> str | None:
@@ -195,9 +195,9 @@ After running this script, run the tests to verify:
     add_to_test_cases(args.celex, path, paragraphs)
 
     print("\nNext steps:")
-    print("  1. Run tests: pytest test_html_parser.py -v")
+    print("  1. Run tests: pytest test_judgment_parser.py -v")
     print(
-        f"  2. Verify test passes: pytest test_html_parser.py::test_paragraph_extraction[{args.celex}] -v"
+        f"  2. Verify test passes: pytest test_judgment_parser.py::test_paragraph_extraction[{args.celex}] -v"
     )
 
 

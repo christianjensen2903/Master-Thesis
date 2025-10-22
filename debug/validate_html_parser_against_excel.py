@@ -8,7 +8,7 @@ from tqdm import tqdm  # type: ignore
 from langdetect import detect, LangDetectException  # type: ignore
 from fuzzywuzzy import fuzz  # type: ignore
 
-from html_parser import JudgementParser, DtDdParser, LegacyEurLexParser
+from judgment_parser import JudgementParser, DtDdParser, LegacyEurLexParser
 
 
 def normalize_whitespace(text: str) -> str:
