@@ -226,18 +226,17 @@ class TextCleaner:
 
         return text.strip()
 
+    def normalize_whitespace(self, text: str) -> str:
+
+        # Replace all whitespace characters (spaces, tabs, newlines, etc.) with single space
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
+
     def clean_spacing(self, text: str) -> str:
         """Clean up spacing around punctuation."""
         if not isinstance(text, str):
             return text
-
-        # Save intentional trailing spaces (including inside parentheses at end)
-        trailing_spaces = ""
-        if re.search(r"\s+\)?$", text):
-            match = re.search(r"(\s+\)?)$", text)
-            if match:
-                trailing_spaces = match.group(1)
-                text = text[: match.start()]
 
         # Remove extra spaces around punctuation
         text = re.sub(r"\s+([,.])", r"\1", text)
@@ -260,7 +259,7 @@ class TextCleaner:
         # Collapse multiple spaces to 2 maximum
         text = re.sub(r" {3,}", "  ", text)
 
-        return text.strip() + trailing_spaces
+        return text.strip()
 
     def remove_duplicate_tags(self, text: str) -> str:
         """Remove duplicate consecutive tags."""
@@ -335,14 +334,9 @@ class TextCleaner:
         Returns:
             Cleaned text
         """
-        if not isinstance(text, str):
-            return text
 
-        # Preserve original trailing spaces
-        original_trailing = ""
-        if text.endswith(" "):
-            stripped = text.rstrip()
-            original_trailing = text[len(stripped) :]
+        # Normalize whitespace first
+        text = self.normalize_whitespace(text)
 
         # Apply cleaning steps in order
         if remove_paragraph_numbers:
@@ -357,7 +351,6 @@ class TextCleaner:
         if remove_dates:
             text = self.remove_dates(text)
 
-        # Clean up spacing (this will preserve intentional trailing spaces)
         text = self.clean_spacing(text)
 
         # Remove duplicate tags
@@ -370,8 +363,7 @@ class TextCleaner:
         if min_length > 0 and len(text.strip()) < min_length:
             return ""
 
-        # The clean_spacing method already handles trailing spaces
-        return text
+        return text.strip()
 
     def clean_pair(self, text_from: str, text_to: str, **kwargs) -> tuple[str, str]:
         """
@@ -396,11 +388,11 @@ class TextCleaner:
 
 # Example usage
 if __name__ == "__main__":
-    # Example text with various elements to clean
+    # Example text with various elements to clean (including extra whitespace)
     sample_text = """
-    25 In that connection it must be observed that, as the Court held in its judgment of 30 October 1974 in Case 188/73 Grassi v Council, paragraph 38, the appointing authority has a wide discretion in the matter of recruitment.
+    25 In that   connection it must be observed that,    as the Court held in its judgment of 30 October 1974 in Case 188/73 Grassi v Council, paragraph 38, the appointing authority has a wide discretion in the matter of recruitment.
     
-    The Court has already held, in its judgment in Case 31/80 L'Oréal v De Nieuwe AMCK, paragraph 25, that Article 11(2) of Regulation No 17/62.
+    The Court has already held,		in its judgment in Case 31/80 L'Oréal v De Nieuwe AMCK, paragraph 25, that Article 11(2) of Regulation No 17/62.
     
     See Commission v Technische Glaswerke Ilmenau, paragraph 50; Sweden and Others v API and Commission, paragraph 9.
     """
