@@ -3,168 +3,103 @@ import sys
 from pathlib import Path
 from typing import Any
 import logging
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
+from pydantic import BaseModel, Field
 
+# Add parent directory to path to import judgment_parser
+sys.path.append(str(Path(__file__).parent.parent))
 from judgment_parser import JudgementParser
+from tqdm import tqdm  # type: ignore
 
 
-class JudgmentData:
-    """Data structure for storing parsed judgment information."""
+class JudgmentData(BaseModel):
+    """Main data structure for storing parsed judgment information."""
 
-    def __init__(self, celex_id: str):
-        self.celex_id = celex_id
-        self.paragraphs: dict[int, str] = {}
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return {
-            "celex_id": self.celex_id,
-            "paragraphs": self.paragraphs,
-        }
+    celex_id: str = Field(..., description="Unique CELEX identifier for the judgment")
+    paragraphs: dict[int, str] = Field(
+        default_factory=dict, description="Paragraphs indexed by number"
+    )
+    meta: dict[str, Any] = Field(default_factory=dict, description="Metadata")
 
 
 class ComprehensiveJudgmentParser:
     """Main parser for processing all CJ judgments."""
 
-    def __init__(self, judgments_dir: str = "judgments", output_dir: str = "data"):
+    def __init__(
+        self,
+        judgments_dir: str = "judgments",
+        output_dir: str = "data",
+        par_to_par_file: str = "data/par-to-par.json",
+    ):
         self.judgments_dir = Path(judgments_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.par_to_par_file = Path(par_to_par_file)
 
         self.parser = JudgementParser()
+        with open(self.par_to_par_file, "r", encoding="utf-8") as f:
+            self.metadata: dict[str, Any] = json.load(f)
 
-        self._setup_logging()
+    def _find_metadata_for_celex_id(self, celex_id: str) -> dict[str, Any]:
+        if celex_id not in self.metadata:
+            return {}
 
-        self.stats = {
-            "total_processed": 0,
-            "successful": 0,
-            "failed": 0,
-            "total_paragraphs": 0,
-            "total_text_length": 0,
-        }
-
-    def _setup_logging(self) -> None:
-        """Setup logging configuration."""
-        log_file = self.output_dir / "parsing.log"
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)],
-        )
-        self.logger = logging.getLogger(__name__)
+        return self.metadata[celex_id].get("meta", {})
 
     def get_judgments(self) -> list[str]:
-        """Get all judgment CELEX IDs from the judgments directory."""
         judgments: list[str] = []
 
         if not self.judgments_dir.exists():
-            self.logger.error(f"Judgments directory not found: {self.judgments_dir}")
+            print(f"Judgments directory not found: {self.judgments_dir}")
             return judgments
 
         for item in self.judgments_dir.iterdir():
             if item.is_dir() and "CJ" in item.name:
                 judgments.append(item.name)
 
-        judgments.sort()
-        self.logger.info(f"Found {len(judgments)} judgments")
         return judgments
 
     def parse_single_judgment(self, celex_id: str) -> JudgmentData:
-        """Parse a single judgment and return structured data."""
-        judgment_data = JudgmentData(celex_id)
-
         try:
-            # Extract paragraphs using the existing parser
             paragraphs = self.parser.extract_paragraphs_from_celex(celex_id)
-            judgment_data.paragraphs = paragraphs
-            self.stats["total_paragraphs"] += len(paragraphs)
-            self.stats["total_text_length"] += sum(
-                len(text) for text in paragraphs.values()
+            meta = self._find_metadata_for_celex_id(celex_id)
+
+            judgment_data = JudgmentData(
+                celex_id=celex_id, paragraphs=paragraphs, meta=meta
             )
-            self.stats["successful"] += 1
 
         except Exception as e:
-            self.logger.error(f"Error parsing {celex_id}: {e}")
-            self.stats["failed"] += 1
+            print(f"Error parsing {celex_id}: {e}")
+            judgment_data = JudgmentData(celex_id=celex_id)
 
         return judgment_data
 
-    def parse_judgments_batch(
-        self, celex_ids: list[str], max_workers: int | None = None
-    ) -> list[JudgmentData]:
-        """Parse multiple judgments in parallel."""
-        if max_workers is None:
-            max_workers = min(mp.cpu_count(), 8)  # Limit to 8 workers max
-
-        self.logger.info(
-            f"Starting batch parsing of {len(celex_ids)} judgments with {max_workers} workers"
-        )
+    def parse_judgments(self, celex_ids: list[str]) -> list[JudgmentData]:
 
         results = []
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_celex = {
-                executor.submit(self.parse_single_judgment, celex_id): celex_id
-                for celex_id in celex_ids
-            }
+        for celex_id in tqdm(celex_ids, desc="Processing judgments"):
+            try:
+                result = self.parse_single_judgment(celex_id)
+                results.append(result)
 
-            # Process completed tasks
-            for future in as_completed(future_to_celex):
-                celex_id = future_to_celex[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-
-                    # Update statistics
-                    self.stats["total_processed"] += 1
-                    self.stats["total_paragraphs"] += len(result.paragraphs)
-                    self.stats["total_text_length"] += sum(
-                        len(text) for text in result.paragraphs.values()
-                    )
-
-                    # Log progress
-                    if self.stats["total_processed"] % 100 == 0:
-                        self.logger.info(
-                            f"Processed {self.stats['total_processed']}/{len(celex_ids)} judgments"
-                        )
-
-                except Exception as e:
-                    self.logger.error(f"Error processing {celex_id}: {e}")
-                    self.stats["failed"] += 1
+            except Exception as e:
+                print(f"Error processing {celex_id}: {e}")
 
         return results
 
     def _save_json(self, results: list[JudgmentData]) -> None:
-        """Save results as JSON files."""
-        complete_data = [result.to_dict() for result in results]
+        complete_data = [result.model_dump() for result in results]
         complete_file = self.output_dir / "judgments.json"
 
         with open(complete_file, "w", encoding="utf-8") as f:
             json.dump(complete_data, f, indent=2, ensure_ascii=False)
 
-        self.logger.info(f"Saved complete dataset to {complete_file}")
-
     def run(self) -> None:
-        """Run the complete parsing process."""
-        self.logger.info("Starting comprehensive CJ judgment parsing")
-
         judgments = self.get_judgments()
-
-        if not judgments:
-            self.logger.error("No judgments found")
-            return
-
-        results = self.parse_judgments_batch(judgments)
-
+        results = self.parse_judgments(judgments)
         self._save_json(results)
-
-        self.logger.info("Parsing completed!")
-        self.logger.info(f"Total processed: {self.stats['total_processed']}")
 
 
 def main():
-    """Main function to run the judgment parser."""
     import argparse
 
     parser = argparse.ArgumentParser(description="Parse all CJ judgments")
@@ -172,12 +107,19 @@ def main():
         "--judgments-dir", default="judgments", help="Path to judgments directory"
     )
     parser.add_argument("--output-dir", default="data", help="Path to output directory")
+    parser.add_argument(
+        "--par-to-par-file",
+        default="data/par-to-par.json",
+        help="Path to par-to-par.json file",
+    )
 
     args = parser.parse_args()
 
     # Create parser and run
     judgment_parser = ComprehensiveJudgmentParser(
-        judgments_dir=args.judgments_dir, output_dir=args.output_dir
+        judgments_dir=args.judgments_dir,
+        output_dir=args.output_dir,
+        par_to_par_file=args.par_to_par_file,
     )
 
     judgment_parser.run()
