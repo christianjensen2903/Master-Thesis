@@ -530,7 +530,6 @@ class LegacyEurLexParser(BaseJudgementParser):
         """Extract paragraphs from the Grounds section."""
 
         p_tags = self._collect_p_tags(soup)
-        print(p_tags)
 
         paragraphs: dict[int, str] = {}
         outer_counter: int = 0
@@ -1213,15 +1212,15 @@ class ReportForHearingParser(BaseJudgementParser):
 
     def _find_judgment_heading(self, soup: bs) -> Tag | None:
         """Find the Judgment heading to start extraction from there."""
-        # Look for the "Judgment" heading (not "JUDGMENT OF THE COURT")
+        # Look for the "Judgment" heading (case insensitive)
         judgment_tags = soup.find_all("p", class_="coj-sum-title-1")
         for tag in judgment_tags:
-            if tag.string and re.match(r"^Judgment$", tag.string):
+            if tag.string and re.match(r"^Judgment$", tag.string, re.IGNORECASE):
                 return tag
 
-        # Fallback: look for any heading containing "Judgment"
+        # Fallback: look for any heading containing "Judgment" (case insensitive)
         for tag in judgment_tags:
-            if tag.string and re.search(r"Judgment", tag.string):
+            if tag.string and re.search(r"Judgment", tag.string, re.IGNORECASE):
                 return tag
 
         return None
@@ -1451,7 +1450,6 @@ class JudgementParser:
         # Try each parser in order
         for parser in self.parsers:
             if parser.can_parse(soup):
-                print(f"Using parser: {parser.__class__.__name__}")
                 return parser.extract_paragraphs(soup)
 
         # No parser could handle this format
@@ -1487,7 +1485,7 @@ if __name__ == "__main__":
     #     soup = parser._load_html(random_case)
 
     # 61976CJ0085
-    random_case = "judgments/61985CJ0314/eng_judgment.html"
+    random_case = "judgments/62012CJ0377/eng_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
 
