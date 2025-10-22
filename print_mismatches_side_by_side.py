@@ -105,6 +105,12 @@ def main() -> int:
         help="Filter by paragraph number",
     )
     parser.add_argument(
+        "--start",
+        type=int,
+        default=0,
+        help="Start index (0-based) for rows to print (default: 0)",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=10,
@@ -123,7 +129,17 @@ def main() -> int:
         print("No rows matched the filters.")
         return 0
 
-    to_show = rows if args.limit is not None and args.limit < 0 else rows[: args.limit]
+    # Apply start index
+    start_idx = max(0, args.start)
+    if start_idx >= len(rows):
+        print(f"Start index {start_idx} is beyond available rows ({len(rows)}).")
+        return 0
+
+    # Apply limit after start index
+    if args.limit < 0:
+        to_show = rows[start_idx:]
+    else:
+        to_show = rows[start_idx : start_idx + args.limit]
 
     for idx, r in enumerate(to_show, start=1):
         celex = r.get("celex", "")
@@ -142,7 +158,7 @@ def main() -> int:
         if idx < len(to_show):
             print("=" * shutil.get_terminal_size(fallback=(120, 40)).columns)
 
-    remaining = len(rows) - len(to_show)
+    remaining = len(rows) - start_idx - len(to_show)
     if remaining > 0:
         print(f"\n... {remaining} more rows not shown (use --limit -1 to show all).")
 

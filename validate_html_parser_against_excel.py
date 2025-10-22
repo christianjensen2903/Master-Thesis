@@ -220,6 +220,7 @@ def compare_against_excel(xlsx_path: str) -> dict[str, Any]:
     celex_dtdd: dict[str, bool] = {}
     celex_legacy: dict[str, bool] = {}
     celex_language_used: dict[str, str] = {}  # Track which language was used
+    celex_fallback_used: dict[str, bool] = {}  # Track if fallback to French was used
     mismatches: list[dict[str, Any]] = []
     missing_files: set[str] = set()
     missing_paragraphs: list[dict[str, Any]] = []
@@ -264,6 +265,40 @@ def compare_against_excel(xlsx_path: str) -> dict[str, Any]:
 
         parsed_map = celex_to_paragraphs.get(celex_id, {})
         parsed_text = parsed_map.get(paragraph_number)
+        language_used_for_paragraph = celex_language_used.get(celex_id, "unknown")
+
+        # If paragraph not found in current language, try the other language
+        if parsed_text is None:
+            current_language = language_used_for_paragraph
+            fallback_language = "fra" if current_language == "eng" else "eng"
+
+            # Try to get the paragraph from the fallback language
+            fallback_html_path = resolve_html_path(celex_id, fallback_language)
+            if fallback_html_path and os.path.exists(fallback_html_path):
+                try:
+                    # Parse the fallback language version
+                    fallback_parser = JudgementParser()
+                    fallback_extracted = fallback_parser.extract_paragraphs(
+                        fallback_html_path
+                    )
+                    fallback_parsed_map = {
+                        k: clean_text(v) for k, v in fallback_extracted.items()
+                    }
+                    parsed_text = fallback_parsed_map.get(paragraph_number)
+
+                    if parsed_text is not None:
+                        # Update the language used for this paragraph
+                        language_used_for_paragraph = fallback_language
+                        # Update the stored paragraphs for this CELEX ID
+                        celex_to_paragraphs[celex_id] = fallback_parsed_map
+                        celex_language_used[celex_id] = fallback_language
+                        # Track if we used French fallback
+                        if fallback_language == "fra":
+                            celex_fallback_used[celex_id] = True
+                except Exception as e:
+                    print(f"Error parsing fallback {fallback_html_path}: {e}")
+
+        # If still not found after trying both languages, mark as missing
         if parsed_text is None:
             missing_paragraphs.append(
                 {
@@ -276,23 +311,35 @@ def compare_against_excel(xlsx_path: str) -> dict[str, Any]:
 
         excel_cmp = clean_text(item["excel_text"])
 
+        # Skip mismatch analysis if French fallback was used for this CELEX ID
+        if celex_fallback_used.get(celex_id, False):
+            continue
+
         # Use fuzzy matching to check if similarity is above 90%
         similarity_ratio = fuzz.ratio(parsed_text, excel_cmp)
 
-        if similarity_ratio < 80:
+        if similarity_ratio < 60:
             # If the case is parsable by DtDdParser, treat our parser as authoritative and ignore
-            if celex_dtdd.get(celex_id, False):
-                continue
+            # if celex_dtdd.get(celex_id, False):
+            #     continue
 
-            if celex_legacy.get(celex_id, False):
-                continue
+            # if celex_legacy.get(celex_id, False):
+            #     continue
 
-            if (celex_id, paragraph_number) in [
-                ("62010CJ036", 11),
-                ("62011CJ0439", 45),
-                ("62011CJ0510", 23),
-            ]:
-                continue
+            # if len(excel_cmp) - len(parsed_text) > 5000:
+            #     continue
+
+            # if (celex_id, paragraph_number) in [
+            #     ("62010CJ0361", 11),
+            #     ("62011CJ0439", 45),
+            #     ("62011CJ0510", 23),
+            #     ("62011CJ0429", 55),
+            #     ("62007CJ0283", 29),
+            #     ("62010CJ0017", 51),
+            #     ("62008CJ0132", 32),
+            #     ("62007CJ0429", 35),
+            # ]:
+            #     continue
 
             mismatches.append(
                 {
@@ -300,7 +347,7 @@ def compare_against_excel(xlsx_path: str) -> dict[str, Any]:
                     "paragraph_number": paragraph_number,
                     "excel_text": excel_cmp,
                     "html_parser_text": parsed_text,
-                    "language_used": celex_language_used.get(celex_id, "unknown"),
+                    "language_used": language_used_for_paragraph,
                     "similarity_ratio": similarity_ratio,
                 }
             )
@@ -315,6 +362,7 @@ def compare_against_excel(xlsx_path: str) -> dict[str, Any]:
         "missing_files": sorted(missing_files),
         "missing_paragraphs": missing_paragraphs,
         "language_usage": celex_language_used,
+        "fallback_used": celex_fallback_used,
     }
 
 
@@ -368,9 +416,10 @@ def write_report(result: dict[str, Any]) -> tuple[str, str, str]:
     language_csv = os.path.join(artifacts_dir, "language_usage.csv")
     with open(language_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["celex", "language_used"])
+        writer.writerow(["celex", "language_used", "fallback_used"])
         for celex, language in result.get("language_usage", {}).items():
-            writer.writerow([celex, language])
+            fallback_used = result.get("fallback_used", {}).get(celex, False)
+            writer.writerow([celex, language, fallback_used])
 
     print(result["missing_files"])
 
@@ -389,15 +438,18 @@ def main() -> int:
 
     # Calculate language usage statistics
     language_usage = result.get("language_usage", {})
+    fallback_used = result.get("fallback_used", {})
     eng_count = sum(1 for lang in language_usage.values() if lang == "eng")
     fra_count = sum(1 for lang in language_usage.values() if lang == "fra")
     none_count = sum(1 for lang in language_usage.values() if lang == "none")
+    fallback_count = sum(1 for used in fallback_used.values() if used)
 
     print(
         f"Checked {result['total_rows']} rows across {result['unique_cases']} cases.\n"
         f"Mismatches: {result['mismatch_count']}, Missing files: {result['missing_file_count']}, "
         f"Missing paragraphs: {result['missing_paragraph_count']}.\n"
         f"Language usage - English: {eng_count}, French: {fra_count}, None: {none_count}\n"
+        f"Cases with French fallback (excluded from mismatch analysis): {fallback_count}\n"
         f"Mismatches written to: {out_csv}\n"
         f"Missing paragraphs written to: {missing_csv}\n"
         f"Language usage written to: {language_csv}"
