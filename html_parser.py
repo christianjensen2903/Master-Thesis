@@ -1612,6 +1612,84 @@ class JudgementParser:
         # No parser could handle this format
         return {}
 
+    def extract_paragraphs_from_celex(self, celex_id: str) -> dict[int, str]:
+        """Extract paragraphs from a judgment using CELEX ID with automatic language selection.
+
+        Language priority: English > French > Native (remaining)
+        When multiple versions exist, chooses the one with most paragraphs.
+        """
+        judgment_path = self._find_best_judgment(celex_id)
+        if not judgment_path:
+            return {}
+
+        return self.extract_paragraphs(judgment_path)
+
+    def _find_best_judgment(self, celex_id: str) -> str | None:
+        """Find the best judgment file for a given CELEX ID.
+
+        Returns the path to the best judgment file, or None if no judgment found.
+        """
+        judgments_dir = os.path.join("judgments", celex_id)
+        if not os.path.exists(judgments_dir):
+            return None
+
+        # Language priority: English > French > Native (remaining)
+        language_priority = ["eng", "fra"]
+
+        # Find all available judgment files
+        available_judgments = []
+        for file in os.listdir(judgments_dir):
+            if file.endswith("_judgment.html"):
+                lang = file.split("_")[0]
+                file_path = os.path.join(judgments_dir, file)
+                available_judgments.append((lang, file_path))
+
+        if not available_judgments:
+            return None
+
+        # If only one judgment, return it
+        if len(available_judgments) == 1:
+            return available_judgments[0][1]
+
+        # Try languages in priority order
+        for preferred_lang in language_priority:
+            for lang, file_path in available_judgments:
+                if lang == preferred_lang:
+                    # Check if this is a good choice by parsing and counting paragraphs
+                    paragraphs = self._count_paragraphs_in_file(file_path)
+                    if paragraphs > 0:  # Valid judgment with content
+                        return file_path
+
+        # If no preferred language found, or all preferred languages have no content,
+        # compare all available judgments and pick the one with most paragraphs
+        best_judgment = None
+        max_paragraphs = 0
+
+        for lang, file_path in available_judgments:
+            paragraphs = self._count_paragraphs_in_file(file_path)
+            if paragraphs > max_paragraphs:
+                max_paragraphs = paragraphs
+                best_judgment = file_path
+
+        return best_judgment
+
+    def _count_paragraphs_in_file(self, file_path: str) -> int:
+        """Count the number of paragraphs in a judgment file without full parsing."""
+        try:
+            soup = self._load_html(file_path)
+            if not soup:
+                return 0
+
+            # Try each parser to see which one can handle this format
+            for parser in self.parsers:
+                if parser.can_parse(soup):
+                    paragraphs = parser.extract_paragraphs(soup)
+                    return len(paragraphs)
+
+            return 0
+        except Exception:
+            return 0
+
 
 if __name__ == "__main__":
     # Get all HTML files from the cases folder
@@ -1621,36 +1699,31 @@ if __name__ == "__main__":
         print("No judgment files found.")
         sys.exit(1)
 
-    # Randomly select a judgment file
-    random_case = random.choice(
-        [file for file in judgment_files if any(x in file for x in ["CJ", "FJ", "TJ"])]
-    )
-
     parser = JudgementParser()
 
-    # Continue until it finds a case which can be parsed by DtDdParser
-    # dtd_parser = DtDdParser()
-    # soup = parser._load_html(random_case)
-    # while soup is None or not dtd_parser.can_parse(soup):
-    #     random_case = random.choice(
-    #         [
-    #             file
-    #             for file in judgment_files
-    #             if any(x in file for x in ["CJ", "FJ", "TJ"])
-    #         ]
-    #     )
-    #     soup = parser._load_html(random_case)
+    # Test the new CELEX-based functionality
+    test_celex = "61974CJ0008"
+    print(f"Testing automatic judgment selection for CELEX: {test_celex}")
 
-    # Test with 61974CJ0008 which has costs section with paragraphs 16-17
-    random_case = "judgments/61974CJ0008/eng_judgment.html"
+    # Use the new method that automatically selects the best judgment
+    paragraphs = parser.extract_paragraphs_from_celex(test_celex)
 
-    paragraphs = parser.extract_paragraphs(random_case)
+    if paragraphs:
+        print(f"Successfully extracted {len(paragraphs)} paragraphs from {test_celex}")
+        print("First few paragraphs:")
+        for number, text in list(paragraphs.items())[:3]:  # Show first 3 paragraphs
+            print(f"{number}: {text[:100]}...")
+            print()
+    else:
+        print(f"No paragraphs found for CELEX: {test_celex}")
 
-    print(f"Processed random case: {random_case}\n")
-    celex = random_case.split("/")[-2].split(".")[0]
-    print(f"CELEX: {celex}\n")
+    # Also test with a few more CELEX IDs to demonstrate the functionality
+    test_celex_ids = ["61974CJ0008", "61975CJ0001", "61976CJ0001"]
 
-    for number, text in list(paragraphs.items()):
-        print(f"{number}:")
-        print(text)
-        print("\n" + "=" * 100 + "\n")
+    for celex_id in test_celex_ids:
+        print(f"\nTesting CELEX: {celex_id}")
+        paragraphs = parser.extract_paragraphs_from_celex(celex_id)
+        if paragraphs:
+            print(f"  Found {len(paragraphs)} paragraphs")
+        else:
+            print(f"  No paragraphs found")
