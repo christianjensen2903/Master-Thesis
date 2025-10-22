@@ -20,20 +20,22 @@ class TextCleaner:
         # Sub-patterns
         _case_joined_all = (
             rf"\bJoined Cases?\s+(?:{COURT}{CASE_NUMBER}"
-            rf"(?:\s*(?:,|and|&)\s*{COURT}{CASE_NUMBER})+)"
-            r"[^.,;)]*"
+            rf"(?:\s*(?:,|and|&)\s*{COURT}{CASE_NUMBER})+)(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+)?"
+            rf"(?=\s*[,\.;\)]|\s*$|$)"
         )
         _case_joined_trailing_year = (
             rf"\bJoined Cases?\s+(?:{COURT}\d+(?:\s*(?:,|and|&)\s*{COURT}\d+)+\s*/\s*{YEAR})"
-            r"[^.,;)]*"
+            rf"(?=\s*[,\.;\)]|\s*$|$)"
         )
         _case_joined_range = (
             rf"\bJoined Cases?\s+(?:{COURT}\d+\s*(?:{DASH}|to|through)\s*{COURT}\d+/\s*{YEAR})"
-            r"[^.,;)]*"
+            rf"(?=\s*[,\.;\)]|\s*$|$)"
         )
-        _case_single = rf"\bCase\s+{COURT}{CASE_NUMBER}[^.,;)]*"
+        _case_single_with_v = rf"Case\s+{COURT}{CASE_NUMBER}\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+(?:v\.?|contre)\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+(?=\s*[,\.;\)]|\s*$|$)"
+        _case_single_with_names = rf"Case\s+{COURT}{CASE_NUMBER}\s+(?:[A-Z][a-z]+\s+(?:and\s+|et\s+)?[A-Z][a-z]+(?:\s+and\s+[A-Z][a-z]+|\s+et\s+[A-Z][a-z]+)*)(?=\s*[,\.;\)]|\s*$|$)"
+        _case_single = rf"Case\s+{COURT}{CASE_NUMBER}(?=\s*[,\.;\)]|\s+[a-z]|\s*$|$)"
 
-        _case_bare = rf"(?<!\w){COURT}{CASE_NUMBER}(?!\w)[^.,;)]*"
+        _case_bare = rf"(?<!Case\s)(?<!case\s)(?<!\w){COURT}{CASE_NUMBER}(?!\w)"
 
         _ecr = r"\bECR\s+(?:[IVX]+[-\u2013\u2014\u2212]?\d{1,5}|\d{1,5})\b"
 
@@ -46,18 +48,37 @@ class TextCleaner:
             r"(?:\s*(?:and|&)\s*\d+)?\b"
         )
 
+        # French legal patterns - improved to handle articles
+        _affaire_with_v = rf"\b(?:l'|les?\s+)?(?:affaire|affaires)\s+(?:jointes?\s+)?{COURT}{CASE_NUMBER}\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+(?:v\.?|contre)\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+(?=\s*[,\.;\)]|\s*$|$)"
+        _affaire_with_names = rf"\b(?:l'|les?\s+)?(?:affaire|affaires)\s+(?:jointes?\s+)?{COURT}{CASE_NUMBER}\s+(?:[A-Z][a-z]+\s+(?:and\s+|et\s+)?[A-Z][a-z]+(?:\s+and\s+[A-Z][a-z]+|\s+et\s+[A-Z][a-z]+)*)(?=\s*[,\.;\)]|\s*$|$)"
+        _affaire = rf"\b(?:l'|les?\s+)?(?:affaire|affaires)\s+(?:jointes?\s+)?{COURT}{CASE_NUMBER}(?=\s*[,\.;\)]|\s+[a-z]|\s*$|$)"
+        _affaires_jointes = rf"\b(?:les?\s+)?affaires\s+jointes?\s+(?:{COURT}{CASE_NUMBER}(?:\s*(?:,|et|&)\s*{COURT}{CASE_NUMBER})+)(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+)?(?=\s*[,\.;\)]|\s*$|$)"
+        _arret = rf"\b(?:l'|les?\s+)?(?:arrêt|arrêts)\s+(?:de\s+la\s+)?(?:Cour|Tribunal|Conseil)\s+(?:du\s+\d{{1,2}}\s+\w+\s+\d{{4}})?"
+        _paragraphe = (
+            r"\b(?:l'|les?\s+)?(?:para|paragraphe)s?\.?\s+\d+"
+            r"(?:\s*(?:[-\u2013\u2014\u2212]|à|jusqu'?à)\s*\d+)?"
+            r"(?:\s*,\s*\d+)*"
+            r"(?:\s*(?:et|&)\s*\d+)?\b"
+        )
+        _alinea = (
+            r"\b(?:l'|les?\s+)?(?:alinéa|al\.)\s+\d+"
+            r"(?:\s*(?:[-\u2013\u2014\u2212]|à|jusqu'?à)\s*\d+)?"
+            r"(?:\s*,\s*\d+)*"
+            r"(?:\s*(?:et|&)\s*\d+)?\b"
+        )
+
         # Party-v-party (EU style) case titles without numbers
         _TOKEN = r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ0-9'''-]*"
-        _CONNECTOR = r"(?:and|&|Others|of|the)"
+        _CONNECTOR = r"(?:and|&|Others|of|the|et|&|contre|de|du|de la|des|d')"
         _NAME = rf"{_TOKEN}(?:\s+(?:{_TOKEN}|{_CONNECTOR})){{0,7}}"
-        _END_BOUNDARY = r"(?=(?:\s*[,\.;\)])|(?:\s*$)|$)"
-        _party_v_party = rf"\b{_NAME}\s+v\.?\s+{_NAME}{_END_BOUNDARY}"
+        _END_BOUNDARY = r"(?=\s*[,\.;\)]|\s*$|$)"
+        _party_v_party = rf"{_NAME}\s+(?:v\.?|contre)\s+{_NAME}{_END_BOUNDARY}"
 
         self._MASTER = re.compile(
-            rf"(?P<CASE>{_party_v_party}|{_case_joined_all}|{_case_joined_trailing_year}|{_case_joined_range}|{_case_single}|{_case_bare})"
+            rf"(?P<CASE>{_case_joined_all}|{_affaires_jointes}|{_case_joined_trailing_year}|{_case_joined_range}|{_case_single_with_v}|{_case_single_with_names}|{_case_single}|{_affaire_with_v}|{_affaire_with_names}|{_affaire}|{_party_v_party}|{_case_bare}|{_arret})"
             rf"|(?P<ECR>{_ecr})"
             rf"|(?P<ECLI>{_ecli})"
-            rf"|(?P<PARAGRAPH>{_para})",
+            rf"|(?P<PARAGRAPH>{_para}|{_paragraphe}|{_alinea})",
             flags=re.IGNORECASE,
         )
 
@@ -66,7 +87,10 @@ class TextCleaner:
         months = (
             r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
             r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|"
-            r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+            r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|"
+            r"janv(?:ier)?|fév(?:rier)?|mars|avr(?:il)?|mai|"
+            r"juin|juil(?:let)?|août|sept(?:embre)?|"
+            r"oct(?:obre)?|nov(?:embre)?|déc(?:embre)?)"
         )
 
         date_patterns_raw = [
@@ -90,6 +114,10 @@ class TextCleaner:
         """Replacement function for citation patterns."""
         g = m.lastgroup
         if g == "CASE":
+            # Check if the match starts with "In " and preserve it
+            matched_text = m.group(0)
+            if matched_text.startswith("In "):
+                return "In <CASE>"
             return "<CASE>"
         if g == "ECR":
             return "<ECR>"
@@ -129,7 +157,8 @@ class TextCleaner:
         quotes = re.findall(r'"[^"]*"', text)
         for q in quotes:
             if q in reference_text:
-                text = text.replace(q, "<QUOTED_TEXT>")
+                # Replace the quoted text but preserve the quotes
+                text = text.replace(q, '"<QUOTED_TEXT>"')
         return text
 
     def clean_text(
