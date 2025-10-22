@@ -17,11 +17,22 @@ class TextCleaner:
         YEAR = r"\d{2,4}"
         CASE_NUMBER = rf"\d+/{YEAR}(?:\s*[A-Z]{{1,4}})?"  # 347/88, 131/12 P, 404/15 PPU
 
+        # ECLI and ECR patterns - defined early for use in case patterns
+        _ecli_pattern = r"EU:(?:C|T|F):\d{4}:\d+"
+        # ECR references can be: "ECR I-123", "ECR 123", or year in brackets "[1989]"
+        # Use DASH pattern to handle all dash variations
+        _ecr_ref = rf"ECR\s+(?:[IVX]+{DASH}?\d{{1,5}}|\d{{1,5}})"
+        _ecr_year_bracket = r"\[(?:19|20)\d{2}\]"
+        # Match years in parens (including double parens with spaces)
+        _year_in_parens = r"\(+\s*(?:19|20)\d{2}\s*\)+"
+        # Optional ECR can be: year_in_parens + ECR, or [YEAR] + ECR, or just ECR/ECLI
+        _optional_ecr = rf"(?:\s*(?:{_year_in_parens}\s*)?(?:{_ecr_year_bracket}\s+)?(?:{_ecr_ref}|{_ecli_pattern}))?"
+
         # Sub-patterns
         _case_joined_all = (
             rf"\bJoined Cases?\s+(?:{COURT}{CASE_NUMBER}"
-            rf"(?:\s*(?:,|and|&)\s*{COURT}{CASE_NUMBER})+)(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+)?"
-            rf"(?=\s*[,\.;\)]|\s*$|$)"
+            rf"(?:\s*(?:,|and|&)\s*{COURT}{CASE_NUMBER})+)(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ\s\-'']+)?"
+            rf"(?=\s*[,\.;\)\[\]]|\s*$|$)"
         )
         _case_joined_trailing_year = (
             rf"\bJoined Cases?\s+(?:{COURT}\d+(?:\s*(?:,|and|&)\s*{COURT}\d+)+\s*/\s*{YEAR})"
@@ -31,15 +42,20 @@ class TextCleaner:
             rf"\bJoined Cases?\s+(?:{COURT}\d+\s*(?:{DASH}|to|through)\s*{COURT}\d+/\s*{YEAR})"
             rf"(?=\s*[,\.;\)]|\s*$|$)"
         )
-        _case_single_with_v = rf"Case\s+{COURT}{CASE_NUMBER}\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+(?:v\.?|contre)\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+(?=\s*[,\.;\)]|\s*$|$)"
-        _case_single_with_names = rf"Case\s+{COURT}{CASE_NUMBER}\s+(?:[A-Z][a-z]+\s+(?:and\s+|et\s+)?[A-Z][a-z]+(?:\s+and\s+[A-Z][a-z]+|\s+et\s+[A-Z][a-z]+)*)(?=\s*[,\.;\)]|\s*$|$)"
-        _case_single = rf"Case\s+{COURT}{CASE_NUMBER}(?=\s*[,\.;\)]|\s+[a-z]|\s*$|$)"
 
-        _case_bare = rf"(?<!Case\s)(?<!case\s)(?<!\w){COURT}{CASE_NUMBER}(?!\w)"
+        # Case patterns with optional ECR/ECLI at the end to avoid double matching
+        _case_single_with_v = rf"Case\s+{COURT}{CASE_NUMBER}\s+[A-Za-zÀ-ÖØ-öø-ÿ\s\-'']+(?:v\.?|contre)\s+[A-Za-zÀ-ÖØ-öø-ÿ\s\-'']+{_optional_ecr}(?=\s*[,\.;\)\(\[]|\s*$|$)"
+        # Match case with names: require actual capital letter, then match names + optional ECR
+        # Use greedy matching but stop before paragraph/comma
+        _case_single_with_names = rf"Case\s+{COURT}{CASE_NUMBER}\s+(?=(?-i:[A-ZÀ-ÖØ-Þ]))(?:[A-Za-zÀ-ÖØ-öø-ÿ\-'']+\s+)*(?:[A-Za-zÀ-ÖØ-öø-ÿ\-'']+)\s*{_optional_ecr}(?=\s*[,\.;]|\s+para(?:graph)?|\s*$|$)"
+        _case_single = rf"Case\s+{COURT}{CASE_NUMBER}{_optional_ecr}(?=\s*[,\.;\)]|\s+[a-z]|\s*$|$)"
 
-        _ecr = r"\bECR\s+(?:[IVX]+[-\u2013\u2014\u2212]?\d{1,5}|\d{1,5})\b"
+        _case_bare = rf"(?<!Case\s)(?<!case\s)(?<!Regulation\sNo\s)(?<!Directive\s)(?<!Directive\s\[)(?<!Law\s)(?<!of\s)(?<!\[)(?<!\w){COURT}{CASE_NUMBER}(?!\w)(?!\])"
 
-        _ecli = r"\bEU:(?:C|T|F):\d{4}:\d+\b"
+        # Standalone ECR/ECLI patterns (for cases not matched by case patterns above)
+        _ecr = rf"\b{_ecr_ref}\b"
+        _ecr_year_brackets = _ecr_year_bracket
+        _ecli = rf"\b{_ecli_pattern}\b"
 
         _para = (
             r"\bpara(?:graph)?s?\.?\s+\d+"
@@ -68,15 +84,39 @@ class TextCleaner:
         )
 
         # Party-v-party (EU style) case titles without numbers
+        # Make NAME pattern more restrictive - must start with TOKEN (not connector)
+        # Use negative lookahead to prevent matching common words as party names
         _TOKEN = r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ0-9'''-]*"
-        _CONNECTOR = r"(?:and|&|Others|of|the|et|&|contre|de|du|de la|des|d')"
-        _NAME = rf"{_TOKEN}(?:\s+(?:{_TOKEN}|{_CONNECTOR})){{0,7}}"
+        _PARTY_CONNECTOR = r"(?:and|&|Others|et)"
+        # Negative lookahead to prevent matching common words that aren't party names
+        _NOT_COMMON_WORD = r"(?!(?:and|or|in|of|the|to|for|with|by|at|from|as|on|that|this|it|is|was|be|has|have|had|but|not|are|were|been|being|also|see|judgments?|judgment|into|than|over|after|before|between|under)\b)"
+        _NAME = (
+            rf"{_NOT_COMMON_WORD}{_TOKEN}(?:\s+(?:{_TOKEN}|{_PARTY_CONNECTOR})){{0,5}}"
+        )
+        # For SHORT names in comma-separated contexts, be even more restrictive
+        _NAME_SHORT = rf"{_NOT_COMMON_WORD}{_TOKEN}(?:\s+{_TOKEN}){{0,2}}"
         _END_BOUNDARY = r"(?=\s*[,\.;\)]|\s*$|$)"
-        _party_v_party = rf"{_NAME}\s+(?:v\.?|contre)\s+{_NAME}{_END_BOUNDARY}"
+        _party_v_party = rf"\b{_NAME}\s+(?:v\.?|contre)\s+{_NAME}{_END_BOUNDARY}"
+
+        # Party names in parentheses with case numbers or before ECLI
+        # Party name with v pattern followed by parentheses with case number/ECLI
+        # Must match full name including multi-word names
+        _party_v_in_parens = rf"\b{_NAME}\s+(?:v\.?|contre)\s+{_NAME}\s+\({COURT}{CASE_NUMBER}\s*,?\s*(?:{_ecli_pattern})?\s*\)"
+
+        # Party name in parentheses with case number/ECLI
+        _party_in_parens = (
+            rf"\({_NAME}\s+{COURT}{CASE_NUMBER}\s*,?\s*(?:{_ecli_pattern})?\s*\)"
+        )
+
+        # Party name followed by comma and ECLI/case - use full NAME pattern for better matching
+        _party_before_ecli = rf"(?:^|\b|(?<=\s))(?!judgments?\s)(?!see\s)(?!in\s){_NAME}\s*,\s*{_ecli_pattern}"
+        _party_before_case = (
+            rf"(?:^|\b|(?<=\s))(?!judgments?\s)(?!see\s){_NAME},\s*{COURT}{CASE_NUMBER}"
+        )
 
         self._MASTER = re.compile(
-            rf"(?P<CASE>{_case_joined_all}|{_affaires_jointes}|{_case_joined_trailing_year}|{_case_joined_range}|{_case_single_with_v}|{_case_single_with_names}|{_case_single}|{_affaire_with_v}|{_affaire_with_names}|{_affaire}|{_party_v_party}|{_case_bare}|{_arret})"
-            rf"|(?P<ECR>{_ecr})"
+            rf"(?P<CASE>{_case_joined_all}|{_affaires_jointes}|{_case_joined_trailing_year}|{_case_joined_range}|{_case_single_with_v}|{_case_single_with_names}|{_case_single}|{_affaire_with_v}|{_affaire_with_names}|{_affaire}|{_party_v_in_parens}|{_party_v_party}|{_case_bare}|{_arret}|{_party_in_parens}|{_party_before_case}|{_party_before_ecli})"
+            rf"|(?P<ECR>{_ecr}|{_ecr_year_brackets})"
             rf"|(?P<ECLI>{_ecli})"
             rf"|(?P<PARAGRAPH>{_para}|{_paragraphe}|{_alinea})",
             flags=re.IGNORECASE,
@@ -103,8 +143,8 @@ class TextCleaner:
             rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+{months}\,?\s*(?:19|20)\d{{2}}\b",  # 3 March 2021 / 3rd March, 2021
             # Year + month name + day
             rf"\b(?:19|20)\d{{2}}\s+{months}\s+\d{{1,2}}(?:st|nd|rd|th)?\b",  # 2021 March 3
-            # Standalone year
-            r"\b(?:19|20)\d{2}\b",
+            # Standalone year (but NOT after /, No, or inside brackets)
+            r"(?<![/\[\d])(?<!No\s)\b(?:19|20)\d{2}\b(?![\]/)])",
         ]
 
         # Compile with IGNORECASE to match 'march'/'MARCH' etc.
@@ -120,16 +160,27 @@ class TextCleaner:
                 return "In <CASE>"
             return "<CASE>"
         if g == "ECR":
-            return "<ECR>"
+            return "<CASE>"
         if g == "ECLI":
-            return "<ECLI>"
+            return "<CASE>"
         return "<PARAGRAPH>"
 
     def remove_paragraph_numbers(self, text: str) -> str:
         """Remove paragraph numbers from the beginning of text."""
         if not isinstance(text, str):
             return text
-        return re.sub(r"^\s*\d+[\.\)]?\s*", "", text).strip()
+
+        # Preserve trailing spaces
+        trailing = ""
+        if text.endswith(" "):
+            stripped = text.rstrip()
+            trailing = text[len(stripped) :]
+
+        # Remove paragraph numbers at the beginning, but be more careful about what follows
+        # Don't remove if it's part of a larger number like "19 of [Regulation"
+        if re.match(r"^\s*\d+\s+of\s+\[", text):
+            return text.strip() + trailing
+        return re.sub(r"^\s*\d+[\.\)]?\s*", "", text).strip() + trailing
 
     def remove_citations(self, text: str) -> str:
         """Remove legal citations from text."""
@@ -141,8 +192,106 @@ class TextCleaner:
         """Remove dates from text."""
         if not isinstance(text, str):
             return text
+
+        # Protect specific contexts where dates should be preserved
+        protected = []
+
+        # Protect "Rules of Procedure of the General Court of DATE (OJ YEAR ...)"
+        # rules_pattern = (
+        #     r"Rules of Procedure of the General Court of [^(]*\(OJ\s+\d{4}[^)]+\)"
+        # )
+
+        # def protect_rules(m):
+        #     protected.append(m.group(0))
+        #     return f"__PROTECTED_{len(protected)-1}__"
+
+        # text = re.sub(rules_pattern, protect_rules, text, flags=re.IGNORECASE)
+
+        # Protect standalone OJ references like "(OJ 2015 L 105, p. 1)"
+        oj_pattern = r"\(OJ\s+\d{4}[^)]+\)"
+
+        def protect_oj(m):
+            protected.append(m.group(0))
+            return f"__PROTECTED_{len(protected)-1}__"
+
+        text = re.sub(oj_pattern, protect_oj, text)
+
+        # Now remove dates
         for pattern in self.date_patterns:
             text = re.sub(pattern, "<DATE>", text)
+
+        # Restore protected text
+        for i, orig in enumerate(protected):
+            text = text.replace(f"__PROTECTED_{i}__", orig)
+
+        return text.strip()
+
+    def clean_spacing(self, text: str) -> str:
+        """Clean up spacing around punctuation."""
+        if not isinstance(text, str):
+            return text
+
+        # Save intentional trailing spaces (including inside parentheses at end)
+        trailing_spaces = ""
+        if re.search(r"\s+\)?$", text):
+            match = re.search(r"(\s+\)?)$", text)
+            if match:
+                trailing_spaces = match.group(1)
+                text = text[: match.start()]
+
+        # Remove extra spaces around punctuation
+        text = re.sub(r"\s+([,.])", r"\1", text)
+        text = re.sub(r"([,.])\s+", r"\1 ", text)
+        # Remove spaces before closing parentheses
+        text = re.sub(r"\s+\)", ")", text)
+        # Remove spaces after opening parentheses
+        text = re.sub(r"\(\s+", "(", text)
+
+        # Handle quoted text: remove spaces INSIDE quotes but preserve spaces OUTSIDE
+        # Match pattern: (space) ' (spaces) TEXT (spaces) ' (spaces)
+        # Keep: (space) 'TEXT' (spaces)
+        def clean_quote_spacing(m):
+            before_space = m.group(1) if m.group(1) else ""
+            content = m.group(2).strip()
+            after_space = m.group(3) if m.group(3) else ""
+            return f"{before_space}'{content}'{after_space}"
+
+        text = re.sub(r"(\s)?'\s*([^']+?)\s*'(\s)?", clean_quote_spacing, text)
+        # Collapse multiple spaces to 2 maximum
+        text = re.sub(r" {3,}", "  ", text)
+
+        return text.strip() + trailing_spaces
+
+    def remove_duplicate_tags(self, text: str) -> str:
+        """Remove duplicate consecutive tags."""
+        if not isinstance(text, str):
+            return text
+        # Remove duplicate consecutive <CASE> tags (multiple passes to handle nested cases)
+        # This handles <CASE><CASE>, <CASE> <CASE>, <CASE>, <CASE> etc.
+        while True:
+            orig = text
+            text = re.sub(r"<CASE>\s*<CASE>", "<CASE>", text)
+            text = re.sub(r"<CASE>,\s*<CASE>", "<CASE>", text)
+            text = re.sub(r"<CASE>\s*\(\s*<CASE>\s*\)", "<CASE>", text)
+            text = re.sub(r"<CASE>\s*\[\s*<CASE>\s*\]", "<CASE>", text)
+            # Handle <CASE> followed by date/year in parens and another <CASE>
+            text = re.sub(r"<CASE>\s*\(+\s*<DATE>\s*\)+\s*<CASE>", "<CASE>", text)
+            # Handle <DATE> inside <CASE> patterns more generally
+            text = re.sub(r"<CASE>\s*<DATE>\s*<CASE>", "<CASE>", text)
+            if text == orig:
+                break
+        return text.strip()
+
+    def fix_false_positives(self, text: str) -> str:
+        """Fix false positive matches in Law/Regulation/Directive numbers."""
+        if not isinstance(text, str):
+            return text
+        # Fix duplicate date tags: ((<DATE>)) -> <DATE>
+        text = re.sub(r"\(\(<DATE>\)\)", "<DATE>", text)
+        # Fix duplicate date tags: <DATE> <CASE> -> <CASE>
+        text = re.sub(r"<DATE>\s+<CASE>", "<CASE>", text)
+        # Fix duplicate case tags: <CASE> <CASE> -> <CASE>
+        text = re.sub(r"<CASE>\s+<CASE>", "<CASE>", text)
         return text.strip()
 
     def mask_quoted_text(self, text: str, reference_text: str | None = None) -> str:
@@ -189,6 +338,12 @@ class TextCleaner:
         if not isinstance(text, str):
             return text
 
+        # Preserve original trailing spaces
+        original_trailing = ""
+        if text.endswith(" "):
+            stripped = text.rstrip()
+            original_trailing = text[len(stripped) :]
+
         # Apply cleaning steps in order
         if remove_paragraph_numbers:
             text = self.remove_paragraph_numbers(text)
@@ -202,11 +357,21 @@ class TextCleaner:
         if remove_dates:
             text = self.remove_dates(text)
 
+        # Clean up spacing (this will preserve intentional trailing spaces)
+        text = self.clean_spacing(text)
+
+        # Remove duplicate tags
+        text = self.remove_duplicate_tags(text)
+
+        # Fix false positives
+        text = self.fix_false_positives(text)
+
         # Remove very short texts
         if min_length > 0 and len(text.strip()) < min_length:
             return ""
 
-        return text.strip()
+        # The clean_spacing method already handles trailing spaces
+        return text
 
     def clean_pair(self, text_from: str, text_to: str, **kwargs) -> tuple[str, str]:
         """
