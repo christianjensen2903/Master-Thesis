@@ -1176,37 +1176,117 @@ class ReportForHearingParser(BaseJudgementParser):
     def _extract_full_paragraph_text(
         self, coj_normal_tag: Tag, parent_table: Tag
     ) -> str:
-        """Extract all text from a coj-normal tag, including sibling sub-points."""
+        """Extract all text from a coj-normal tag, including sibling paragraphs and nested sub-points."""
         text_parts: list[str] = []
 
-        # Get the main text from the coj-normal tag
-        main_text = self._get_text(coj_normal_tag)
-        if main_text.strip():
-            text_parts.append(main_text.strip())
-
-        # Find the parent td element that contains both the coj-normal and nested tables
+        # Find the parent td element that contains the content
         parent_td = coj_normal_tag.find_parent("td")
-        if parent_td:
-            # Find all sibling tables within the same td
-            sibling_tables = parent_td.find_all("table")
+        if not parent_td:
+            # Fallback to just the main text
+            main_text = self._get_text(coj_normal_tag)
+            if main_text.strip():
+                text_parts.append(main_text.strip())
+            return " ".join(text_parts)
 
-            for sibling_table in sibling_tables:
-                # Skip the current table (the main paragraph table)
-                if sibling_table == parent_table:
+        # Check if there are nested tables with subpoints
+        nested_tables = parent_td.find_all("table")
+        has_subpoint_tables = False
+
+        for nested_table in nested_tables:
+            if nested_table == parent_table:
+                continue
+            nested_count = nested_table.find("p", class_="coj-count")
+            nested_normal = nested_table.find("p", class_="coj-normal")
+            if nested_count and nested_normal:
+                has_subpoint_tables = True
+                break
+
+        if has_subpoint_tables:
+            # Check if the subpoint tables contain the same content as main paragraphs
+            # by comparing the first few words of the main text with subpoint text
+            main_text = self._get_text(coj_normal_tag).strip()
+            first_subpoint_text = ""
+
+            for nested_table in nested_tables:
+                if nested_table == parent_table:
                     continue
-
-                nested_count = sibling_table.find("p", class_="coj-count")
-                nested_normal = sibling_table.find("p", class_="coj-normal")
-
+                nested_count = nested_table.find("p", class_="coj-count")
+                nested_normal = nested_table.find("p", class_="coj-normal")
                 if nested_count and nested_normal:
-                    nested_count_text = self._get_text(nested_count).strip()
-                    nested_normal_text = self._get_text(nested_normal)
+                    first_subpoint_text = self._get_text(nested_normal).strip()
+                    break
 
-                    if nested_normal_text.strip():
-                        # Add the sub-point with its number
-                        text_parts.append(
-                            f"{nested_count_text} {nested_normal_text.strip()}"
-                        )
+            # Check if there's significant overlap between main text and subpoint text
+            # This indicates duplication (like in 61980CJ0158)
+            has_duplication = False
+            if main_text and first_subpoint_text:
+                # Check if the subpoint text is much longer than the main text
+                # and contains the main text content - this indicates duplication
+                if len(first_subpoint_text) > len(main_text) * 2:
+                    # The subpoint text is much longer, check if it contains the main text
+                    if main_text.lower() in first_subpoint_text.lower():
+                        has_duplication = True
+                else:
+                    # Simple heuristic: if the subpoint text contains a significant portion of the main text
+                    main_words = main_text.split()[:10]  # First 10 words
+                    subpoint_words = first_subpoint_text.split()[:10]
+                    if len(main_words) > 3 and len(subpoint_words) > 3:
+                        # Check if there's significant overlap
+                        overlap = len(set(main_words) & set(subpoint_words))
+                        if overlap > len(main_words) * 0.3:  # 30% overlap threshold
+                            has_duplication = True
+
+            if has_duplication:
+                # Case like 61980CJ0158: subpoints contain the main content, avoid duplication
+                # Get the main introductory text (usually the first coj-normal paragraph)
+                if main_text:
+                    text_parts.append(main_text)
+
+                # Collect subpoints from nested tables
+                for nested_table in nested_tables:
+                    if nested_table == parent_table:
+                        continue
+                    nested_count = nested_table.find("p", class_="coj-count")
+                    nested_normal = nested_table.find("p", class_="coj-normal")
+                    if nested_count and nested_normal:
+                        nested_count_text = self._get_text(nested_count).strip()
+                        nested_normal_text = self._get_text(nested_normal).strip()
+                        if nested_normal_text:
+                            text_parts.append(
+                                f"{nested_count_text} {nested_normal_text}"
+                            )
+            else:
+                # Case like 62012CJ0377: subpoints are additional content, include both
+                # Collect all coj-normal paragraphs first, but exclude those that are in nested tables
+                all_normal_paragraphs = parent_td.find_all("p", class_="coj-normal")
+                for p_tag in all_normal_paragraphs:
+                    # Skip if this paragraph is inside a nested table (subpoint)
+                    if p_tag.find_parent("table") != parent_table:
+                        continue
+                    p_text = self._get_text(p_tag).strip()
+                    if p_text:
+                        text_parts.append(p_text)
+
+                # Then add subpoints from nested tables
+                for nested_table in nested_tables:
+                    if nested_table == parent_table:
+                        continue
+                    nested_count = nested_table.find("p", class_="coj-count")
+                    nested_normal = nested_table.find("p", class_="coj-normal")
+                    if nested_count and nested_normal:
+                        nested_count_text = self._get_text(nested_count).strip()
+                        nested_normal_text = self._get_text(nested_normal).strip()
+                        if nested_normal_text:
+                            text_parts.append(
+                                f"{nested_count_text} {nested_normal_text}"
+                            )
+        else:
+            # If no subpoint tables, collect all coj-normal paragraphs
+            all_normal_paragraphs = parent_td.find_all("p", class_="coj-normal")
+            for p_tag in all_normal_paragraphs:
+                p_text = self._get_text(p_tag).strip()
+                if p_text:
+                    text_parts.append(p_text)
 
         return " ".join(text_parts)
 
@@ -1215,12 +1295,15 @@ class ReportForHearingParser(BaseJudgementParser):
         # Look for the "Judgment" heading (case insensitive)
         judgment_tags = soup.find_all("p", class_="coj-sum-title-1")
         for tag in judgment_tags:
-            if tag.string and re.match(r"^Judgment$", tag.string, re.IGNORECASE):
+            # Use get_text() to handle nested elements like <span>
+            text = tag.get_text().strip()
+            if re.match(r"^Judgment$", text, re.IGNORECASE):
                 return tag
 
         # Fallback: look for any heading containing "Judgment" (case insensitive)
         for tag in judgment_tags:
-            if tag.string and re.search(r"Judgment", tag.string, re.IGNORECASE):
+            text = tag.get_text().strip()
+            if re.search(r"Judgment", text, re.IGNORECASE):
                 return tag
 
         return None
