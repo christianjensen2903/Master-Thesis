@@ -380,13 +380,28 @@ class NumberingPattern(Enum):
 class LegacyEurLexParser(BaseJudgementParser):
     """Parser for legacy EUR-Lex format (older cases, simple HTML structure)."""
 
+    GROUNDS_PATTERNS = [
+        r"grounds",  # English
+        r"motifs",  # French
+        r"gründe",  # German
+        r"motivos",  # Spanish
+        r"motivi",  # Italian
+        r"gronden",  # Dutch
+        r"fundamentação",  # Portuguese
+        r"uzasadnienie",  # Polish
+        r"fundamentare",  # Romanian
+        r"обосновение",  # Bulgarian
+        r"odůvodnění",  # Czech
+        r"põhjendused",  # Estonian
+        r"perustelut",  # Finnish
+        r"αιτιολόγηση",  # Greek
+    ]
+
     def can_parse(self, soup: bs) -> bool:
         """Check if this is the legacy EUR-Lex format."""
-        # Look for the Grounds section with anchor tag
-        grounds_section = soup.find("a", attrs={"name": "MO"})
-        if grounds_section:
-            return True
-        return False
+
+        p_tags = self._collect_p_tags(soup)
+        return len(p_tags) > 1
 
     def _detect_numbering_pattern(self, tag: Tag) -> NumberingPattern:
         text = self._get_text(tag).strip()
@@ -478,30 +493,9 @@ class LegacyEurLexParser(BaseJudgementParser):
 
         return False  # No next +1 found
 
-    def extract_paragraphs(self, soup: bs) -> dict[int, str]:
-        """Extract paragraphs from the Grounds section."""
-
-        # Find the h2 header and the em tag containing the paragraphs
-        # Support multiple languages for grounds section
-        grounds_patterns = [
-            r"grounds",  # English
-            r"motifs",  # French
-            r"gründe",  # German
-            r"motivos",  # Spanish
-            r"motivi",  # Italian
-            r"gronden",  # Dutch
-            r"fundamentação",  # Portuguese
-            r"uzasadnienie",  # Polish
-            r"fundamentare",  # Romanian
-            r"обосновение",  # Bulgarian
-            r"odůvodnění",  # Czech
-            r"põhjendused",  # Estonian
-            r"perustelut",  # Finnish
-            r"αιτιολόγηση",  # Greek
-        ]
-
+    def _collect_p_tags(self, soup: bs) -> list[Tag]:
         h2_tag = None
-        for pattern in grounds_patterns:
+        for pattern in self.GROUNDS_PATTERNS:
             h2_tags = soup.find_all("h2")
             for tag in h2_tags:
                 if tag.string and re.match(pattern, tag.string, re.IGNORECASE):
@@ -511,9 +505,8 @@ class LegacyEurLexParser(BaseJudgementParser):
                 break
 
         if not h2_tag:
-            return {}
+            return []
 
-        # Find the em tag after the h2; some simplified pages do not wrap in <em>
         em_tag = h2_tag.find_next_sibling("em")
 
         # Collect paragraph tags: prefer <em> container, otherwise scan sibling <p> until next section
@@ -530,6 +523,14 @@ class LegacyEurLexParser(BaseJudgementParser):
                     if sibling.name == "p":
                         p_tags.append(sibling)
                 sibling = sibling.find_next_sibling()
+
+        return p_tags
+
+    def extract_paragraphs(self, soup: bs) -> dict[int, str]:
+        """Extract paragraphs from the Grounds section."""
+
+        p_tags = self._collect_p_tags(soup)
+        print(p_tags)
 
         paragraphs: dict[int, str] = {}
         outer_counter: int = 0
@@ -670,6 +671,105 @@ class LegacyEurLexParser(BaseJudgementParser):
                 paragraphs[outer_counter] += " " + text
 
         return paragraphs
+
+
+class LegacySingleParagraphParser(BaseJudgementParser):
+    """Parser for legacy EUR-Lex format where grounds are in one big paragraph."""
+
+    def can_parse(self, soup: bs) -> bool:
+        """Check if this is the legacy single paragraph format."""
+        # Look for the Grounds section with anchor tag
+        grounds_section = soup.find("a", attrs={"name": "MO"})
+        if not grounds_section:
+            return False
+
+        # Find the h2 tag that follows the anchor
+        h2_tag = grounds_section.find_next_sibling("h2")
+        if not h2_tag:
+            return False
+
+        em_tag = h2_tag.find_next_sibling("em")
+        if not em_tag:
+            return False
+
+        # Check if there's only one paragraph in the em tag
+        p_tags = em_tag.find_all("p", recursive=False)
+        if len(p_tags) != 1:
+            return False
+
+        # Check if the single paragraph contains numbered content
+        single_p = p_tags[0]
+        text = self._get_text(single_p).strip()
+
+        # Look for patterns like "1 BY AN ORDER" or "2 THOSE QUESTIONS"
+        # Also check if there are multiple numbered paragraphs in the text
+        if re.match(r"^\s*\d+\s+[A-Z]", text):
+            # Count how many numbered paragraphs are in this single text
+            numbered_matches = re.findall(r"\d+\s+[A-Z]", text)
+            if len(numbered_matches) > 1:
+                return True
+
+        return False
+
+    def extract_paragraphs(self, soup: bs) -> dict[int, str]:
+        """Extract paragraphs from the single grounds paragraph."""
+        # Find the Grounds section
+        grounds_section = soup.find("a", attrs={"name": "MO"})
+        if not grounds_section:
+            return {}
+
+        h2_tag = grounds_section.find_next_sibling("h2")
+        if not h2_tag:
+            return {}
+
+        em_tag = h2_tag.find_next_sibling("em")
+        if not em_tag:
+            return {}
+
+        # Get the single paragraph
+        p_tags = em_tag.find_all("p", recursive=False)
+        if len(p_tags) != 1:
+            return {}
+
+        single_paragraph = p_tags[0]
+        full_text = self._get_text(single_paragraph)
+
+        # Split the text into numbered paragraphs
+        paragraphs = self._split_into_numbered_paragraphs(full_text)
+
+        return paragraphs
+
+    def _split_into_numbered_paragraphs(self, text: str) -> dict[int, str]:
+        """Split the text into numbered paragraphs using a simple counter approach."""
+        paragraphs: list[str] = []
+
+        # Find all numbers in the text
+        number_matches = list(re.finditer(r" \d+ ", text))
+
+        expected_paragraph_num = 2
+
+        last_pos = 0
+
+        for match in number_matches:
+            found_num = int(match.group())
+
+            # Check if this is the next expected paragraph number
+            if found_num == expected_paragraph_num:
+                start_pos = match.start()
+
+                paragraph_text = text[last_pos:start_pos].strip()
+
+                # Clean up the text
+                paragraph_text = re.sub(r"\s+", " ", paragraph_text).strip()
+
+                paragraphs.append(paragraph_text)
+
+                expected_paragraph_num += 1
+                last_pos = start_pos
+
+        paragraphs.append(text[last_pos:].strip())
+
+        return {i + 1: p for i, p in enumerate(paragraphs)}
 
 
 class NestedDocumentParser(BaseJudgementParser):
@@ -1300,6 +1400,7 @@ class JudgementParser:
             DtDdParser(),
             ModernJudgementParser(),
             ReportForHearingParser(),
+            LegacySingleParagraphParser(),
             OperativePartParser(),
         ]
 
@@ -1350,6 +1451,7 @@ class JudgementParser:
         # Try each parser in order
         for parser in self.parsers:
             if parser.can_parse(soup):
+                print(f"Using parser: {parser.__class__.__name__}")
                 return parser.extract_paragraphs(soup)
 
         # No parser could handle this format
@@ -1385,15 +1487,15 @@ if __name__ == "__main__":
     #     soup = parser._load_html(random_case)
 
     # 61976CJ0085
-    random_case = "judgments/62004CJ0418/eng_judgment.html"
+    random_case = "judgments/61985CJ0314/eng_judgment.html"
 
     paragraphs = parser.extract_paragraphs(random_case)
-
-    # for number, text in list(paragraphs.items()):
-    #     print(f"{number}:")
-    #     print(text)
-    #     print("\n" + "=" * 100 + "\n")
 
     print(f"Processed random case: {random_case}\n")
     celex = random_case.split("/")[-2].split(".")[0]
     print(f"CELEX: {celex}\n")
+
+    for number, text in list(paragraphs.items()):
+        print(f"{number}:")
+        print(text)
+        print("\n" + "=" * 100 + "\n")
