@@ -16,8 +16,8 @@ def build_index(index_path: str) -> Any:
     indexer = pt.terrier.IterDictIndexer(
         index_path,
         overwrite=True,
-        meta={"document_id": 100},
-        meta_reverse=["document_id"],
+        meta={"docno": 100},
+        meta_reverse=["docno"],
         tokeniser="utf",
     )
 
@@ -29,5 +29,5 @@ def build_index(index_path: str) -> Any:
 
 
 if __name__ == "__main__":
-    docs = load_candidate_documents("2018-01-01", use_all_paragraphs=True)
+    docs = load_candidate_documents("2018-01-01", use_all_paragraphs=False)
     build_index("artifacts/index")
