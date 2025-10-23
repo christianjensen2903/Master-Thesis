@@ -5,28 +5,23 @@ from typing import Any
 from utils import load_candidate_documents
 
 
-def build_index(documents_df: pd.DataFrame, index_path: str) -> Any:
+def build_index(index_path: str) -> Any:
     # Convert to absolute path and create directory if it doesn't exist
     index_path = str(Path(index_path).resolve())
     Path(index_path).mkdir(parents=True, exist_ok=True)
 
     print(f"\nBuilding index at: {index_path}")
-
-    # Filter out documents with empty text
-    documents_df = documents_df[
-        documents_df["text"].notna() & (documents_df["text"].str.strip() != "")
-    ].copy()
-    print(f"Indexing {len(documents_df)} documents (after filtering empty text)")
+    print(f"Indexing {len(docs)} documents")
 
     indexer = pt.terrier.IterDictIndexer(
         index_path,
         overwrite=True,
-        meta={"docno": 100},
-        meta_reverse=["docno"],
+        meta={"document_id": 100},
+        meta_reverse=["document_id"],
         tokeniser="utf",
     )
 
-    index_ref = indexer.index(documents_df.to_dict(orient="records"))
+    index_ref = indexer.index([doc.model_dump() for doc in docs])
 
     print(f"Index built successfully")
 
@@ -34,7 +29,5 @@ def build_index(documents_df: pd.DataFrame, index_path: str) -> Any:
 
 
 if __name__ == "__main__":
-    documents_df = load_candidate_documents(
-        "data/par-to-par.csv", "2018-01-01", use_all_paragraphs=True
-    )
-    build_index(documents_df, "artifacts/index")
+    docs = load_candidate_documents("2018-01-01", use_all_paragraphs=True)
+    build_index("artifacts/index")
