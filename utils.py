@@ -64,8 +64,8 @@ def _load_target_paragraphs_before_cutoff(
     df = pd.read_csv("data/par-to-par.csv").dropna()
 
     docs = (
-        df[["CELEX_TO", "NUMBER_TO", "DATE_TO", "TEXT_TO", "TITLE_TO", "TO_ID"]]
-        .drop_duplicates("TO_ID")
+        df[["CELEX_TO", "NUMBER_TO", "DATE_TO", "TEXT_TO", "TITLE_TO"]]
+        .drop_duplicates(["CELEX_TO", "NUMBER_TO"])
         .copy()
     )
     return [
@@ -74,7 +74,7 @@ def _load_target_paragraphs_before_cutoff(
             text=doc["TEXT_TO"],
         )
         for doc in docs.to_dict(orient="records")
-        if doc["DATE"] < cutoff
+        if pd.to_datetime(doc["DATE_TO"]) < cutoff
     ]
 
 
@@ -138,6 +138,59 @@ def load_relevance_judgments(df: pd.DataFrame, cutoff_date: str) -> pd.DataFrame
     # Remove duplicate qid-docno pairs (if any)
     qrels_df = qrels_df.drop_duplicates(subset=["qid", "docno"])
     return qrels_df
+
+
+def load_documents_with_context(cutoff_date: str) -> list[Document]:
+    """Load documents with context (previous and next paragraphs) for BM25 context retriever."""
+    cutoff = pd.Timestamp(cutoff_date)
+
+    with open("data/judgments_cleaned.json", "r") as f:
+        judgments = json.load(f)
+
+    # Create lookup for faster access
+    judgments_lookup = {judgment["celex_id"]: judgment for judgment in judgments}
+
+    all_paragraphs = []
+    for judgment in judgments:
+        celex_id = judgment["celex_id"]
+        date = judgment.get("meta", {}).get("date", "")
+        if date:
+            try:
+                judgment_date = pd.to_datetime(date)
+                if judgment_date < cutoff:
+                    paragraphs = judgment["paragraphs"]
+                    for para_num_str, para_text in paragraphs.items():
+                        para_num = int(para_num_str)
+                        para_id = get_document_id(celex_id, para_num)
+
+                        # Get context paragraphs
+                        prev_para = paragraphs.get(str(para_num - 1))
+                        next_para = paragraphs.get(str(para_num + 1))
+
+                        # Concatenate with context using [SEP] token
+                        parts = []
+                        if prev_para:
+                            parts.append(prev_para)
+                        parts.append(para_text)
+                        if next_para:
+                            parts.append(next_para)
+
+                        enhanced_text = " [SEP] ".join(parts)
+
+                        all_paragraphs.append(
+                            Document(
+                                docno=para_id,
+                                text=enhanced_text,
+                            )
+                        )
+            except:
+                # Skip judgments with invalid dates
+                continue
+
+    print(
+        f"Loaded {len(all_paragraphs)} paragraphs with context from judgments before cutoff date"
+    )
+    return all_paragraphs
 
 
 def load_and_prepare_data(

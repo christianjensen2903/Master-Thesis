@@ -52,18 +52,18 @@ def main() -> None:
         csv_path, cutoff_date, use_all_paragraphs
     )
 
-    # BM25 retriever
+    # Regular BM25 retriever for comparison
     # index = pt.IndexFactory.of(index_path)
-    # bm25 = pt.rewrite.tokenise("utf") >> pt.terrier.Retriever(
+    # bm25_regular = pt.rewrite.tokenise("utf") >> pt.terrier.Retriever(
     #     index, wmodel="BM25", verbose=True
     # )
 
     # # Dense retrievers
-    sbert = DenseRetriever(
-        documents_df=documents_df,
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        use_gpu=False,
-    )
+    # sbert = DenseRetriever(
+    #     documents_df=documents_df,
+    #     model_name="sentence-transformers/all-MiniLM-L6-v2",
+    #     use_gpu=False,
+    # )
 
     # legalbert = DenseRetriever(
     #     documents_df=documents_df,
@@ -73,8 +73,8 @@ def main() -> None:
 
     # models = [bm25, sbert, legalbert]
     # model_names = ["BM25", "SBERT", "LegalBERT"]
-    models = [sbert]
-    model_names = ["SBERT"]
+    models = [bm25_context]
+    model_names = ["BM25_Context"]
 
     results = evaluate(models, model_names, queries_df, qrels_df, k_values)  # type: ignore
 
