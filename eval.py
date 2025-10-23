@@ -29,22 +29,34 @@ def evaluate(
 
 def main() -> None:
 
-    csv_path = "data/clean_data.csv"
-    index_path = "./artifacts/pyterrier_index/data.properties"
+    csv_path = "data/par-to-par.csv"
+    index_path = "./artifacts/index/data.properties"
     cutoff_date = "2018-01-01"
     k_values = [5, 10, 50, 100]
+    use_all_paragraphs = (
+        True  # Set to True to use all paragraphs before cutoff as candidates
+    )
 
     print("=" * 80)
     print("PyTerrier Retrieval Evaluation")
     print("=" * 80)
+    if use_all_paragraphs:
+        print("Mode: Using ALL paragraphs before cutoff date as candidates")
+    else:
+        print(
+            "Mode: Using only target paragraphs from par-to-par dataset as candidates"
+        )
+    print("=" * 80)
 
-    documents_df, queries_df, qrels_df = load_and_prepare_data(csv_path, cutoff_date)
+    _, queries_df, qrels_df = load_and_prepare_data(
+        csv_path, cutoff_date, use_all_paragraphs
+    )
 
     # BM25 retriever
-    # index = pt.IndexFactory.of(index_path)
-    # bm25 = pt.rewrite.tokenise("utf") >> pt.terrier.Retriever(
-    #     index, wmodel="BM25", verbose=True
-    # )
+    index = pt.IndexFactory.of(index_path)
+    bm25 = pt.rewrite.tokenise("utf") >> pt.terrier.Retriever(
+        index, wmodel="BM25", verbose=True
+    )
 
     # # Dense retrievers
     # sbert = DenseRetriever(
@@ -53,16 +65,16 @@ def main() -> None:
     #     use_gpu=False,
     # )
 
-    legalbert = DenseRetriever(
-        documents_df=documents_df,
-        model_name="nlpaueb/legal-bert-base-uncased",
-        use_gpu=False,
-    )
+    # legalbert = DenseRetriever(
+    #     documents_df=documents_df,
+    #     model_name="nlpaueb/legal-bert-base-uncased",
+    #     use_gpu=False,
+    # )
 
     # models = [bm25, sbert, legalbert]
     # model_names = ["BM25", "SBERT", "LegalBERT"]
-    models = [legalbert]
-    model_names = ["LegalBERT"]
+    models = [bm25]
+    model_names = ["BM25"]
 
     results = evaluate(models, model_names, queries_df, qrels_df, k_values)  # type: ignore
 

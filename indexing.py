@@ -2,7 +2,7 @@ import pandas as pd  # type: ignore
 import pyterrier as pt  # type: ignore
 from pathlib import Path
 from typing import Any
-from utils import load_and_prepare_data
+from utils import load_candidate_documents
 
 
 def build_index(documents_df: pd.DataFrame, index_path: str) -> Any:
@@ -34,7 +34,7 @@ def build_index(documents_df: pd.DataFrame, index_path: str) -> Any:
 
 
 if __name__ == "__main__":
-    documents_df, queries_df, qrels_df = load_and_prepare_data(
-        "data/clean_data.csv", "2018-01-01"
+    documents_df = load_candidate_documents(
+        "data/par-to-par.csv", "2018-01-01", use_all_paragraphs=True
     )
     build_index(documents_df, "artifacts/index")
