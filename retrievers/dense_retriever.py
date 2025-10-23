@@ -5,7 +5,6 @@ import numpy as np
 import sys
 import os
 import torch
-from tqdm import tqdm
 
 import pyterrier as pt  # type: ignore
 
@@ -41,12 +40,14 @@ class DenseRetriever(pt.Transformer):
         self,
         documents: list[Document],
         show_progress: bool = True,
+        batch_size: int = 32,
     ) -> None:
 
         embeddings = self.model.encode(
             [doc.text for doc in documents],
             show_progress_bar=show_progress,
             convert_to_numpy=True,
+            batch_size=batch_size,
         )
 
         # Build int64 ids and mapping to original docnos
@@ -62,7 +63,7 @@ class DenseRetriever(pt.Transformer):
         # Optionally move to GPU
         self.index = self._maybe_to_gpu(idmap)
 
-    def transform(self, queries_df: pd.DataFrame) -> pd.DataFrame:
+    def transform(self, queries_df: pd.DataFrame, batch_size: int = 32) -> pd.DataFrame:
         if self.index is None:
             raise RuntimeError("Index not built. Call build_index() first.")
 
@@ -75,6 +76,7 @@ class DenseRetriever(pt.Transformer):
             show_progress_bar=True,
             convert_to_numpy=True,
             normalize_embeddings=True,
+            batch_size=batch_size,
         )
 
         scores, ids = self.index.search(qemb, self.k)
@@ -97,7 +99,6 @@ class DenseRetriever(pt.Transformer):
 
 
 if __name__ == "__main__":
-    # pt.init()  # optional depending on your pipeline usage
     print("Loading documents...")
     docs = load_candidate_documents("2018-01-01", use_all_paragraphs=True)
     print(f"Loaded {len(docs)} documents")
@@ -108,11 +109,5 @@ if __name__ == "__main__":
     )
 
     print("Building index...")
-    try:
-        dense_retriever.build_index(docs)
-        print("Index built successfully!")
-    except Exception as e:
-        print(f"Error building index: {e}")
-        import traceback
-
-        traceback.print_exc()
+    dense_retriever.build_index(docs)
+    print("Index built successfully!")
