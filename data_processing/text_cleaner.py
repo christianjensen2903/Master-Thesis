@@ -309,6 +309,216 @@ class TextCleaner:
                 text = text.replace(q, '"<QUOTED_TEXT>"')
         return text
 
+    def mask_verbatim_text(
+        self, text: str, reference_text: str | None = None, min_length: int = 50
+    ) -> str:
+        """Mask verbatim text segments that appear in both texts, even without quotes."""
+        if not isinstance(text, str) or reference_text is None:
+            return text
+
+        # Split text into sentences for better matching
+        sentences = re.split(r"[.!?]+", text)
+        masked_sentences = []
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) < min_length:
+                masked_sentences.append(sentence)
+                continue
+
+            # Check if this sentence appears verbatim in reference text
+            if sentence in reference_text:
+                # Mask the sentence but preserve its structure
+                masked_sentences.append("<VERBATIM_TEXT>")
+            else:
+                # Check for partial matches (substrings of sufficient length)
+                words = sentence.split()
+                if len(words) >= 5:  # Only check sentences with at least 5 words
+                    # Look for consecutive word sequences that match
+                    for i in range(len(words) - 4):  # Check sequences of 5+ words
+                        for j in range(i + 5, len(words) + 1):
+                            phrase = " ".join(words[i:j])
+                            if len(phrase) >= min_length and phrase in reference_text:
+                                # Replace this phrase with mask, preserving spacing
+                                phrase_start = sentence.find(phrase)
+                                if phrase_start == -1:
+                                    continue
+
+                                # Check spacing around the phrase
+                                space_before = ""
+                                space_after = ""
+
+                                if (
+                                    phrase_start > 0
+                                    and sentence[phrase_start - 1] == " "
+                                ):
+                                    space_before = " "
+
+                                phrase_end = phrase_start + len(phrase)
+                                if (
+                                    phrase_end < len(sentence)
+                                    and sentence[phrase_end] == " "
+                                ):
+                                    space_after = " "
+
+                                sentence = sentence.replace(
+                                    phrase,
+                                    f"{space_before}<VERBATIM_TEXT>{space_after}",
+                                )
+                                break
+                        if "<VERBATIM_TEXT>" in sentence:
+                            break
+
+                masked_sentences.append(sentence)
+
+        return ". ".join(masked_sentences).replace("..", ".")
+
+    def mask_verbatim_phrases(
+        self, text: str, reference_text: str | None = None, min_phrase_length: int = 50
+    ) -> str:
+        """Mask verbatim phrases using an efficient sentence-based approach."""
+        if not isinstance(text, str) or reference_text is None:
+            return text
+
+        # Normalize both texts for better matching
+        def normalize_for_matching(t: str) -> str:
+            # Remove extra whitespace and normalize punctuation
+            t = re.sub(r"\s+", " ", t.strip())
+            # Remove common legal citations that might interfere
+            t = re.sub(
+                r"\(see,?\s+to\s+that\s+effect,?\s+judgment\s+of\s+[^)]+\)",
+                "",
+                t,
+                flags=re.IGNORECASE,
+            )
+            return t
+
+        normalized_text = normalize_for_matching(text)
+        normalized_reference = normalize_for_matching(reference_text)
+
+        # Use a sentence-based approach for maximum efficiency
+        def find_verbatim_sentences(s1: str, s2: str, min_len: int) -> list[str]:
+            """Find verbatim sentences and phrases using sentence-based matching."""
+            if len(s1) < min_len or len(s2) < min_len:
+                return []
+
+            # Split into sentences for efficient processing
+            sentences1 = re.split(r"[.!?]+", s1)
+            sentences2 = re.split(r"[.!?]+", s2)
+
+            # Clean and filter sentences
+            clean_sentences1 = [
+                s.strip() for s in sentences1 if len(s.strip()) >= min_len
+            ]
+            clean_sentences2 = [
+                s.strip() for s in sentences2 if len(s.strip()) >= min_len
+            ]
+
+            # Create a set for fast lookup
+            sentences2_set = set(clean_sentences2)
+
+            # Find exact sentence matches
+            exact_matches = []
+            for sentence in clean_sentences1:
+                if sentence in sentences2_set and len(sentence) >= min_len:
+                    exact_matches.append(sentence)
+
+            # Find phrase matches within sentences
+            phrase_matches = []
+            for sentence in clean_sentences1:
+                if sentence not in sentences2_set:  # Only check non-exact matches
+                    # Split into words and look for common phrases
+                    words = sentence.split()
+                    if len(words) >= 10:  # Only check longer sentences
+                        # Look for phrases of 5+ words
+                        for i in range(len(words) - 4):
+                            for j in range(
+                                i + 5, min(i + 15, len(words) + 1)
+                            ):  # Limit phrase length
+                                phrase = " ".join(words[i:j])
+                                if len(phrase) >= min_len and phrase in s2:
+                                    phrase_matches.append(phrase)
+
+            # Combine and deduplicate
+            all_matches = exact_matches + phrase_matches
+            unique_matches = list(set(all_matches))
+
+            # Sort by length (longest first) and remove overlaps
+            unique_matches.sort(key=len, reverse=True)
+
+            # Remove overlapping matches
+            filtered_matches = []
+            used_positions: set[int] = set()
+
+            for match in unique_matches:
+                # Find all positions where this match appears in s1
+                positions = []
+                start = 0
+                while True:
+                    pos = s1.find(match, start)
+                    if pos == -1:
+                        break
+                    positions.append((pos, pos + len(match)))
+                    start = pos + 1
+
+                # Check for overlaps
+                overlaps = any(
+                    any(start <= used_pos < end for used_pos in used_positions)
+                    for start, end in positions
+                )
+
+                if not overlaps:
+                    filtered_matches.append(match)
+                    for start, end in positions:
+                        used_positions.update(range(start, end))
+
+            return filtered_matches
+
+        # Find verbatim segments using the sentence-based method
+        segments = find_verbatim_sentences(
+            normalized_text, normalized_reference, min_phrase_length
+        )
+
+        # Apply masks to the original text with proper spacing
+        masked_text = text
+        for segment in segments:
+            if segment in masked_text:
+                # Find the segment position
+                segment_pos = masked_text.find(segment)
+                if segment_pos == -1:
+                    continue
+
+                # Check spacing around the segment
+                space_before = ""
+                space_after = ""
+
+                # Check if there's a space before the segment
+                if segment_pos > 0 and masked_text[segment_pos - 1] == " ":
+                    space_before = " "
+
+                # Check if there's a space after the segment
+                segment_end = segment_pos + len(segment)
+                if segment_end < len(masked_text) and masked_text[segment_end] == " ":
+                    space_after = " "
+
+                # Replace with proper spacing - ensure we maintain the original spacing
+                replacement = f"{space_before}<VERBATIM_TEXT>{space_after}"
+                masked_text = masked_text.replace(segment, replacement, 1)
+
+                # Clean up any double spaces that might have been created
+                masked_text = masked_text.replace("  ", " ")
+
+                # Ensure proper spacing around the tag
+                masked_text = masked_text.replace(
+                    "<VERBATIM_TEXT>", " <VERBATIM_TEXT> "
+                )
+                # Clean up any triple spaces
+                masked_text = masked_text.replace("   ", " ")
+                # Clean up any double spaces
+                masked_text = masked_text.replace("  ", " ")
+
+        return masked_text
+
     def clean_text(
         self,
         text: str,
@@ -317,6 +527,7 @@ class TextCleaner:
         remove_citations: bool = True,
         remove_dates: bool = True,
         mask_quotes: bool = True,
+        mask_verbatim: bool = True,
         min_length: int = 0,
     ) -> str:
         """
@@ -329,6 +540,7 @@ class TextCleaner:
             remove_citations: Whether to remove legal citations
             remove_dates: Whether to remove dates
             mask_quotes: Whether to mask quoted text
+            mask_verbatim: Whether to mask verbatim text segments
             min_length: Minimum length for text to be kept (0 = no minimum)
 
         Returns:
@@ -344,6 +556,9 @@ class TextCleaner:
 
         if mask_quotes and reference_text:
             text = self.mask_quoted_text(text, reference_text)
+
+        if mask_verbatim and reference_text:
+            text = self.mask_verbatim_phrases(text, reference_text)
 
         if remove_citations:
             text = self.remove_citations(text)
@@ -367,23 +582,53 @@ class TextCleaner:
 
     def clean_pair(self, text_from: str, text_to: str, **kwargs) -> tuple[str, str]:
         """
-        Clean a pair of texts, applying quote masking between them.
+        Clean a pair of texts, applying quote and verbatim masking between them.
+        Only the quoting text (text_from) gets verbatim masking applied.
 
         Args:
-            text_from: First text
-            text_to: Second text
+            text_from: First text (quoting text - gets verbatim masking)
+            text_to: Second text (quoted text - no verbatim masking)
             **kwargs: Additional arguments passed to clean_text
 
         Returns:
             Tuple of (cleaned_text_from, cleaned_text_to)
         """
-        # Clean text_from with text_to as reference for quote masking
+        # Clean text_from with text_to as reference for quote and verbatim masking
         cleaned_from = self.clean_text(text_from, reference_text=text_to, **kwargs)
 
-        # Clean text_to with text_from as reference for quote masking
-        cleaned_to = self.clean_text(text_to, reference_text=text_from, **kwargs)
+        # Clean text_to without verbatim masking (it's the source text)
+        kwargs_no_verbatim = kwargs.copy()
+        kwargs_no_verbatim["mask_verbatim"] = False
+        cleaned_to = self.clean_text(text_to, **kwargs_no_verbatim)
 
         return cleaned_from, cleaned_to
+
+    def clean_pair_with_direction(
+        self, quoting_text: str, quoted_text: str, **kwargs
+    ) -> tuple[str, str]:
+        """
+        Clean a pair of texts with explicit direction for verbatim masking.
+        Only the quoting text gets verbatim masking applied.
+
+        Args:
+            quoting_text: The text that contains the quote (gets verbatim masking)
+            quoted_text: The text that is being quoted (no verbatim masking)
+            **kwargs: Additional arguments passed to clean_text
+
+        Returns:
+            Tuple of (cleaned_quoting_text, cleaned_quoted_text)
+        """
+        # Clean quoting_text with quoted_text as reference for verbatim masking
+        cleaned_quoting = self.clean_text(
+            quoting_text, reference_text=quoted_text, **kwargs
+        )
+
+        # Clean quoted_text without verbatim masking (it's the source text)
+        kwargs_no_verbatim = kwargs.copy()
+        kwargs_no_verbatim["mask_verbatim"] = False
+        cleaned_quoted = self.clean_text(quoted_text, **kwargs_no_verbatim)
+
+        return cleaned_quoting, cleaned_quoted
 
 
 # Example usage
