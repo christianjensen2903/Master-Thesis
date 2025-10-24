@@ -1,220 +1,235 @@
+import json
 from datetime import datetime as dt
 from collections import defaultdict
-import json
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from scipy.sparse import vstack
 
 
-# ----------------------------
-# Data structures
-# ----------------------------
-class Paragraph:
-    def __init__(self, case_id, number, date, text, citations):
-        self.case_id = case_id
-        self.number = number
-        self.date = dt.strptime(date, "%Y-%m-%d") if isinstance(date, str) else date
-        self.text = text
-        self.citations = citations or []
-
-    def get_id(self):
-        return f"{self.case_id}-{self.number}"
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
 def generate_train_test(metadata):
-    # Training set will be paragraphs from < 2018, test set >= 2018
-    train, test = [], []
+    train = []
+    test = []
     for case_id, m in metadata.items():
         m["case_id"] = case_id
-        date = m["meta"]["date"]
-        year = int(date.split("-")[0])
+        year = int(m["meta"]["date"].split("-")[0])
         (train if year < 2018 else test).append(m)
     return train, test
 
 
-def build_paragraph_objects(paragraphs_df, train_celex, test_celex):
-    """
-    Build Paragraph objects matching the original link_prediction_clf.py logic.
-    """
-    train_paragraphs_obj, test_paragraphs_obj = [], []
-    texts = set()
-
-    # Group all sources (FROM) by (celex, number) - matching original logic
-    grp_by_celex_df = paragraphs_df.groupby(["CELEX_FROM", "NUMBER_FROM"])
-    for (celex_from, number_from), subset_df in tqdm(
-        grp_by_celex_df, desc="Build objects"
-    ):
-        paragraph = subset_df["TEXT_FROM"].tolist()[0]
-        date = subset_df["DATE_FROM"].tolist()[0]
-        citations_text = subset_df["TEXT_TO"].tolist()
-        citations_celex = subset_df["CELEX_TO"].tolist()
-        citations = list(zip(citations_celex, citations_text))
-        obj = Paragraph(celex_from, number_from, date, paragraph, citations)
-
-        if celex_from in train_celex:
-            train_paragraphs_obj.append(obj)
-            texts.add(paragraph)
-        elif celex_from in test_celex:
-            test_paragraphs_obj.append(obj)
-            texts.add(paragraph)
-        else:
-            print("oups")
-
-    # Add TO paragraphs (targets that never appeared as a FROM paragraph text)
-    paragraphs_to_obj = []
-    for _, row in tqdm(paragraphs_df.iterrows(), desc="Add TO-only objects"):
-        paragraph = row["TEXT_TO"]
-        if paragraph not in texts:
-            celex_to = row["CELEX_TO"]
-            number_to = row["NUMBER_TO"]
-            date = row["DATE_TO"]
-            citations = None
-            obj = Paragraph(celex_to, number_to, date, paragraph, citations)
-            paragraphs_to_obj.append(obj)
-            texts.add(paragraph)
-
-    return train_paragraphs_obj, test_paragraphs_obj, paragraphs_to_obj
+def mean_average_precision(all_ap):
+    if not all_ap:
+        return 0.0
+    return float(np.mean(all_ap))
 
 
-def retrieve_candidate_paragraphs(paragraphs, date):
-    # Given a paragraph's date of publication,
-    # all the previous paragraphs can be considered as citation candidates
-    candidates = set()
-    for p in paragraphs:
-        if p.date < date:
-            candidates.add(p)
-    return candidates
-
-
-def concat_sparse_matrix(vectors_by_par, paragraphs):
-    vectors = [vectors_by_par[p].reshape(1, -1) for p in paragraphs]
-    matrix = vstack(vectors)
-    return matrix
-
-
-def compute_precision_original_style(
-    all_paragraphs_obj, vectors_by_par, paragraph, k=10, verbose=False
-):
-    candidates = retrieve_candidate_paragraphs(all_paragraphs_obj, paragraph.date)
-    candidates_texts = list({p.text for p in candidates if p.text in vectors_by_par})
-    citations_to_find = {t for c, t in paragraph.citations if t in vectors_by_par}
-    num_citations = len(citations_to_find)
-    if num_citations:
-        candidates_vectors = concat_sparse_matrix(vectors_by_par, candidates_texts)
-        source_vector = vectors_by_par[paragraph.text]
-        sims = cosine_similarity(
-            candidates_vectors, source_vector.reshape(1, -1)
-        ).reshape(-1)
-        indices = np.argsort(sims)[::-1]
-
-        results = defaultdict(lambda: defaultdict(dict))
-        num_good = 0
-        precisions = list()
-        ranks = list()
-        for i, candidate_index in enumerate(indices):
-            candidate_sim = sims[candidate_index]
-            candidate_text = candidates_texts[candidate_index]
-            if verbose and i < 11:
-                ranks.append((candidate_text, float(candidate_sim)))
-            if candidate_text in citations_to_find:
-                num_good += 1
-                precision = num_good / (i + 1)
-                precisions.append(precision)
-                citations_to_find.remove(candidate_text)
-        results["average_precision"] = sum(precisions) / num_citations
-
-        return dict(results)
-    else:
-        return None
+# -----------------
+# Main pipeline
+# -----------------
 
 
 def main():
     print("Loading data...")
-    paragraphs_df = pd.read_excel("data/par-to-par-2.xlsx")
-    print("Rows", len(paragraphs_df))
-    paragraphs_df = paragraphs_df.dropna()
-    print("Rows", len(paragraphs_df))
+    df = pd.read_excel("data/par-to-par-2.xlsx")
+    print("Rows (raw)", len(df))
+    df = df.dropna()
+    print("Rows (dropna)", len(df))
 
     metadata = json.load(open("data/par-to-par.json"))
-    train, test = generate_train_test(metadata)
-    train_celex = {m["case_id"] for m in train}
-    test_celex = {m["case_id"] for m in test}
+    train_meta, test_meta = generate_train_test(metadata)
 
-    # Texts for fitting the vectorizer (like original)
-    train_paragraphs_from = list(
-        set(
-            paragraphs_df[paragraphs_df["CELEX_FROM"].isin(train_celex)][
-                "TEXT_FROM"
-            ].tolist()
-        )
+    train_celex = {m["case_id"] for m in train_meta}
+    test_celex = {m["case_id"] for m in test_meta}
+
+    # First collect all unique paragraph texts
+    all_texts = pd.unique(
+        pd.concat([df["TEXT_FROM"], df["TEXT_TO"]], ignore_index=True)
     )
-    train_paragraphs_to = list(
-        set(
-            paragraphs_df[paragraphs_df["CELEX_TO"].isin(train_celex)][
-                "TEXT_TO"
-            ].tolist()
-        )
+    # Filter out non-strings defensively
+    all_texts = [t for t in all_texts if isinstance(t, str)]
+
+    # pid <-> text
+    text_to_pid = {t: i for i, t in enumerate(all_texts)}
+    pid_to_text = np.array(all_texts, dtype=object)
+
+    n_par = len(pid_to_text)
+    print("Unique paragraphs:", n_par)
+
+    tmp_info = {
+        pid: {
+            "date": None,  # datetime
+            "celex": None,  # str
+            "number": None,  # paragraph number
+            "set_type": None,  # "train" / "test" / None
+        }
+        for pid in range(n_par)
+    }
+
+    # pass 1: fill from TEXT_FROM rows (they have citations out)
+    for (celex_from, number_from), sub in tqdm(
+        df.groupby(["CELEX_FROM", "NUMBER_FROM"]), desc="pass1_from"
+    ):
+        paragraph_text = sub["TEXT_FROM"].iloc[0]
+        date_str = sub["DATE_FROM"].iloc[0]
+        if not isinstance(paragraph_text, str):
+            continue
+        pid = text_to_pid[paragraph_text]
+        d = dt.strptime(date_str, "%Y-%m-%d")
+
+        info = tmp_info[pid]
+        if info["date"] is None or d < info["date"]:
+            info["date"] = d
+            info["celex"] = celex_from
+            info["number"] = number_from
+            info["set_type"] = (
+                "train"
+                if celex_from in train_celex
+                else ("test" if celex_from in test_celex else info["set_type"])
+            )
+
+    # pass 2: fill from TEXT_TO rows (catch paragraphs that only appear as targets)
+    for (celex_to, number_to), sub in tqdm(
+        df.groupby(["CELEX_TO", "NUMBER_TO"]), desc="pass2_to"
+    ):
+        paragraph_text = sub["TEXT_TO"].iloc[0]
+        date_str = sub["DATE_TO"].iloc[0]
+        if not isinstance(paragraph_text, str):
+            continue
+        pid = text_to_pid[paragraph_text]
+        d = dt.strptime(date_str, "%Y-%m-%d")
+
+        info = tmp_info[pid]
+        if info["date"] is None or d < info["date"]:
+            info["date"] = d
+            info["celex"] = celex_to
+            info["number"] = number_to
+            # only set set_type if not known
+            if info["set_type"] is None:
+                info["set_type"] = (
+                    "train"
+                    if celex_to in train_celex
+                    else ("test" if celex_to in test_celex else None)
+                )
+
+    # Now build arrays
+    paragraph_dates = np.array(
+        [tmp_info[pid]["date"] for pid in range(n_par)],
+        dtype="datetime64[ns]",
     )
-    # filter to valid strings
-    train_paragraphs = [
-        p for p in train_paragraphs_from + train_paragraphs_to if isinstance(p, str)
+    paragraph_celex = np.array(
+        [tmp_info[pid]["celex"] for pid in range(n_par)],
+        dtype=object,
+    )
+    paragraph_set = np.array(
+        [tmp_info[pid]["set_type"] for pid in range(n_par)],
+        dtype=object,
+    )
+
+    # -----------------
+    # Build citation graph (source pid -> list of cited pid)
+    # -----------------
+    # We'll aggregate once using pid.
+    cited_by_pid = defaultdict(set)
+
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="citations"):
+        src_txt = row["TEXT_FROM"]
+        tgt_txt = row["TEXT_TO"]
+        if not isinstance(src_txt, str) or not isinstance(tgt_txt, str):
+            continue
+        src_pid = text_to_pid[src_txt]
+        tgt_pid = text_to_pid[tgt_txt]
+        cited_by_pid[src_pid].add(tgt_pid)
+
+    # Turn sets into sorted lists for determinism
+    for k in list(cited_by_pid.keys()):
+        cited_by_pid[k] = sorted(cited_by_pid[k])
+
+    # -----------------
+    # Build train corpus for TF-IDF (only paragraphs from train celex)
+    # -----------------
+    train_mask = paragraph_set == "train"
+    train_texts = pid_to_text[train_mask]
+
+    print("Fitting TF-IDF...")
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        strip_accents="ascii",
+        norm="l2",  # default, makes cosine = dot
+    )
+    vectorizer.fit(train_texts)
+
+    print("Vectorizing all paragraphs...")
+    tfidf_matrix = vectorizer.transform(pid_to_text)  # csr_matrix [n_par, vocab]
+
+    # -----------------
+    # Pre-sort paragraph IDs by date ASC once.
+    # We'll use this to quickly get "all candidates published before this paragraph".
+    # -----------------
+    sort_idx = np.argsort(paragraph_dates)  # oldest -> newest
+    sorted_dates = paragraph_dates[sort_idx]
+
+    # -----------------
+    # Evaluation: MAP on *test* paragraphs that have citations
+    # We'll iterate only pids with set_type=="test" and at least 1 citation.
+    # -----------------
+    print("Computing MAP...")
+    test_source_pids = [
+        pid
+        for pid in range(n_par)
+        if paragraph_set[pid] == "test" and len(cited_by_pid.get(pid, [])) > 0
     ]
 
-    # Build objects (sources with citations + to-only objects)
-    (
-        train_paragraphs_obj,
-        test_paragraphs_obj,
-        paragraphs_to_obj,
-    ) = build_paragraph_objects(paragraphs_df, train_celex, test_celex)
+    avg_precs = []
 
-    print(len(train_paragraphs_obj), len(test_paragraphs_obj), len(paragraphs_to_obj))
+    for src_pid in tqdm(test_source_pids, desc="eval"):
+        src_date = paragraph_dates[src_pid]
 
-    # Unique set of ALL paragraph texts - matching original logic
-    p_from = set(paragraphs_df["TEXT_FROM"].tolist())
-    p_to = set(paragraphs_df["TEXT_TO"].tolist())
-    all_paragraphs = list(p_from.union(p_to))
-    all_paragraphs = [p for p in all_paragraphs if type(p) is str]
-    print(len(p_from), len(p_to), len(all_paragraphs))
+        # Candidates = all paragraphs strictly older than src_date
+        # Binary search boundary using np.searchsorted
+        # searchsorted gives first index where src_date could be inserted
+        # Since sorted_dates is ascending, everything < src_date is before that index
+        cutoff = np.searchsorted(sorted_dates, src_date, side="left")
+        cand_pids = sort_idx[:cutoff]
 
-    # Build all paragraph objects
-    all_paragraphs_obj = train_paragraphs_obj + test_paragraphs_obj + paragraphs_to_obj
+        if len(cand_pids) == 0:
+            continue  # nothing to retrieve against, skip
 
-    # Fit TF-IDF - matching original logic
-    print("Fitting tf-idf...")
-    vectorizer = TfidfVectorizer(stop_words="english", strip_accents="ascii")
-    X = vectorizer.fit_transform(train_paragraphs)
-    vectors = vectorizer.transform(all_paragraphs)
-    vectors_by_par = dict()
-    for p, v in zip(all_paragraphs, vectors):
-        vectors_by_par[p] = v
+        # Ground truth relevant docs for this source paragraph
+        relevant = set(cited_by_pid[src_pid])
+        # filter out any target that is not in cand_pids (can't cite the future)
+        relevant = relevant.intersection(set(cand_pids))
+        num_rel = len(relevant)
+        if num_rel == 0:
+            continue
 
-    # Test paragraphs with citations
-    test_pars_with_citations = [p for p in test_paragraphs_obj if len(p.citations)]
-    train_pars_with_citations = [p for p in train_paragraphs_obj if len(p.citations)]
+        # Build similarity scores:
+        # sim = C * v, where C is (num_cand x dim), v is (dim x 1)
+        src_vec = tfidf_matrix[src_pid]  # (1, dim)
+        cand_mat = tfidf_matrix[cand_pids]  # (num_cand, dim)
+        sims = cand_mat.dot(src_vec.T).toarray().ravel()  # dense 1D
 
-    print("Computing precisions single thread...")
-    results = list()
-    logs = list()
-    pbar = tqdm(test_pars_with_citations)
-    for i, p in enumerate(pbar):
-        r = compute_precision_original_style(
-            all_paragraphs_obj, vectors_by_par, p, verbose=True
-        )
-        if r is not None:
-            results.append(r["average_precision"])
-            logs.append(r)
-        if i > 0 and i % 10 == 0:
-            pbar.set_description(f"MAP: {np.mean(results)}")
-    mean_average_precision = np.mean(results)
-    print(mean_average_precision)
+        # Rank candidates by sim desc
+        rank_order = np.argsort(-sims)  # descending
+
+        # Compute Average Precision for this src_pid
+        good = 0
+        precisions = []
+        for rank_pos, local_idx in enumerate(rank_order, start=1):
+            pid_candidate = cand_pids[local_idx]
+            if pid_candidate in relevant:
+                good += 1
+                precisions.append(good / rank_pos)
+
+                # optional early exit: if we already found them all
+                if good == num_rel:
+                    break
+
+        ap = np.mean(precisions) if precisions else 0.0
+        avg_precs.append(ap)
+
+    map_score = mean_average_precision(avg_precs)
+    print("MAP:", map_score)
 
 
 if __name__ == "__main__":
