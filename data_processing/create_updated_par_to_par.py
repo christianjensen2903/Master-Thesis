@@ -47,5 +47,5 @@ def update_par_to_par(
 
 
 if __name__ == "__main__":
-    cleaned_judgments = load_cleaned_judgments("../data/judgments_cleaned.json")
-    update_par_to_par("../data/par-to-par.csv", cleaned_judgments)
+    cleaned_judgments = load_cleaned_judgments("data/judgments_cleaned.json")
+    update_par_to_par("data/par-to-par.csv", cleaned_judgments)

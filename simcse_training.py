@@ -1,6 +1,6 @@
-import pandas as pd
+import pandas as pd  # type: ignore
 import wandb
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore
 from sentence_transformers import SentenceTransformer, losses, InputExample
 from sentence_transformers.datasets import NoDuplicatesDataLoader
 from validation_utils import (
@@ -49,6 +49,7 @@ def train_simcse(
     epochs: int = 5,
     warmup_steps: int = 100,
     checkpoint_save_steps: int = 1000,
+    evaluation_steps: int = 1000,
     show_progress_bar: bool = True,
     validation_split: float = 0.1,
     use_wandb: bool = True,
@@ -86,29 +87,17 @@ def train_simcse(
     print(f"Total validation examples: {len(val_dataset)}")
     print(f"Total batches: {len(train_dataloader)}")
 
-    # Training with validation
-    if evaluator is not None:
-        model.fit(
-            train_objectives=[(train_dataloader, train_loss)],
-            epochs=epochs,
-            warmup_steps=warmup_steps,
-            output_path=output_path,
-            scheduler="WarmupLinear",
-            checkpoint_save_steps=checkpoint_save_steps,
-            show_progress_bar=show_progress_bar,
-            evaluator=evaluator,
-            evaluation_steps=500,  # Evaluate every 500 steps
-        )
-    else:
-        model.fit(
-            train_objectives=[(train_dataloader, train_loss)],
-            epochs=epochs,
-            warmup_steps=warmup_steps,
-            output_path=output_path,
-            scheduler="WarmupLinear",
-            checkpoint_save_steps=checkpoint_save_steps,
-            show_progress_bar=show_progress_bar,
-        )
+    model.fit(
+        train_objectives=[(train_dataloader, train_loss)],  # type: ignore
+        epochs=epochs,
+        warmup_steps=warmup_steps,
+        output_path=output_path,
+        scheduler="WarmupLinear",
+        checkpoint_save_steps=checkpoint_save_steps,
+        show_progress_bar=show_progress_bar,
+        evaluator=evaluator,
+        evaluation_steps=evaluation_steps,
+    )
 
     # Save model to wandb
     if use_wandb:

@@ -1,14 +1,12 @@
-import pandas as pd
-import numpy as np
-from typing import Tuple, List
+import pandas as pd  # type: ignore
 from sentence_transformers import InputExample
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split  # type: ignore
 
 
 def split_data_by_date(
     df: pd.DataFrame, cutoff_date: pd.Timestamp, validation_split: float = 0.1
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Split data into train and validation sets based on date cutoff.
 
@@ -55,11 +53,9 @@ def create_ir_evaluator(
     # Prepare queries and documents for IR evaluation
     queries = {}
     documents = {}
-    relevant_docs = {}
+    relevant_docs: dict[str, set[str]] = {}
 
     # Create unique IDs for queries and documents
-    query_id = 0
-    doc_id = 0
     query_to_id = {}
     doc_to_id = {}
 
@@ -69,26 +65,20 @@ def create_ir_evaluator(
 
         # Get or create query ID
         if text_from not in query_to_id:
-            query_to_id[text_from] = query_id
-            queries[query_id] = text_from
-            relevant_docs[query_id] = set()
-            query_id += 1
+            query_to_id[text_from] = text_from
+            queries[text_from] = text_from
+            relevant_docs[text_from] = set()
 
         # Get or create document ID
         if text_to not in doc_to_id:
-            doc_to_id[text_to] = doc_id
-            documents[doc_id] = text_to
-            doc_id += 1
+            doc_to_id[text_to] = text_to
+            documents[text_to] = text_to
 
-        # Add relevant document
-        relevant_docs[query_to_id[text_from]].add(doc_to_id[text_to])
-
-    # Convert sets to lists for evaluator
-    relevant_docs = {k: list(v) for k, v in relevant_docs.items()}
+        relevant_docs[text_from].add(text_to)
 
     evaluator = InformationRetrievalEvaluator(
         queries=queries,
-        documents=documents,
+        corpus=documents,
         relevant_docs=relevant_docs,
         name="validation_ir",
         show_progress_bar=True,
@@ -97,7 +87,7 @@ def create_ir_evaluator(
     return evaluator
 
 
-def create_validation_examples(val_df: pd.DataFrame) -> List[InputExample]:
+def create_validation_examples(val_df: pd.DataFrame) -> list[InputExample]:
     """
     Create InputExamples for validation set.
 

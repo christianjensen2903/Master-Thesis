@@ -1,13 +1,13 @@
 import random
-import pandas as pd
+import pandas as pd  # type: ignore
 import wandb
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore
 from torch.utils.data import DataLoader
 from sentence_transformers import SentenceTransformer, losses, InputExample
 from sentence_transformers.losses import TripletDistanceMetric
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
+from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+from sklearn.neighbors import NearestNeighbors  # type: ignore
 from validation_utils import split_data_by_date, create_ir_evaluator
 
 
@@ -168,7 +168,7 @@ def train_triplet_tfidf(
     train_dataset, val_df = get_triplet_data_tfidf(
         paragraph_file, cutoff_date, validation_split=validation_split
     )
-    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size)
+    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size)  # type: ignore
 
     model = SentenceTransformer(model_name)
     train_loss = losses.TripletLoss(
