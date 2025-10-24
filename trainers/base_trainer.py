@@ -64,7 +64,7 @@ class BaseTrainer(ABC):
         self,
         paragraph_file: str,
         cutoff_date: pd.Timestamp,
-    ) -> SentenceTransformer:
+    ) -> None:
         """
         Abstract method for training models.
 
@@ -123,8 +123,6 @@ class BaseTrainer(ABC):
             show_progress_bar=True,
             map_at_k=[1000],
             precision_recall_at_k=[5, 10, 50, 100],
-            mrr_at_k=[],
-            ndcg_at_k=[],
         )
 
         return evaluator
