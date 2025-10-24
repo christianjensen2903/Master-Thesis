@@ -31,7 +31,11 @@ class BaseRetriever(ABC):
 
     @abstractmethod
     def retrieve(
-        self, query_idx: int, embeddings: np.ndarray, candidate_indices: np.ndarray
+        self,
+        query_idx: int,
+        embeddings: np.ndarray,
+        candidate_indices: np.ndarray,
+        top_k: int | None = None,
     ) -> np.ndarray:
         """
         Retrieve and rank candidate paragraphs for a given query.
@@ -40,6 +44,7 @@ class BaseRetriever(ABC):
             query_idx: Index of the query paragraph
             embeddings: Full embedding matrix of all paragraphs
             candidate_indices: Indices of candidate paragraphs to rank
+            top_k: If provided, only return top k results (faster)
 
         Returns:
             Array of candidate indices sorted by relevance (most relevant first)

@@ -34,7 +34,11 @@ class TfidfRetriever(BaseRetriever):
         return self.vectorizer.transform(texts)
 
     def retrieve(
-        self, query_idx: int, embeddings: csr_matrix, candidate_indices: np.ndarray
+        self,
+        query_idx: int,
+        embeddings: csr_matrix,
+        candidate_indices: np.ndarray,
+        top_k: int | None = None,
     ) -> np.ndarray:
         query_vec = embeddings[query_idx]
         candidate_vecs = embeddings[candidate_indices]
@@ -42,7 +46,15 @@ class TfidfRetriever(BaseRetriever):
         # Cosine similarity via dot product (vectors are l2-normalized)
         similarities = candidate_vecs.dot(query_vec.T).toarray().ravel()
 
-        # Sort by similarity (high to low)
-        ranked_order = np.argsort(-similarities)
-
-        return candidate_indices[ranked_order]
+        # Use efficient top-k selection if requested
+        if top_k is not None and top_k < len(similarities):
+            # argpartition is O(n) vs argsort O(n log n)
+            # Get indices of top_k largest values (unsorted)
+            top_k_indices = np.argpartition(-similarities, top_k)[:top_k]
+            # Sort only the top_k values
+            sorted_top_k = top_k_indices[np.argsort(-similarities[top_k_indices])]
+            return candidate_indices[sorted_top_k]
+        else:
+            # Full sort by similarity (high to low)
+            ranked_order = np.argsort(-similarities)
+            return candidate_indices[ranked_order]

@@ -20,12 +20,14 @@ class Evaluator:
         excel_path: str = "data/par-to-par-2.xlsx",
         metadata_path: str = "data/par-to-par.json",
         train_cutoff_year: int = 2018,
+        top_k: int | None = None,
     ):
         self.retriever = retriever
         self.embeddings = embeddings
         self.excel_path = excel_path
         self.metadata_path = metadata_path
         self.train_cutoff_year = train_cutoff_year
+        self.top_k = top_k
 
         # Data structures (populated by load_and_prepare)
         self.df: pd.DataFrame | None = None
@@ -86,7 +88,9 @@ class Evaluator:
 
         avg_precs = []
 
-        for src_pid in tqdm(test_source_pids, desc="Evaluating MAP"):  # type: ignore
+        desc = f"Evaluating MAP@{self.top_k}" if self.top_k else "Evaluating MAP"
+
+        for src_pid in tqdm(test_source_pids, desc=desc):  # type: ignore
             assert self.paragraph_dates is not None
             assert self.sorted_dates is not None
             assert self.sort_idx is not None
@@ -106,13 +110,21 @@ class Evaluator:
             if num_rel == 0:
                 continue
 
-            # Retrieve and rank candidates
-            ranked_pids = self.retriever.retrieve(src_pid, self.embeddings, cand_pids)
+            # Retrieve and rank candidates (with optional top_k limit)
+            ranked_pids = self.retriever.retrieve(
+                src_pid, self.embeddings, cand_pids, top_k=self.top_k
+            )
 
-            # Compute average precision
+            # Compute average precision (only up to top_k if specified)
             good = 0
             precisions = []
-            for rank_pos, pid_candidate in enumerate(ranked_pids, start=1):
+            max_rank = (
+                len(ranked_pids)
+                if self.top_k is None
+                else min(len(ranked_pids), self.top_k)
+            )
+
+            for rank_pos, pid_candidate in enumerate(ranked_pids[:max_rank], start=1):
                 if pid_candidate in relevant:
                     good += 1
                     precisions.append(good / rank_pos)
@@ -138,10 +150,11 @@ class Evaluator:
         print(f"Train paragraphs: {np.sum(self.paragraph_set == 'train')}")
         print(f"Test paragraphs: {np.sum(self.paragraph_set == 'test')}")
 
-        print("\nComputing MAP...")
+        metric_name = f"MAP@{self.top_k}" if self.top_k else "MAP"
+        print(f"\nComputing {metric_name}...")
         score = self.evaluate_map()
 
-        print(f"\nMAP: {score:.4f}")
+        print(f"\n{metric_name}: {score:.4f}")
 
         return score
 
@@ -175,7 +188,11 @@ if __name__ == "__main__":
     embeddings = retriever.fit_transform(pid_to_text, train_mask)
     print(f"Embeddings shape: {embeddings.shape}")
 
-    # Run evaluation
+    # Run evaluation (with optional top_k for faster evaluation)
     print("\nEvaluating...")
-    evaluator = Evaluator(retriever=retriever, embeddings=embeddings)
+    evaluator = Evaluator(
+        retriever=retriever,
+        embeddings=embeddings,
+        top_k=1000,  # Use MAP@1000 for faster evaluation, or None for full MAP
+    )
     evaluator.run()
