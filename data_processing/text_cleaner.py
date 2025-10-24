@@ -71,7 +71,7 @@ class TextCleaner:
         _affaires_jointes = rf"\b(?:les?\s+)?affaires\s+jointes?\s+(?:{COURT}{CASE_NUMBER}(?:\s*(?:,|et|&)\s*{COURT}{CASE_NUMBER})+)(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ\s]+)?(?=\s*[,\.;\)]|\s*$|$)"
         _arret = rf"\b(?:l'|les?\s+)?(?:arrêt|arrêts)\s+(?:de\s+la\s+)?(?:Cour|Tribunal|Conseil)\s+(?:du\s+\d{{1,2}}\s+\w+\s+\d{{4}})?"
         _paragraphe = (
-            r"\b(?:l'|les?\s+)?(?:para|paragraphe)s?\.?\s+\d+"
+            r"\b(?:l'|les?\s+)?(?:para|paragraphe|point)s?\.?\s+\d+"
             r"(?:\s*(?:[-\u2013\u2014\u2212]|à|jusqu'?à)\s*\d+)?"
             r"(?:\s*,\s*\d+)*"
             r"(?:\s*(?:et|&)\s*\d+)?\b"
@@ -86,7 +86,8 @@ class TextCleaner:
         # Party-v-party (EU style) case titles without numbers
         # Make NAME pattern more restrictive - must start with TOKEN (not connector)
         # Use negative lookahead to prevent matching common words as party names
-        _TOKEN = r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ0-9'''-]*"
+        # Extended to include Latin Extended-A (U+0100-U+017F) and Latin Extended-B (U+0180-U+024F)
+        _TOKEN = r"[A-ZÀ-ÖØ-Þ\u0100-\u024F][A-Za-zÀ-ÖØ-öø-ÿ\u0100-\u024F0-9'''-]*"
         _PARTY_CONNECTOR = r"(?:and|&|Others|et)"
         # Negative lookahead to prevent matching common words that aren't party names
         _NOT_COMMON_WORD = r"(?!(?:and|or|in|of|the|to|for|with|by|at|from|as|on|that|this|it|is|was|be|has|have|had|but|not|are|were|been|being|also|see|judgments?|judgment|into|than|over|after|before|between|under)\b)"
@@ -110,12 +111,13 @@ class TextCleaner:
 
         # Party name followed by comma and ECLI/case - use full NAME pattern for better matching
         _party_before_ecli = rf"(?:^|\b|(?<=\s))(?!judgments?\s)(?!see\s)(?!in\s){_NAME}\s*,\s*{_ecli_pattern}"
-        _party_before_case = (
-            rf"(?:^|\b|(?<=\s))(?!judgments?\s)(?!see\s){_NAME},\s*{COURT}{CASE_NUMBER}"
-        )
+        _party_before_case = rf"(?:^|\b|(?<=\s))(?!judgments?\s)(?!see\s)(?!voir\s)(?!arrêt\s)(?!arrêts\s){_NAME},\s*{COURT}{CASE_NUMBER}"
+
+        # Party names with slash separator (Commission/Grèce, Commission/Italie) followed by case number
+        _party_slash_party = rf"\b[A-ZÀ-ÖØ-Þ\u0100-\u024F][A-Za-zÀ-ÖØ-öø-ÿ\u0100-\u024F]+\s*/\s*[A-ZÀ-ÖØ-Þ\u0100-\u024F][A-Za-zÀ-ÖØ-öø-ÿ\u0100-\u024F]+\s*,\s*{COURT}{CASE_NUMBER}"
 
         self._MASTER = re.compile(
-            rf"(?P<CASE>{_case_joined_all}|{_affaires_jointes}|{_case_joined_trailing_year}|{_case_joined_range}|{_case_single_with_v}|{_case_single_with_names}|{_case_single}|{_affaire_with_v}|{_affaire_with_names}|{_affaire}|{_party_v_in_parens}|{_party_v_party}|{_case_bare}|{_arret}|{_party_in_parens}|{_party_before_case}|{_party_before_ecli})"
+            rf"(?P<CASE>{_case_joined_all}|{_affaires_jointes}|{_case_joined_trailing_year}|{_case_joined_range}|{_case_single_with_v}|{_case_single_with_names}|{_case_single}|{_affaire_with_v}|{_affaire_with_names}|{_affaire}|{_party_v_in_parens}|{_party_v_party}|{_case_bare}|{_arret}|{_party_in_parens}|{_party_slash_party}|{_party_before_case}|{_party_before_ecli})"
             rf"|(?P<ECR>{_ecr}|{_ecr_year_brackets})"
             rf"|(?P<ECLI>{_ecli})"
             rf"|(?P<PARAGRAPH>{_para}|{_paragraphe}|{_alinea})",
@@ -265,6 +267,10 @@ class TextCleaner:
         """Remove duplicate consecutive tags."""
         if not isinstance(text, str):
             return text
+
+        # Track if we had duplicate CASE tags
+        had_duplicates = "<CASE>, <CASE>" in text or "<CASE> <CASE>" in text
+
         # Remove duplicate consecutive <CASE> tags (multiple passes to handle nested cases)
         # This handles <CASE><CASE>, <CASE> <CASE>, <CASE>, <CASE> etc.
         while True:
@@ -279,6 +285,17 @@ class TextCleaner:
             text = re.sub(r"<CASE>\s*<DATE>\s*<CASE>", "<CASE>", text)
             if text == orig:
                 break
+
+        # If we had duplicate CASE tags and collapsed them, also remove connector words
+        # between citation tags, as they were connecting the duplicates
+        # E.g., "<CASE>, <PARAGRAPH>, et <CASE>" -> "<CASE>, <PARAGRAPH>, <CASE>"
+        if had_duplicates:
+            text = re.sub(
+                r"<CASE>,\s+<PARAGRAPH>,\s+(?:and|et|&)\s+<CASE>",
+                "<CASE>, <PARAGRAPH>, <CASE>",
+                text,
+            )
+
         return text.strip()
 
     def fix_false_positives(self, text: str) -> str:
