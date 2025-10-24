@@ -92,6 +92,8 @@ def train_simcse(
         show_progress_bar=show_progress_bar,
         evaluator=evaluator,
         evaluation_steps=evaluation_steps,
+        save_best_model=True,
+        checkpoint_save_path=evaluation_steps,
     )
 
     # Save model to wandb

@@ -142,6 +142,8 @@ def train_triplet_tfidf(
     output_path: str = "output/simcse_triplet_tfidf",
     batch_size: int = 16,
     epochs: int = 5,
+    checkpoint_save_steps: int = 1000,
+    evaluation_steps: int = 1000,
     warmup_steps: int = 100,
     margin: float = 0.2,
     distance_metric: TripletDistanceMetric = TripletDistanceMetric.COSINE,
@@ -187,27 +189,18 @@ def train_triplet_tfidf(
     print(f"Total validation examples: {len(val_df)}")
     print(f"Total batches: {len(train_dataloader)}")
 
-    # Training with validation
-    if evaluator is not None:
-        model.fit(
-            train_objectives=[(train_dataloader, train_loss)],
-            epochs=epochs,
-            warmup_steps=warmup_steps,
-            output_path=output_path,
-            scheduler="WarmupLinear",
-            show_progress_bar=show_progress_bar,
-            evaluator=evaluator,
-            evaluation_steps=500,  # Evaluate every 500 steps
-        )
-    else:
-        model.fit(
-            train_objectives=[(train_dataloader, train_loss)],
-            epochs=epochs,
-            warmup_steps=warmup_steps,
-            output_path=output_path,
-            scheduler="WarmupLinear",
-            show_progress_bar=show_progress_bar,
-        )
+    model.fit(
+        train_objectives=[(train_dataloader, train_loss)],
+        epochs=epochs,
+        warmup_steps=warmup_steps,
+        output_path=output_path,
+        scheduler="WarmupLinear",
+        show_progress_bar=show_progress_bar,
+        evaluator=evaluator,
+        evaluation_steps=evaluation_steps,
+        checkpoint_save_steps=checkpoint_save_steps,
+        save_best_model=True,
+    )
 
     # Save model to wandb
     if use_wandb:

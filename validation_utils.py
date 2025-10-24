@@ -80,6 +80,10 @@ def create_ir_evaluator(val_df: pd.DataFrame) -> InformationRetrievalEvaluator:
         relevant_docs=relevant_docs,
         name="validation_ir",
         show_progress_bar=True,
+        map_at_k=[1000],
+        precision_recall_at_k=[5, 10, 50, 100],
+        mrr_at_k=[],
+        ndcg_at_k=[],
     )
 
     return evaluator
