@@ -22,13 +22,8 @@ def get_data(
     # Split into train and validation
     train_df, val_df = split_data_by_date(df, cutoff_date, validation_split)
 
-    # Get training paragraphs for TF-IDF
-    train_paragraphs_from = train_df["TEXT_FROM"].dropna().unique().tolist()
-    train_paragraphs_to = train_df["TEXT_TO"].dropna().unique().tolist()
-    train_paragraphs = list(set(train_paragraphs_from + train_paragraphs_to))
-
     train_examples = []
-    for index, row in tqdm(
+    for _, row in tqdm(
         train_df.iterrows(), total=len(train_df), desc="Creating training InputExamples"
     ):
         text_from = row["TEXT_FROM"]
@@ -80,7 +75,7 @@ def train_simcse(
     # Create validation evaluator if validation data exists
     evaluator = None
     if len(val_df) > 0:
-        evaluator = create_ir_evaluator(val_df, model_name)
+        evaluator = create_ir_evaluator(val_df)
 
     print(f"\nTraining {model_name} with Supervised SimCSE (MNRL)...")
     print(f"Total training examples: {len(train_dataset)}")

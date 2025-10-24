@@ -260,7 +260,7 @@ def train_semi_hard_triplet(
     # Create validation evaluator if validation data exists
     evaluator = None
     if len(val_df) > 0:
-        evaluator = create_ir_evaluator(val_df, model_name)
+        evaluator = create_ir_evaluator(val_df)
 
     print(f"\nTraining {model_name} with TripletLoss + Semi-Hard Sampling...")
     print(f"Total triplets: {len(train_dataset)}")

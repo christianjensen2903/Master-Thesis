@@ -37,9 +37,7 @@ def split_data_by_date(
     return train_df, val_df
 
 
-def create_ir_evaluator(
-    val_df: pd.DataFrame, model_name: str = "all-MiniLM-L6-v2"
-) -> InformationRetrievalEvaluator:
+def create_ir_evaluator(val_df: pd.DataFrame) -> InformationRetrievalEvaluator:
     """
     Create InformationRetrievalEvaluator for validation.
 
