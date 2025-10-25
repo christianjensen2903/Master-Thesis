@@ -8,20 +8,20 @@ from tqdm import tqdm  # type: ignore
 
 
 def load_citation_data(
-    excel_path: str = "data/par-to-par-2.xlsx",
+    csv_path: str = "data/par-to-par-og.csv",
     metadata_path: str = "data/par-to-par.json",
 ) -> tuple[pd.DataFrame, dict]:
     """
     Load citation data from Excel and metadata from JSON.
 
     Args:
-        excel_path: Path to paragraph-to-paragraph Excel file
+        csv_path: Path to paragraph-to-paragraph CSV file
         metadata_path: Path to metadata JSON file
 
     Returns:
         Tuple of (DataFrame, metadata_dict)
     """
-    df = pd.read_excel(excel_path)
+    df = pd.read_csv(csv_path)
     df = df.dropna()
 
     with open(metadata_path) as f:
