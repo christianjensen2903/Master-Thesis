@@ -22,7 +22,6 @@ class SemiHardTrainer(BaseTripletTrainer):
         """
         pool_texts = context["pool_texts"]
         text2idx = context["text2idx"]
-        X = context["X"]
         get_neighbors = context["get_neighbors"]
         margin = context.get("margin", 0.2)
 
@@ -32,12 +31,27 @@ class SemiHardTrainer(BaseTripletTrainer):
         if anchor_idx is None or positive_idx is None:
             return None
 
+        # Get pre-computed neighbors with distances
         neighbors = get_neighbors(anchor_idx)
 
-        # Calculate distance from anchor to positive
-        anchor_positive_dist = cosine_distances(X[anchor_idx], X[positive_idx])[0][0]
+        # Get positive distance from neighbors list (if positive is in neighbors)
+        # Otherwise compute it once
+        anchor_positive_dist = None
+        for idx, dist in neighbors:
+            if idx == positive_idx:
+                anchor_positive_dist = dist
+                break
 
-        # Find semi-hard negatives
+        # If positive not in neighbors, compute distance once
+        if anchor_positive_dist is None:
+            from sklearn.metrics.pairwise import cosine_distances
+
+            X = context["X"]
+            anchor_positive_dist = cosine_distances(X[anchor_idx], X[positive_idx])[0][
+                0
+            ]
+
+        # Find semi-hard negatives using pre-computed distances
         semi_hard_candidates = []
 
         for neg_idx, neg_dist in neighbors:

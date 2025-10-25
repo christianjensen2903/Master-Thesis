@@ -101,8 +101,10 @@ class BaseTripletTrainer(BaseTrainer):
         Cosine KNN over TF-IDF space. Returns a fitted NearestNeighbors.
         Note: cosine distance = 1 - cosine similarity; nearest = most similar.
         """
+        # Use 'auto' to let sklearn choose the best algorithm
+        # For large datasets, this can be much faster
         knn = NearestNeighbors(
-            n_neighbors=n_neighbors, metric="cosine", algorithm="brute"
+            n_neighbors=n_neighbors, metric="cosine", algorithm="auto", n_jobs=-1
         )
         knn.fit(X)
         return knn
@@ -149,16 +151,18 @@ class BaseTripletTrainer(BaseTrainer):
         vec, X, text2idx = self._build_tfidf_index(pool_texts)
         knn = self._build_knn(X, n_neighbors=min(self.n_neighbors, len(pool_texts)))
 
+        # PRE-COMPUTE all neighbors for all texts (much faster than on-demand queries)
+        print("Pre-computing KNN neighbors for all texts...")
+        distances_all, indices_all = knn.kneighbors(X, return_distance=True)
+
         # Cache for neighbor queries
-        neighbor_cache = {}
+        neighbor_cache = {
+            idx: list(zip(indices_all[idx].tolist(), distances_all[idx].tolist()))
+            for idx in range(len(pool_texts))
+        }
 
         def get_neighbors(anchor_idx: int) -> list[tuple[int, float]]:
             """Get cached neighbors for an anchor."""
-            if anchor_idx not in neighbor_cache:
-                distances, indices = knn.kneighbors(X[anchor_idx], return_distance=True)
-                neighbor_cache[anchor_idx] = list(
-                    zip(indices[0].tolist(), distances[0].tolist())
-                )
             return neighbor_cache[anchor_idx]
 
         triplets: list[InputExample] = []
