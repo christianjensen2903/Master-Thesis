@@ -1,10 +1,16 @@
 import random
+from typing import Any, Tuple
+
+import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
 from torch.utils.data import DataLoader
 from sentence_transformers import SentenceTransformer, losses, InputExample
 from sentence_transformers.losses import TripletDistanceMetric
-from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+from sklearn.feature_extraction.text import (
+    TfidfVectorizer,  # type: ignore
+    HashingVectorizer,  # type: ignore
+)
 from sklearn.neighbors import NearestNeighbors  # type: ignore
 from .base_trainer import BaseTrainer
 
@@ -18,7 +24,13 @@ class BaseTripletTrainer(BaseTrainer):
         distance_metric: TripletDistanceMetric = TripletDistanceMetric.COSINE,
         n_neighbors: int = 50,
         max_attempts: int = 100,
-        **kwargs,
+        # TF-IDF/indexing controls for performance
+        tfidf_max_features: int | None = 100_000,
+        tfidf_min_df: int | float = 3,
+        tfidf_max_df: float = 0.9,
+        tfidf_ngram_range: tuple[int, int] = (1, 1),
+        tfidf_use_hashing: bool = False,
+        **kwargs: Any,
     ):
         """
         Initialize BaseTripletTrainer.
@@ -34,6 +46,12 @@ class BaseTripletTrainer(BaseTrainer):
         self.distance_metric = distance_metric
         self.n_neighbors = n_neighbors
         self.max_attempts = max_attempts
+        # TF-IDF/indexing settings
+        self.tfidf_max_features = tfidf_max_features
+        self.tfidf_min_df = tfidf_min_df
+        self.tfidf_max_df = tfidf_max_df
+        self.tfidf_ngram_range = tfidf_ngram_range
+        self.tfidf_use_hashing = tfidf_use_hashing
 
     def create_triplet_loss(self, model: SentenceTransformer) -> losses.TripletLoss:
         """Create triplet loss with configured parameters."""
@@ -47,21 +65,35 @@ class BaseTripletTrainer(BaseTrainer):
         """Preserve order while deduping (pd.unique keeps first occurrence)."""
         return pd.unique(series.fillna("").astype(str))
 
-    def _build_tfidf_index(
-        self,
-        texts: list[str],
-        *,
-        min_df: int = 3,
-        max_df: float = 0.9,
-        ngram_range: tuple = (1, 2),
-    ) -> tuple:
+    def _build_tfidf_index(self, texts: list[str]) -> Tuple[Any, Any, dict[str, int]]:
+        """Build a fast, memory-efficient TF-IDF (or Hashing) index over texts.
+
+        Returns (vectorizer_like, X_matrix, text_to_index).
         """
-        Fit a TF-IDF vectorizer on `texts` and return (vectorizer, X, index_of_text).
-        `texts` should be a list of unique strings.
-        """
-        vec = TfidfVectorizer(min_df=min_df, max_df=max_df, ngram_range=ngram_range)
-        X = vec.fit_transform(texts)  # csr_matrix [N, V]
-        text2idx = {t: i for i, t in enumerate(texts)}
+        # Map texts to row indices
+        text2idx: dict[str, int] = {t: i for i, t in enumerate(texts)}
+
+        if self.tfidf_use_hashing:
+            n_features = self.tfidf_max_features or (1 << 18)
+            vec = HashingVectorizer(
+                n_features=int(n_features),
+                alternate_sign=False,
+                norm="l2",
+                analyzer="word",
+                ngram_range=self.tfidf_ngram_range,
+                dtype=np.float32,
+            )
+            X = vec.transform(texts)
+            return vec, X, text2idx
+
+        vec = TfidfVectorizer(
+            min_df=self.tfidf_min_df,
+            max_df=self.tfidf_max_df,
+            ngram_range=self.tfidf_ngram_range,
+            max_features=self.tfidf_max_features,
+            dtype=np.float32,
+        )
+        X = vec.fit_transform(texts)
         return vec, X, text2idx
 
     def _build_knn(self, X, n_neighbors: int = 50):

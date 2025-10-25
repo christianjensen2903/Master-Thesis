@@ -17,14 +17,14 @@ class Evaluator:
         self,
         retriever: BaseRetriever,
         embeddings: NDArray,
-        excel_path: str = "data/par-to-par-2.xlsx",
+        csv_path: str = "data/par-to-par-og.csv",
         metadata_path: str = "data/par-to-par.json",
         train_cutoff_year: int = 2018,
         top_k: int | None = None,
     ):
         self.retriever = retriever
         self.embeddings = embeddings
-        self.excel_path = excel_path
+        self.csv_path = csv_path
         self.metadata_path = metadata_path
         self.train_cutoff_year = train_cutoff_year
         self.top_k = top_k
@@ -49,7 +49,7 @@ class Evaluator:
         self.map_score: float | None = None
 
     def load_and_prepare(self) -> None:
-        self.df, self.metadata = load_citation_data(self.excel_path, self.metadata_path)
+        self.df, self.metadata = load_citation_data(self.csv_path, self.metadata_path)
         self.train_meta, self.test_meta = split_train_test(
             self.metadata, self.train_cutoff_year
         )
