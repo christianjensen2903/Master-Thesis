@@ -44,7 +44,6 @@ class SemiHardTrainer(BaseTripletTrainer):
 
         # If positive not in neighbors, compute distance once
         if anchor_positive_dist is None:
-            from sklearn.metrics.pairwise import cosine_distances
 
             X = context["X"]
             anchor_positive_dist = cosine_distances(X[anchor_idx], X[positive_idx])[0][

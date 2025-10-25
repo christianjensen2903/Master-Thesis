@@ -5,6 +5,7 @@ from typing import Any
 from abc import ABC, abstractmethod
 from validation_utils import split_data_by_date
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
+from sentence_transformers import SentenceTransformer
 
 
 class BaseTrainer(ABC):
@@ -64,7 +65,7 @@ class BaseTrainer(ABC):
         self,
         paragraph_file: str,
         cutoff_date: pd.Timestamp,
-    ) -> None:
+    ) -> SentenceTransformer:
         """
         Abstract method for training models.
 

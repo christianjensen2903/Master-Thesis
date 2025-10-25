@@ -7,9 +7,9 @@ from tqdm import tqdm  # type: ignore
 from torch.utils.data import DataLoader
 from sentence_transformers import SentenceTransformer, losses, InputExample
 from sentence_transformers.losses import TripletDistanceMetric
-from sklearn.feature_extraction.text import (
-    TfidfVectorizer,  # type: ignore
-    HashingVectorizer,  # type: ignore
+from sklearn.feature_extraction.text import (  # type: ignore
+    TfidfVectorizer,
+    HashingVectorizer,
 )
 from sklearn.neighbors import NearestNeighbors  # type: ignore
 from .base_trainer import BaseTrainer
