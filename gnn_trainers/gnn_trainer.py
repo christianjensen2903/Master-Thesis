@@ -274,11 +274,13 @@ class GNNTrainer(BaseTrainer):
         embeddings = model(x, edge_index)
         embeddings = F.normalize(embeddings, p=2, dim=1).cpu().numpy()
 
-        # Compute MRR and Recall@k
+        # Compute MRR, MAP and Recall@k
         ranks = []
         recall_at_5 = 0
         recall_at_10 = 0
         recall_at_50 = 0
+        recall_at_100 = 0
+        average_precisions = []
 
         for anchor_id, cited_ids in val_citation_graph.items():
             if not cited_ids or anchor_id >= len(embeddings):
@@ -290,34 +292,54 @@ class GNNTrainer(BaseTrainer):
             # Rank all candidates
             ranked_indices = np.argsort(-similarities)
 
-            # Find rank of positive samples
+            # Find rank of positive samples and compute average precision
+            query_ranks = []
             for cited_id in cited_ids:
                 if cited_id >= len(embeddings):
                     continue
                 rank = np.where(ranked_indices == cited_id)[0]
                 if len(rank) > 0:
-                    rank = rank[0] + 1  # 1-indexed rank
-                    ranks.append(rank)
-                    if rank <= 5:
+                    rank_val = rank[0] + 1  # 1-indexed rank
+                    ranks.append(rank_val)
+                    query_ranks.append(rank_val)
+                    if rank_val <= 5:
                         recall_at_5 += 1
-                    if rank <= 10:
+                    if rank_val <= 10:
                         recall_at_10 += 1
-                    if rank <= 50:
+                    if rank_val <= 50:
                         recall_at_50 += 1
+                    if rank_val <= 100:
+                        recall_at_100 += 1
+
+            # Compute average precision for this query
+            if query_ranks:
+                query_ranks_sorted = sorted(query_ranks)
+                precisions = []
+                for i, rank in enumerate(query_ranks_sorted):
+                    precision_at_rank = (i + 1) / rank
+                    precisions.append(precision_at_rank)
+                avg_precision = np.mean(precisions)
+                average_precisions.append(avg_precision)
 
         if ranks:
             mrr = float(np.mean([1.0 / r for r in ranks]))
             recall_5 = float(recall_at_5 / len(ranks))
             recall_10 = float(recall_at_10 / len(ranks))
             recall_50 = float(recall_at_50 / len(ranks))
+            recall_100 = float(recall_at_100 / len(ranks))
+            map_score = (
+                float(np.mean(average_precisions)) if average_precisions else 0.0
+            )
         else:
-            mrr = recall_5 = recall_10 = recall_50 = 0.0
+            mrr = recall_5 = recall_10 = recall_50 = recall_100 = map_score = 0.0
 
         return {
             "mrr": mrr,
             "recall@5": recall_5,
             "recall@10": recall_10,
             "recall@50": recall_50,
+            "recall@100": recall_100,
+            "map": map_score,
         }
 
     def train(
@@ -440,9 +462,11 @@ class GNNTrainer(BaseTrainer):
             if (epoch + 1) % max(1, self.epochs // 5) == 0:
                 val_metrics = self.evaluate(model, graph_data, val_citation_graph)
                 print(f"  Validation MRR: {val_metrics['mrr']:.4f}")
+                print(f"  Validation MAP: {val_metrics['map']:.4f}")
                 print(f"  Recall@5: {val_metrics['recall@5']:.4f}")
                 print(f"  Recall@10: {val_metrics['recall@10']:.4f}")
                 print(f"  Recall@50: {val_metrics['recall@50']:.4f}")
+                print(f"  Recall@100: {val_metrics['recall@100']:.4f}")
 
                 if self.use_wandb:
                     import wandb
@@ -452,9 +476,11 @@ class GNNTrainer(BaseTrainer):
                             "epoch": epoch + 1,
                             "train_loss": train_loss,
                             "val_mrr": val_metrics["mrr"],
+                            "val_map": val_metrics["map"],
                             "val_recall@5": val_metrics["recall@5"],
                             "val_recall@10": val_metrics["recall@10"],
                             "val_recall@50": val_metrics["recall@50"],
+                            "val_recall@100": val_metrics["recall@100"],
                         }
                     )
 
