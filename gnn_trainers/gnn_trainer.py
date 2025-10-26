@@ -163,23 +163,29 @@ class GNNTrainer(BaseTrainer):
         texts: np.ndarray,
         citation_graph: dict[int, list[int]],
         text_encoder: SentenceTransformer,
+        precomputed_embeddings: np.ndarray | None = None,
     ) -> Data:
-        # Try to load cached embeddings
-        cache_key = self._compute_cache_key(texts, self.text_encoder_name)
-        text_embeddings = self._load_cached_embeddings(cache_key)
-
-        if text_embeddings is None:
-            print("Encoding texts...")
-            text_embeddings = text_encoder.encode(
-                texts.tolist(),
-                batch_size=self.batch_size,
-                show_progress_bar=True,
-                convert_to_numpy=True,
-            )
-            # Save to cache for future use
-            self._save_cached_embeddings(text_embeddings, cache_key)
+        # Use pre-computed embeddings if provided
+        if precomputed_embeddings is not None:
+            print("Using pre-computed embeddings...")
+            text_embeddings = precomputed_embeddings
         else:
-            print("Using cached embeddings")
+            # Try to load cached embeddings
+            cache_key = self._compute_cache_key(texts, self.text_encoder_name)
+            text_embeddings = self._load_cached_embeddings(cache_key)
+
+            if text_embeddings is None:
+                print("Encoding texts...")
+                text_embeddings = text_encoder.encode(
+                    texts.tolist(),
+                    batch_size=self.batch_size,
+                    show_progress_bar=True,
+                    convert_to_numpy=True,
+                )
+                # Save to cache for future use
+                self._save_cached_embeddings(text_embeddings, cache_key)
+            else:
+                print("Using cached embeddings")
 
         x = torch.tensor(text_embeddings, dtype=torch.float32)
 
@@ -394,6 +400,7 @@ class GNNTrainer(BaseTrainer):
         self,
         paragraph_file: str,
         cutoff_date: pd.Timestamp,
+        precomputed_embeddings: np.ndarray | None = None,
     ) -> torch.nn.Module:
         # Create output directory if it doesn't exist
         os.makedirs(self.output_path, exist_ok=True)
@@ -452,7 +459,9 @@ class GNNTrainer(BaseTrainer):
             raise ValueError("Text encoder does not provide embedding dimension")
 
         # Build graph data using temporal DAG (causally masked)
-        graph_data = self.build_graph_data(all_texts, temporal_dag, text_encoder)
+        graph_data = self.build_graph_data(
+            all_texts, temporal_dag, text_encoder, precomputed_embeddings
+        )
 
         # Initialize GNN model
         print(f"\nInitializing GNN model...")

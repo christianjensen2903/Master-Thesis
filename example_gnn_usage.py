@@ -1,5 +1,7 @@
 import pandas as pd  # type: ignore
 import numpy as np
+import pickle
+import os
 from gnn_trainers import GNNTrainer
 from retrievers import GNNRetriever, DenseRetriever, TfidfRetriever
 from data_loader import (
@@ -100,10 +102,39 @@ def evaluate_gnn_map(
 
     # Fit on corpus with TRAINING temporal DAG only (no leakage)
     print("\nFitting retriever on corpus (TRAIN temporal DAG only - no leakage)...")
+
+    # Option 1: Let GNN compute embeddings internally (default behavior)
+    # retriever.fit(
+    #     texts=pid_to_text,
+    #     citation_graph=train_temporal_dag,
+    #     paragraph_dates=paragraph_dates,
+    # )
+
+    # Option 2: Use pre-computed embeddings from cache
+    embeddings_cache_dir = "artifacts/embeddings_cache"
+    cache_files = [f for f in os.listdir(embeddings_cache_dir) if f.endswith(".pkl")]
+
+    text_embeddings = None
+    if cache_files:
+        cache_path = os.path.join(embeddings_cache_dir, cache_files[0])
+        print(f"Loading pre-computed embeddings from {cache_path}...")
+        with open(cache_path, "rb") as f:
+            text_embeddings = pickle.load(f)
+        print(f"Loaded embeddings shape: {text_embeddings.shape}")
+    else:
+        print("No cached embeddings found, computing with DenseRetriever...")
+        dense_retriever = DenseRetriever(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            batch_size=32,
+        )
+        text_embeddings = dense_retriever.transform(pid_to_text)
+        print(f"Computed embeddings shape: {text_embeddings.shape}")
+
     retriever.fit(
         texts=pid_to_text,
         citation_graph=train_temporal_dag,
         paragraph_dates=paragraph_dates,
+        precomputed_embeddings=text_embeddings,
     )
 
     # Generate embeddings

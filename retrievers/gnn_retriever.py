@@ -158,15 +158,20 @@ class GNNRetriever(BaseRetriever):
         self,
         texts: np.ndarray,
         citation_graph: dict[int, list[int]] | None = None,
+        precomputed_embeddings: np.ndarray | None = None,
     ) -> Data:
-        # Encode texts with text encoder
-        print("Encoding texts with text encoder...")
-        text_embeddings = self.text_encoder.encode(
-            texts.tolist(),
-            batch_size=self.batch_size,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-        )
+        # Use pre-computed embeddings if provided, otherwise encode texts
+        if precomputed_embeddings is not None:
+            print("Using pre-computed text embeddings...")
+            text_embeddings = precomputed_embeddings
+        else:
+            print("Encoding texts with text encoder...")
+            text_embeddings = self.text_encoder.encode(
+                texts.tolist(),
+                batch_size=self.batch_size,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+            )
 
         x = torch.tensor(text_embeddings, dtype=torch.float32)
 
@@ -216,6 +221,7 @@ class GNNRetriever(BaseRetriever):
         mask: np.ndarray | None = None,
         citation_graph: dict[int, list[int]] | None = None,
         paragraph_dates: np.ndarray | None = None,
+        precomputed_embeddings: np.ndarray | None = None,
     ) -> None:
         """
         Fit the retriever on a collection of texts.
@@ -225,9 +231,12 @@ class GNNRetriever(BaseRetriever):
             mask: Optional boolean mask (unused for GNN, kept for compatibility)
             citation_graph: Citation graph (should be temporal DAG for causal inference)
             paragraph_dates: Optional dates for temporal masking during inference
+            precomputed_embeddings: Optional pre-computed text embeddings (if None, will compute from texts)
         """
         # Build graph structure
-        self.graph_data = self.build_graph(texts, citation_graph)
+        self.graph_data = self.build_graph(
+            texts, citation_graph, precomputed_embeddings
+        )
         self.text_to_node_id = {text: i for i, text in enumerate(texts)}
         self.paragraph_dates = paragraph_dates
         self._is_fitted = True
