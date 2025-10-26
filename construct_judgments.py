@@ -1,13 +1,60 @@
 import json
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from tqdm import tqdm  # type: ignore
+from bs4 import BeautifulSoup
 
-from judgment_parser import (
-    ECJProcessor,
-    ECJProcessor15,
-    ECJTextProcessor,
-)
+from judgment_parser import ECJProcessor, ECJProcessor15, ECJTextProcessor
+
+
+def parse_old_format_judgment(html_path: str) -> dict[int, str]:
+    """
+    Parse old-format ECJ judgments where all paragraphs are in a single <em> block.
+
+    Old HTML files (pre-1990s) have all text in one <em> tag without individual <p> tags.
+    Paragraphs are separated by ". " (period + spaces) or just multiple spaces.
+    """
+    with open(html_path, "r", encoding="utf-8") as f:
+        soup = BeautifulSoup(f.read(), "html.parser")
+
+    paragraphs = {}
+
+    # Parse sections: Grounds (MO), Decision on costs (CO), Operative part (DI)
+    for section_name in ["MO", "CO", "DI"]:
+        section_anchor = soup.find("a", attrs={"name": section_name})
+        if not section_anchor:
+            continue
+
+        h2 = section_anchor.find_next("h2")
+        em = h2.find_next("em") if h2 else None
+        if not em:
+            continue
+
+        text = em.get_text()
+
+        # Split by punctuation/spaces followed by digit + space + uppercase letter
+        parts = re.split(r"(?:[.?!]\s+|\s{2,})(?=\d+\s+[A-Z])", text.strip())
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+
+            # Extract paragraph number from start of text
+            match = re.match(r"^(\d+)\s+", part)
+            if match:
+                paragraphs[int(match.group(1))] = part
+
+    return paragraphs
+
+
+def try_parser(parser_callable: Callable[[], dict[int, str]]) -> dict[int, str]:
+    """Try a parser and return results, or empty dict on failure."""
+    try:
+        return parser_callable()
+    except Exception:
+        return {}
 
 
 def find_cj_judgments(judgments_dir: str) -> list[str]:
@@ -40,31 +87,33 @@ def get_available_languages(judgment_dir: Path) -> dict[str, Path]:
 
 
 def process_paragraphs(celex: str, judgment_dir: Path) -> dict[int, str]:
-    """Process a single judgment, choosing the best language version."""
-
-    # Get available languages
+    """Process a single judgment, choosing the best language and parser."""
     languages = get_available_languages(judgment_dir)
 
     if not languages:
         print(f"No language versions found for {celex}")
         return {}
 
-    # Parse each available language
+    # Try all parsers on each language and keep the best result
     parsed_versions = {}
     for lang, path in languages.items():
-        try:
-            processor = ECJProcessor(str(path))
-            paragraphs = processor.read_paragraphs()
-        except Exception as e:
-            paragraphs = {}
+        path_str = str(path)
 
-        parsed_versions[lang] = paragraphs
+        # Try each parser - returns empty dict on failure
+        results = [
+            try_parser(lambda: ECJProcessor(path_str).read_paragraphs()),
+            try_parser(lambda: ECJProcessor15(path_str).read_paragraphs()),
+            try_parser(lambda: parse_old_format_judgment(path_str)),
+        ]
 
-    # Choose the version with most paragraphs
-    best_lang = max(parsed_versions.keys(), key=lambda lang: len(parsed_versions[lang]))
-    best_paragraphs = parsed_versions[best_lang]
+        # Use the parser that found the most paragraphs
+        parsed_versions[lang] = max(results, key=len)
 
-    return best_paragraphs
+    # Choose the language version with most paragraphs
+    if not parsed_versions:
+        return {}
+
+    return max(parsed_versions.values(), key=len)
 
 
 def load_metadata(par_to_par_path: str) -> dict[str, Any]:
@@ -122,8 +171,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # parse_judgment_with_processor(Path("judgments/62010CJ0412/eng_judgment.html"))
-    # print(process_judgment("61980CJ0211", Path("judgments/61980CJ0211")))
-    # processor: ECJProcessor = ECJProcessor("judgments/61980CJ0211/eng_judgment.html")
-    # paragraphs = processor.read_paragraphs()
-    # print(paragraphs)
