@@ -63,9 +63,7 @@ class GNNRetriever(BaseRetriever):
         if input_dim is None:
             raise ValueError("Text encoder does not provide embedding dimension")
 
-        # Use provided GNN model
-        self.gnn_model: BaseGNNEncoder
-        self.gnn_model = cast(BaseGNNEncoder, gnn_model.to(self.device))
+        self.gnn_model = gnn_model.to(self.device)
 
         # Validate input dimension compatibility when possible
         try:
