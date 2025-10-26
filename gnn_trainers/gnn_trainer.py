@@ -1,5 +1,7 @@
 import os
 import random
+import pickle
+import hashlib
 import pandas as pd  # type: ignore
 import numpy as np
 import torch
@@ -32,6 +34,7 @@ class GNNTrainer(BaseTrainer):
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
         num_negatives: int = 5,
+        embeddings_cache_dir: str | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -45,9 +48,14 @@ class GNNTrainer(BaseTrainer):
         self.weight_decay = weight_decay
         self.temperature = temperature
         self.num_negatives = num_negatives
+        self.embeddings_cache_dir = embeddings_cache_dir
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
+
+        # Create cache directory if specified
+        if self.embeddings_cache_dir:
+            os.makedirs(self.embeddings_cache_dir, exist_ok=True)
 
     def build_citation_graph_from_df(
         self, df: pd.DataFrame
@@ -119,19 +127,59 @@ class GNNTrainer(BaseTrainer):
 
         return citation_graph, par_id_to_idx, all_texts, paragraph_dates
 
+    def _compute_cache_key(self, texts: np.ndarray, encoder_name: str) -> str:
+        """Compute a unique cache key based on texts and encoder name."""
+        # Create hash from encoder name and texts
+        hasher = hashlib.sha256()
+        hasher.update(encoder_name.encode("utf-8"))
+        for text in texts:
+            hasher.update(str(text).encode("utf-8"))
+        return hasher.hexdigest()
+
+    def _load_cached_embeddings(self, cache_key: str) -> np.ndarray | None:
+        """Load embeddings from cache if they exist."""
+        if not self.embeddings_cache_dir:
+            return None
+
+        cache_path = os.path.join(self.embeddings_cache_dir, f"{cache_key}.pkl")
+        if os.path.exists(cache_path):
+            print(f"Loading cached embeddings from {cache_path}")
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        return None
+
+    def _save_cached_embeddings(self, embeddings: np.ndarray, cache_key: str) -> None:
+        """Save embeddings to cache."""
+        if not self.embeddings_cache_dir:
+            return
+
+        cache_path = os.path.join(self.embeddings_cache_dir, f"{cache_key}.pkl")
+        print(f"Saving embeddings to cache: {cache_path}")
+        with open(cache_path, "wb") as f:
+            pickle.dump(embeddings, f)
+
     def build_graph_data(
         self,
         texts: np.ndarray,
         citation_graph: dict[int, list[int]],
         text_encoder: SentenceTransformer,
     ) -> Data:
-        print("Encoding texts...")
-        text_embeddings = text_encoder.encode(
-            texts.tolist(),
-            batch_size=self.batch_size,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-        )
+        # Try to load cached embeddings
+        cache_key = self._compute_cache_key(texts, self.text_encoder_name)
+        text_embeddings = self._load_cached_embeddings(cache_key)
+
+        if text_embeddings is None:
+            print("Encoding texts...")
+            text_embeddings = text_encoder.encode(
+                texts.tolist(),
+                batch_size=self.batch_size,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+            )
+            # Save to cache for future use
+            self._save_cached_embeddings(text_embeddings, cache_key)
+        else:
+            print("Using cached embeddings")
 
         x = torch.tensor(text_embeddings, dtype=torch.float32)
 

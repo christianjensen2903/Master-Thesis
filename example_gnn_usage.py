@@ -19,17 +19,18 @@ from evaluator import Evaluator
 
 
 def train_example() -> None:
-    """Example: Train a GNN model."""
+    """Example: Train a GNN model with embeddings caching."""
     print("\n" + "=" * 80)
     print("Training GNN Model")
     print("=" * 80 + "\n")
 
-    # Initialize trainer
+    # Initialize trainer with embeddings caching
+    # Set embeddings_cache_dir to cache text embeddings for faster subsequent runs
     trainer = GNNTrainer(
         text_encoder_name="sentence-transformers/all-MiniLM-L6-v2",
-        hidden_dim=256,
+        hidden_dim=64,
         output_dim=192,
-        num_layers=3,
+        num_layers=2,
         num_heads=2,
         dropout=0.2,
         output_path="checkpoints/gnn",
@@ -40,6 +41,7 @@ def train_example() -> None:
         num_negatives=2,
         validation_split=0.1,
         use_wandb=True,
+        embeddings_cache_dir="artifacts/embeddings_cache",  # Cache embeddings here
     )
 
     # Train on paragraph pairs
@@ -90,9 +92,9 @@ def evaluate_gnn_map(
     retriever = GNNRetriever(
         model_path=model_path,
         text_encoder_name="sentence-transformers/all-MiniLM-L6-v2",
-        hidden_dim=256,
+        hidden_dim=64,
         output_dim=192,
-        num_layers=3,
+        num_layers=2,
         num_heads=2,
     )
 
@@ -126,5 +128,4 @@ def evaluate_gnn_map(
 
 if __name__ == "__main__":
     train_example()
-    # inference_example()
     evaluate_gnn_map()
