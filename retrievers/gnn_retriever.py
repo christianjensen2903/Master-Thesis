@@ -1,89 +1,16 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GATv2Conv, global_mean_pool  # type: ignore
 from torch_geometric.data import Data  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from .base_retriever import BaseRetriever
-
-
-class GNNEncoder(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 256,
-        output_dim: int = 384,
-        num_layers: int = 3,
-        num_heads: int = 4,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.num_layers = num_layers
-        self.dropout = dropout
-
-        # Input projection
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-
-        # GAT layers
-        self.gat_layers = nn.ModuleList()
-        norm_dims: list[int] = []
-        # Track feature dimension flowing through layers (post input projection)
-        prev_dim = hidden_dim
-        for i in range(num_layers):
-            in_channels = prev_dim
-            is_last_layer = i == num_layers - 1
-            out_channels = hidden_dim if not is_last_layer else output_dim
-            heads = num_heads if not is_last_layer else 1
-            concat = not is_last_layer
-
-            self.gat_layers.append(
-                GATv2Conv(
-                    in_channels,
-                    out_channels,
-                    heads=heads,
-                    dropout=dropout,
-                    concat=concat,
-                )
-            )
-
-            # Determine the output feature dimension of this layer for LayerNorm
-            layer_out_dim = out_channels * heads if concat else out_channels
-            norm_dims.append(layer_out_dim)
-            prev_dim = layer_out_dim
-
-        # Layer normalization with correct per-layer feature sizes
-        self.layer_norms = nn.ModuleList([nn.LayerNorm(d) for d in norm_dims])
-
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        # Input projection
-        x = self.input_proj(x)
-        x = torch.relu(x)
-
-        # Apply GAT layers
-        for i, (gat, norm) in enumerate(zip(self.gat_layers, self.layer_norms)):
-            x_new = gat(x, edge_index)
-            x_new = norm(x_new)
-
-            if i < self.num_layers - 1:
-                x_new = torch.relu(x_new)
-                x_new = torch.dropout(x_new, p=self.dropout, train=self.training)
-                # Residual connection
-                if x_new.shape == x.shape:
-                    x = x + x_new
-                else:
-                    x = x_new
-            else:
-                x = x_new
-
-        return x
+from typing import cast
 
 
 class GNNRetriever(BaseRetriever):
     def __init__(
         self,
+        gnn_model: nn.Module,
         model_path: str | None = None,
         text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         hidden_dim: int = 256,
@@ -94,7 +21,7 @@ class GNNRetriever(BaseRetriever):
         batch_size: int = 32,
         device: str | None = None,
         normalize_embeddings: bool = True,
-    ):
+    ) -> None:
         self.text_encoder_name = text_encoder_name
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
@@ -103,27 +30,52 @@ class GNNRetriever(BaseRetriever):
         self.dropout = dropout
         self.batch_size = batch_size
         self.normalize_embeddings = normalize_embeddings
+        self.architecture = "external"
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
 
+        # If loading from a checkpoint, try to read config first to determine text encoder/architecture
+        checkpoint_config: dict[str, object] | None = None
+        if model_path is not None:
+            try:
+                checkpoint = torch.load(model_path, map_location="cpu")
+                checkpoint_config = (
+                    checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+                )
+                if isinstance(checkpoint_config, dict):
+                    te_name = checkpoint_config.get(
+                        "text_encoder"
+                    ) or checkpoint_config.get("text_encoder_name")
+                    if isinstance(te_name, str):
+                        self.text_encoder_name = te_name
+                    arch = checkpoint_config.get("architecture")
+                    if isinstance(arch, str):
+                        self.architecture = arch
+            except Exception:
+                pass
+
         # Initialize text encoder
-        self.text_encoder = SentenceTransformer(text_encoder_name)
+        self.text_encoder = SentenceTransformer(self.text_encoder_name)
         input_dim = self.text_encoder.get_sentence_embedding_dimension()
         if input_dim is None:
             raise ValueError("Text encoder does not provide embedding dimension")
 
-        # Initialize GNN model
-        self.gnn_model = GNNEncoder(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
-            num_layers=num_layers,
-            num_heads=num_heads,
-            dropout=dropout,
-        ).to(self.device)
+        # Use provided GNN model
+        self.gnn_model: BaseGNNEncoder
+        self.gnn_model = cast(BaseGNNEncoder, gnn_model.to(self.device))
+
+        # Validate input dimension compatibility when possible
+        try:
+            model_input_dim = cast(int, getattr(self.gnn_model, "input_dim"))
+            if model_input_dim != input_dim:
+                raise ValueError(
+                    f"Provided GNN model input_dim={model_input_dim} does not match text encoder dim={input_dim}"
+                )
+        except AttributeError:
+            pass
 
         # Load pretrained weights if provided
         if model_path is not None:
@@ -135,7 +87,13 @@ class GNNRetriever(BaseRetriever):
 
     def load_model(self, model_path: str) -> None:
         checkpoint = torch.load(model_path, map_location=self.device)
-        self.gnn_model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = (
+            checkpoint.get("model_state_dict") if isinstance(checkpoint, dict) else None
+        )
+        if state_dict is None:
+            raise ValueError("Checkpoint missing 'model_state_dict'")
+        self.gnn_model.load_state_dict(state_dict)  # type: ignore[arg-type]
+        cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
         self.gnn_model.eval()
 
     def save_model(self, model_path: str) -> None:
@@ -143,7 +101,8 @@ class GNNRetriever(BaseRetriever):
             {
                 "model_state_dict": self.gnn_model.state_dict(),
                 "config": {
-                    "text_encoder_name": self.text_encoder_name,
+                    "architecture": "external",
+                    "text_encoder": self.text_encoder_name,
                     "hidden_dim": self.hidden_dim,
                     "output_dim": self.output_dim,
                     "num_layers": self.num_layers,

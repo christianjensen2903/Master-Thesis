@@ -13,18 +13,19 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.data import Data  # type: ignore
 from tqdm import tqdm  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
-from retrievers.gnn_retriever import GNNEncoder
 from utils.temporal_graph import (
     build_temporal_dag,
     validate_temporal_dag,
     print_temporal_graph_stats,
 )
 from sentence_trainers.base_trainer import BaseTrainer
+from typing import cast
 
 
 class GNNTrainer(BaseTrainer):
     def __init__(
         self,
+        gnn_model: nn.Module,
         text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         hidden_dim: int = 256,
         output_dim: int = 384,
@@ -39,6 +40,7 @@ class GNNTrainer(BaseTrainer):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.gnn_model = gnn_model
         self.text_encoder_name = text_encoder_name
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
@@ -465,16 +467,19 @@ class GNNTrainer(BaseTrainer):
             all_texts, temporal_dag, text_encoder, precomputed_embeddings
         )
 
-        # Initialize GNN model
-        print(f"\nInitializing GNN model...")
-        model = GNNEncoder(
-            input_dim=input_dim,
-            hidden_dim=self.hidden_dim,
-            output_dim=self.output_dim,
-            num_layers=self.num_layers,
-            num_heads=self.num_heads,
-            dropout=self.dropout,
-        ).to(self.device)
+        # Use provided GNN model
+        print("\nInitializing provided GNN model...")
+        model = self.gnn_model.to(self.device)
+
+        # Validate input dimension compatibility when possible
+        try:
+            model_input_dim = cast(int, getattr(self.gnn_model, "input_dim"))
+            if model_input_dim != input_dim:
+                raise ValueError(
+                    f"Provided GNN model input_dim={model_input_dim} does not match text encoder dim={input_dim}"
+                )
+        except AttributeError:
+            pass
 
         # Initialize optimizer and scheduler
         optimizer = AdamW(
@@ -486,7 +491,7 @@ class GNNTrainer(BaseTrainer):
 
         # Setup wandb
         config = {
-            "model_type": "GNN-GAT",
+            "model_type": "GNN-External",
             "text_encoder": self.text_encoder_name,
             "hidden_dim": self.hidden_dim,
             "output_dim": self.output_dim,

@@ -4,6 +4,7 @@ import pickle
 import os
 from gnn_trainers import GNNTrainer
 from retrievers import GNNRetriever, DenseRetriever, TfidfRetriever
+from models import GraphSAGEEncoder, GATv2Encoder, GCNEncoder
 from data_loader import (
     load_citation_data,
     split_train_test,
@@ -28,7 +29,9 @@ def train_example() -> None:
 
     # Initialize trainer with embeddings caching
     # Set embeddings_cache_dir to cache text embeddings for faster subsequent runs
+    model = GraphSAGEEncoder(input_dim=384, hidden_dim=64, output_dim=192, num_layers=2)
     trainer = GNNTrainer(
+        gnn_model=model,
         text_encoder_name="sentence-transformers/all-MiniLM-L6-v2",
         hidden_dim=64,
         output_dim=192,
@@ -43,7 +46,7 @@ def train_example() -> None:
         num_negatives=2,
         validation_split=0.1,
         use_wandb=True,
-        embeddings_cache_dir="artifacts/embeddings_cache",  # Cache embeddings here
+        embeddings_cache_dir="artifacts/embeddings_cache",
     )
 
     # Train on paragraph pairs
@@ -91,7 +94,11 @@ def evaluate_gnn_map(
 
     # Initialize retriever
     print("\nInitializing GNN retriever...")
+    retriever_model = GraphSAGEEncoder(
+        input_dim=384, hidden_dim=64, output_dim=192, num_layers=2
+    )
     retriever = GNNRetriever(
+        gnn_model=retriever_model,
         model_path=model_path,
         text_encoder_name="sentence-transformers/all-MiniLM-L6-v2",
         hidden_dim=64,
