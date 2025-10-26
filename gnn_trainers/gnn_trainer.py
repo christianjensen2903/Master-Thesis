@@ -2,6 +2,7 @@ import os
 import random
 import pickle
 import hashlib
+import wandb
 import pandas as pd  # type: ignore
 import numpy as np
 import torch
@@ -172,9 +173,9 @@ class GNNTrainer(BaseTrainer):
         else:
             # Try to load cached embeddings
             cache_key = self._compute_cache_key(texts, self.text_encoder_name)
-            text_embeddings = self._load_cached_embeddings(cache_key)
+            cached_embeddings = self._load_cached_embeddings(cache_key)
 
-            if text_embeddings is None:
+            if cached_embeddings is None:
                 print("Encoding texts...")
                 text_embeddings = text_encoder.encode(
                     texts.tolist(),
@@ -186,6 +187,7 @@ class GNNTrainer(BaseTrainer):
                 self._save_cached_embeddings(text_embeddings, cache_key)
             else:
                 print("Using cached embeddings")
+                text_embeddings = cached_embeddings
 
         x = torch.tensor(text_embeddings, dtype=torch.float32)
 
@@ -497,6 +499,7 @@ class GNNTrainer(BaseTrainer):
             "num_negatives": self.num_negatives,
             "batch_size": self.batch_size,
             "epochs": self.epochs,
+            "eval_every_n_epochs": self.eval_every_n_epochs,
             "num_nodes": len(all_texts),
             "num_train_edges": sum(len(v) for k, v in temporal_dag.items()),
             "num_val_edges": sum(len(v) for k, v in val_citation_graph.items()),
@@ -514,9 +517,17 @@ class GNNTrainer(BaseTrainer):
 
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
+            if self.use_wandb:
+                wandb.log(
+                    {
+                        "epoch": epoch + 1,
+                        "train_loss": train_loss,
+                    }
+                )
 
-            # Evaluate on validation set
-            if (epoch + 1) % max(1, self.epochs // 5) == 0:
+            # Evaluate on validation set based on configured frequency
+            eval_interval = self.eval_every_n_epochs or max(1, self.epochs // 5)
+            if (epoch + 1) % eval_interval == 0:
                 val_metrics = self.evaluate(model, graph_data, val_citation_graph)
                 print(f"  Validation MRR: {val_metrics['mrr']:.4f}")
                 print(f"  Validation MAP: {val_metrics['map']:.4f}")
@@ -526,12 +537,9 @@ class GNNTrainer(BaseTrainer):
                 print(f"  Recall@100: {val_metrics['recall@100']:.4f}")
 
                 if self.use_wandb:
-                    import wandb
-
                     wandb.log(
                         {
                             "epoch": epoch + 1,
-                            "train_loss": train_loss,
                             "val_mrr": val_metrics["mrr"],
                             "val_map": val_metrics["map"],
                             "val_recall@5": val_metrics["recall@5"],

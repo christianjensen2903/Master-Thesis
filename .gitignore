@@ -11,3 +11,5 @@ artifacts
 *.pyc
 eurlex_rdf
 *.jsonl
+checkpoints
+wandb

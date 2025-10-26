@@ -22,6 +22,7 @@ class BaseTrainer(ABC):
         warmup_steps: int = 100,
         checkpoint_save_steps: int = 1000,
         evaluation_steps: int = 1000,
+        eval_every_n_epochs: int | None = None,
         show_progress_bar: bool = True,
         validation_split: float = 0.1,
         use_wandb: bool = True,
@@ -34,6 +35,7 @@ class BaseTrainer(ABC):
         self.warmup_steps = warmup_steps
         self.checkpoint_save_steps = checkpoint_save_steps
         self.evaluation_steps = evaluation_steps
+        self.eval_every_n_epochs = eval_every_n_epochs
         self.show_progress_bar = show_progress_bar
         self.validation_split = validation_split
         self.use_wandb = use_wandb
