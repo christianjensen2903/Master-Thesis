@@ -2,9 +2,9 @@ import pandas as pd  # type: ignore
 import numpy as np
 import pickle
 import os
+from torch_geometric.nn.models import GraphSAGE  # type: ignore
 from gnn_trainers import GNNTrainer
-from retrievers import GNNRetriever, DenseRetriever, TfidfRetriever
-from models import GraphSAGEEncoder, GATv2Encoder, GCNEncoder
+from retrievers import GNNRetriever, DenseRetriever
 from data_loader import (
     load_citation_data,
     split_train_test,
@@ -29,7 +29,15 @@ def train_example() -> None:
 
     # Initialize trainer with embeddings caching
     # Set embeddings_cache_dir to cache text embeddings for faster subsequent runs
-    model = GraphSAGEEncoder(input_dim=384, hidden_dim=64, output_dim=192, num_layers=2)
+    model = GraphSAGE(
+        in_channels=384,
+        hidden_channels=64,
+        out_channels=192,
+        num_layers=2,
+        dropout=0.2,
+        act="relu",
+        norm="layer_norm",
+    )
     trainer = GNNTrainer(
         gnn_model=model,
         text_encoder_name="sentence-transformers/all-MiniLM-L6-v2",
@@ -94,8 +102,14 @@ def evaluate_gnn_map(
 
     # Initialize retriever
     print("\nInitializing GNN retriever...")
-    retriever_model = GraphSAGEEncoder(
-        input_dim=384, hidden_dim=64, output_dim=192, num_layers=2
+    retriever_model = GraphSAGE(
+        in_channels=384,
+        hidden_channels=64,
+        out_channels=192,
+        num_layers=2,
+        dropout=0.2,
+        act="relu",
+        norm="layer_norm",
     )
     retriever = GNNRetriever(
         gnn_model=retriever_model,
