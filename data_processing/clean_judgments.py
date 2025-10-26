@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 from text_cleaner import TextCleaner
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore
 
 
 def clean_judgments(
@@ -39,9 +39,8 @@ def clean_judgments(
     total_paragraphs = 0
     cleaned_paragraphs = 0
 
-    for judgment in tqdm(judgments, desc="Cleaning judgments"):
+    for celex_id, judgment in tqdm(judgments.items(), desc="Cleaning judgments"):
         cleaned_judgment = {
-            "celex_id": judgment["celex_id"],
             "paragraphs": {},
             "meta": judgment.get("meta", {}),
         }
