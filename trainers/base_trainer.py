@@ -1,3 +1,4 @@
+import os
 import pandas as pd  # type: ignore
 import wandb
 from sentence_transformers import SentenceTransformer
@@ -37,6 +38,9 @@ class BaseTrainer(ABC):
         self.validation_split = validation_split
         self.use_wandb = use_wandb
         self.project_name = project_name
+
+        # Create output directory if it doesn't exist
+        os.makedirs(self.output_path, exist_ok=True)
 
     def load_and_split_data(
         self, paragraph_file: str, cutoff_date: pd.Timestamp
