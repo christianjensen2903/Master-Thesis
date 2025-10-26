@@ -1,0 +1,284 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch_geometric.nn import GATv2Conv, global_mean_pool  # type: ignore
+from torch_geometric.data import Data  # type: ignore
+from sentence_transformers import SentenceTransformer  # type: ignore
+from .base_retriever import BaseRetriever
+
+
+class GNNEncoder(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 256,
+        output_dim: int = 384,
+        num_layers: int = 3,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        # GAT layers
+        self.gat_layers = nn.ModuleList()
+        norm_dims: list[int] = []
+        # Track feature dimension flowing through layers (post input projection)
+        prev_dim = hidden_dim
+        for i in range(num_layers):
+            in_channels = prev_dim
+            is_last_layer = i == num_layers - 1
+            out_channels = hidden_dim if not is_last_layer else output_dim
+            heads = num_heads if not is_last_layer else 1
+            concat = not is_last_layer
+
+            self.gat_layers.append(
+                GATv2Conv(
+                    in_channels,
+                    out_channels,
+                    heads=heads,
+                    dropout=dropout,
+                    concat=concat,
+                )
+            )
+
+            # Determine the output feature dimension of this layer for LayerNorm
+            layer_out_dim = out_channels * heads if concat else out_channels
+            norm_dims.append(layer_out_dim)
+            prev_dim = layer_out_dim
+
+        # Layer normalization with correct per-layer feature sizes
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(d) for d in norm_dims])
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        # Input projection
+        x = self.input_proj(x)
+        x = torch.relu(x)
+
+        # Apply GAT layers
+        for i, (gat, norm) in enumerate(zip(self.gat_layers, self.layer_norms)):
+            x_new = gat(x, edge_index)
+            x_new = norm(x_new)
+
+            if i < self.num_layers - 1:
+                x_new = torch.relu(x_new)
+                x_new = torch.dropout(x_new, p=self.dropout, train=self.training)
+                # Residual connection
+                if x_new.shape == x.shape:
+                    x = x + x_new
+                else:
+                    x = x_new
+            else:
+                x = x_new
+
+        return x
+
+
+class GNNRetriever(BaseRetriever):
+    def __init__(
+        self,
+        model_path: str | None = None,
+        text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        hidden_dim: int = 256,
+        output_dim: int = 384,
+        num_layers: int = 3,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        batch_size: int = 32,
+        device: str | None = None,
+        normalize_embeddings: bool = True,
+    ):
+        self.text_encoder_name = text_encoder_name
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.batch_size = batch_size
+        self.normalize_embeddings = normalize_embeddings
+
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
+        # Initialize text encoder
+        self.text_encoder = SentenceTransformer(text_encoder_name)
+        input_dim = self.text_encoder.get_sentence_embedding_dimension()
+        if input_dim is None:
+            raise ValueError("Text encoder does not provide embedding dimension")
+
+        # Initialize GNN model
+        self.gnn_model = GNNEncoder(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+        ).to(self.device)
+
+        # Load pretrained weights if provided
+        if model_path is not None:
+            self.load_model(model_path)
+
+        self._is_fitted = False
+        self.graph_data: Data | None = None
+        self.text_to_node_id: dict[str, int] = {}
+
+    def load_model(self, model_path: str) -> None:
+        checkpoint = torch.load(model_path, map_location=self.device)
+        self.gnn_model.load_state_dict(checkpoint["model_state_dict"])
+        self.gnn_model.eval()
+
+    def save_model(self, model_path: str) -> None:
+        torch.save(
+            {
+                "model_state_dict": self.gnn_model.state_dict(),
+                "config": {
+                    "text_encoder_name": self.text_encoder_name,
+                    "hidden_dim": self.hidden_dim,
+                    "output_dim": self.output_dim,
+                    "num_layers": self.num_layers,
+                    "num_heads": self.num_heads,
+                    "dropout": self.dropout,
+                },
+            },
+            model_path,
+        )
+
+    def build_graph(
+        self,
+        texts: np.ndarray,
+        citation_graph: dict[int, list[int]] | None = None,
+    ) -> Data:
+        # Encode texts with text encoder
+        print("Encoding texts with text encoder...")
+        text_embeddings = self.text_encoder.encode(
+            texts.tolist(),
+            batch_size=self.batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+
+        x = torch.tensor(text_embeddings, dtype=torch.float32)
+
+        # Build edge index from citation graph
+        if citation_graph is not None:
+            edge_list = []
+            for src, targets in citation_graph.items():
+                for tgt in targets:
+                    if src < len(texts) and tgt < len(texts):
+                        edge_list.append([src, tgt])
+                        # Add reverse edge for undirected graph
+                        edge_list.append([tgt, src])
+
+            if edge_list:
+                edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+            else:
+                # Empty graph - no edges
+                edge_index = torch.empty((2, 0), dtype=torch.long)
+        else:
+            # No citation graph provided - fully connected within batches
+            # or use k-NN based on text similarity
+            edge_index = self._build_knn_graph(text_embeddings, k=10)
+
+        return Data(x=x, edge_index=edge_index)
+
+    def _build_knn_graph(self, embeddings: np.ndarray, k: int = 10) -> torch.Tensor:
+        from sklearn.neighbors import NearestNeighbors  # type: ignore
+
+        # Build k-NN graph based on cosine similarity
+        knn = NearestNeighbors(n_neighbors=min(k + 1, len(embeddings)), metric="cosine")
+        knn.fit(embeddings)
+        distances, indices = knn.kneighbors(embeddings)
+
+        edge_list = []
+        for i, neighbors in enumerate(indices):
+            for j in neighbors[1:]:  # Skip self
+                edge_list.append([i, j])
+
+        if edge_list:
+            return torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+        else:
+            return torch.empty((2, 0), dtype=torch.long)
+
+    def fit(
+        self,
+        texts: np.ndarray,
+        mask: np.ndarray | None = None,
+        citation_graph: dict[int, list[int]] | None = None,
+        paragraph_dates: np.ndarray | None = None,
+    ) -> None:
+        """
+        Fit the retriever on a collection of texts.
+
+        Args:
+            texts: Array of paragraph texts
+            mask: Optional boolean mask (unused for GNN, kept for compatibility)
+            citation_graph: Citation graph (should be temporal DAG for causal inference)
+            paragraph_dates: Optional dates for temporal masking during inference
+        """
+        # Build graph structure
+        self.graph_data = self.build_graph(texts, citation_graph)
+        self.text_to_node_id = {text: i for i, text in enumerate(texts)}
+        self.paragraph_dates = paragraph_dates
+        self._is_fitted = True
+
+    def transform(self, texts: np.ndarray) -> np.ndarray:
+        if not self._is_fitted or self.graph_data is None:
+            raise ValueError("Model not fitted. Call fit() first.")
+
+        self.gnn_model.eval()
+
+        with torch.no_grad():
+            # Move data to device
+            x = self.graph_data.x.to(self.device)
+            edge_index = self.graph_data.edge_index.to(self.device)
+
+            # Forward pass through GNN
+            embeddings = self.gnn_model(x, edge_index)
+
+            # Normalize embeddings
+            if self.normalize_embeddings:
+                embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+            embeddings = embeddings.cpu().numpy()
+
+        # Map requested texts to their embeddings
+        result = np.zeros((len(texts), embeddings.shape[1]), dtype=np.float32)
+        for i, text in enumerate(texts):
+            node_id = self.text_to_node_id.get(text)
+            if node_id is not None and node_id < len(embeddings):
+                result[i] = embeddings[node_id]
+
+        return result
+
+    def retrieve(
+        self,
+        query_idx: int,
+        embeddings: np.ndarray,
+        candidate_indices: np.ndarray,
+        top_k: int | None = None,
+    ) -> np.ndarray:
+        query_vec = embeddings[query_idx]
+        candidate_vecs = embeddings[candidate_indices]
+
+        # Cosine similarity (embeddings should be normalized)
+        similarities = candidate_vecs @ query_vec
+
+        # Use efficient top-k selection if requested
+        if top_k is not None and top_k < len(similarities):
+            top_k_indices = np.argpartition(-similarities, top_k)[:top_k]
+            sorted_top_k = top_k_indices[np.argsort(-similarities[top_k_indices])]
+            return candidate_indices[sorted_top_k]
+        else:
+            ranked_order = np.argsort(-similarities)
+            return candidate_indices[ranked_order]
