@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.data import Data  # type: ignore
-from torch_geometric.loader import NeighborLoader  # type: ignore
 from tqdm import tqdm  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from retrievers.gnn_retriever import GNNEncoder
@@ -33,8 +32,6 @@ class GNNTrainer(BaseTrainer):
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
         num_negatives: int = 5,
-        neighbor_batch_size: int = 32,
-        num_neighbors: list[int] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -48,9 +45,6 @@ class GNNTrainer(BaseTrainer):
         self.weight_decay = weight_decay
         self.temperature = temperature
         self.num_negatives = num_negatives
-        self.neighbor_batch_size = neighbor_batch_size
-        # Fewer neighbors per layer to keep subgraphs small
-        self.num_neighbors = num_neighbors or [10, 5]
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -198,109 +192,71 @@ class GNNTrainer(BaseTrainer):
         epoch: int,
     ) -> float:
         model.train()
-        total_loss = 0.0
-        num_batches = 0
 
-        # Mini-batch over subgraphs to avoid full-graph OOM
-        # Use only nodes with citations as seeds to maximize useful pairs
-        seed_nodes_with_citations = torch.tensor(
-            list(citation_graph.keys()), dtype=torch.long
+        # Move graph to device
+        x = graph_data.x.to(self.device)
+        edge_index = graph_data.edge_index.to(self.device)
+
+        # Forward pass on entire graph
+        embeddings = model(x, edge_index)
+
+        # Build anchor/positive pairs from citation graph
+        anchor_ids: list[int] = []
+        positive_ids: list[int] = []
+        for anchor_id, cited_ids in citation_graph.items():
+            if cited_ids and anchor_id < len(embeddings):
+                # Sample one positive for each anchor
+                valid_cited = [c for c in cited_ids if c < len(embeddings)]
+                if valid_cited:
+                    anchor_ids.append(anchor_id)
+                    positive_ids.append(random.choice(valid_cited))
+
+        if not anchor_ids:
+            return 0.0
+
+        # Sample negatives (excluding anchor and cited nodes)
+        num_nodes = len(embeddings)
+        negative_ids: list[list[int]] = []
+        for i, anchor_id in enumerate(anchor_ids):
+            cited_set = set(citation_graph.get(anchor_id, []))
+            excluded = cited_set.union({anchor_id})
+            candidates = [n for n in range(num_nodes) if n not in excluded]
+
+            if len(candidates) >= self.num_negatives:
+                sampled = random.sample(candidates, self.num_negatives)
+            else:
+                # Pad with random choices if needed
+                sampled = candidates.copy()
+                while len(sampled) < self.num_negatives and candidates:
+                    sampled.append(random.choice(candidates))
+                # Final fallback
+                while len(sampled) < self.num_negatives:
+                    sampled.append(0)
+            negative_ids.append(sampled)
+
+        # Gather embeddings
+        anchor_tensor = torch.tensor(anchor_ids, dtype=torch.long, device=self.device)
+        positive_tensor = torch.tensor(
+            positive_ids, dtype=torch.long, device=self.device
         )
-        loader = NeighborLoader(
-            graph_data,
-            num_neighbors=self.num_neighbors,
-            batch_size=self.neighbor_batch_size,
-            shuffle=True,
-            input_nodes=seed_nodes_with_citations,
-            num_workers=0,
+        negative_tensor = torch.tensor(
+            negative_ids, dtype=torch.long, device=self.device
         )
 
-        for batch in tqdm(loader, desc=f"Epoch {epoch + 1}"):
-            # Map from original ids to local indices in subgraph
-            n_id: torch.Tensor = batch.n_id
-            local_index_of = {int(orig): int(local) for local, orig in enumerate(n_id)}
+        anchor_emb = embeddings[anchor_tensor]
+        positive_emb = embeddings[positive_tensor]
+        negative_emb = embeddings[negative_tensor]
 
-            # Seed nodes are the first `batch_size` nodes
-            seed_count = int(
-                getattr(batch, "batch_size", min(len(n_id), self.neighbor_batch_size))
-            )
-            seed_orig_ids = [int(i) for i in n_id[:seed_count].tolist()]
+        # Compute loss
+        loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
 
-            # Build anchor/positive pairs where positive exists inside the subgraph
-            anchor_orig: list[int] = []
-            positive_orig: list[int] = []
-            for a in seed_orig_ids:
-                cited = citation_graph.get(a, [])
-                # Keep only positives present in this subgraph
-                cited_in_sub = [p for p in cited if p in local_index_of]
-                if cited_in_sub:
-                    anchor_orig.append(a)
-                    positive_orig.append(random.choice(cited_in_sub))
+        # Backward pass
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
-            if not anchor_orig:
-                continue
-
-            # Sample negatives from nodes present in this subgraph (excluding cited + anchor)
-            all_local_nodes = [int(i) for i in range(len(n_id))]
-            all_orig_nodes = [int(o) for o in n_id.tolist()]
-            negative_local: list[list[int]] = []
-            for a in anchor_orig:
-                cited_set = set(citation_graph.get(a, []))
-                excluded_orig = cited_set.union({a})
-                candidates_orig = [o for o in all_orig_nodes if o not in excluded_orig]
-                if not candidates_orig:
-                    # Fallback to any local node except anchor
-                    candidates_orig = [o for o in all_orig_nodes if o != a]
-                # Map to local indices and sample
-                candidates_local = [local_index_of[o] for o in candidates_orig]
-                if len(candidates_local) >= self.num_negatives:
-                    sampled = random.sample(candidates_local, self.num_negatives)
-                else:
-                    # Pad with random choices if needed
-                    sampled = candidates_local.copy()
-                    while len(sampled) < self.num_negatives and candidates_local:
-                        sampled.append(random.choice(candidates_local))
-                    while len(sampled) < self.num_negatives:
-                        sampled.append(0)
-                negative_local.append(sampled)
-
-            # Forward on subgraph
-            x = batch.x.to(self.device)
-            edge_index = batch.edge_index.to(self.device)
-            embeddings_local = model(x, edge_index)
-
-            # Gather embeddings for anchors/positives/negatives
-            anchor_local = torch.tensor(
-                [local_index_of[a] for a in anchor_orig],
-                dtype=torch.long,
-                device=self.device,
-            )
-            positive_local = torch.tensor(
-                [local_index_of[p] for p in positive_orig],
-                dtype=torch.long,
-                device=self.device,
-            )
-            negative_local_t = torch.tensor(
-                negative_local, dtype=torch.long, device=self.device
-            )
-
-            anchor_emb = embeddings_local[anchor_local]
-            positive_emb = embeddings_local[positive_local]
-            negative_emb = embeddings_local[negative_local_t]
-
-            # Compute loss
-            loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
-
-            # Backward pass
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            total_loss += float(loss.item())
-            num_batches += 1
-
-        return total_loss / num_batches if num_batches > 0 else 0.0
+        return float(loss.item())
 
     @torch.no_grad()
     def evaluate(
@@ -311,26 +267,12 @@ class GNNTrainer(BaseTrainer):
     ) -> dict[str, float]:
         model.eval()
 
-        # Compute embeddings for all nodes via NeighborLoader in mini-batches
-        embeddings = np.zeros((graph_data.num_nodes, self.output_dim), dtype=np.float32)
-        loader = NeighborLoader(
-            graph_data,
-            num_neighbors=self.num_neighbors,
-            batch_size=self.neighbor_batch_size,
-            shuffle=False,
-        )
+        # Compute embeddings for all nodes in one forward pass
+        x = graph_data.x.to(self.device)
+        edge_index = graph_data.edge_index.to(self.device)
 
-        with torch.no_grad():
-            for batch in tqdm(loader, desc="Evaluating"):
-                if int(getattr(batch, "batch_size", 0)) == 0:
-                    continue
-                seed_cnt = int(getattr(batch, "batch_size", len(batch.n_id)))
-                x = batch.x.to(self.device)
-                edge_index = batch.edge_index.to(self.device)
-                out = model(x, edge_index)
-                out = F.normalize(out[:seed_cnt], p=2, dim=1).cpu().numpy()
-                seed_orig = batch.n_id[:seed_cnt].cpu().numpy()
-                embeddings[seed_orig] = out
+        embeddings = model(x, edge_index)
+        embeddings = F.normalize(embeddings, p=2, dim=1).cpu().numpy()
 
         # Compute MRR and Recall@k
         ranks = []
