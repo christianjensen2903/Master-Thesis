@@ -1,10 +1,17 @@
 """
-Training modules for different approaches.
+Sentence transformer training modules.
 """
 
 from .base_trainer import BaseTrainer  # type: ignore
+from .base_triplet_trainer import BaseTripletTrainer  # type: ignore
 from .hard_negative_trainer import HardNegativeTrainer  # type: ignore
 from .semi_hard_trainer import SemiHardTrainer  # type: ignore
 from .simcse_trainer import SimCSETrainer  # type: ignore
 
-__all__ = ["BaseTrainer", "HardNegativeTrainer", "SemiHardTrainer", "SimCSETrainer"]
+__all__ = [
+    "BaseTrainer",
+    "BaseTripletTrainer",
+    "HardNegativeTrainer",
+    "SemiHardTrainer",
+    "SimCSETrainer",
+]

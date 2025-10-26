@@ -1,6 +1,6 @@
 import pandas as pd  # type: ignore
 import numpy as np
-from trainers.gnn_trainer import GNNTrainer
+from gnn_trainers import GNNTrainer
 from retrievers import GNNRetriever, DenseRetriever, TfidfRetriever
 from data_loader import (
     load_citation_data,

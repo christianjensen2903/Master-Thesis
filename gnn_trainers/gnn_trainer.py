@@ -16,7 +16,7 @@ from utils.temporal_graph import (
     validate_temporal_dag,
     print_temporal_graph_stats,
 )
-from .base_trainer import BaseTrainer
+from sentence_trainers.base_trainer import BaseTrainer
 
 
 class GNNTrainer(BaseTrainer):
