@@ -163,8 +163,9 @@ if __name__ == "__main__":
     from retrievers import TfidfRetriever
     from data_loader import load_citation_data, split_train_test, build_paragraph_index
 
+    csv_path = "data/par-to-par-2.csv"
     print("Loading data...")
-    df, metadata = load_citation_data()
+    df, metadata = load_citation_data(csv_path=csv_path)
     train_meta, test_meta = split_train_test(metadata, cutoff_year=2018)
 
     print("Building paragraph index...")
@@ -193,6 +194,7 @@ if __name__ == "__main__":
     evaluator = Evaluator(
         retriever=retriever,
         embeddings=embeddings,
-        top_k=1000,  # Use MAP@1000 for faster evaluation, or None for full MAP
+        top_k=10000,
+        csv_path=csv_path,
     )
     evaluator.run()
