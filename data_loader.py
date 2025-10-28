@@ -8,7 +8,7 @@ from tqdm import tqdm  # type: ignore
 
 
 def load_citation_data(
-    csv_path: str = "data/par-to-par-og.csv",
+    csv_path: str = "data/par-to-par-cleaned.csv",
     metadata_path: str = "data/par-to-par.json",
 ) -> tuple[pd.DataFrame, dict]:
     """

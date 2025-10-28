@@ -17,7 +17,7 @@ class Evaluator:
         self,
         retriever: BaseRetriever,
         embeddings: NDArray,
-        csv_path: str = "data/par-to-par-og.csv",
+        csv_path: str = "data/par-to-par-cleaned.csv",
         metadata_path: str = "data/par-to-par.json",
         train_cutoff_year: int = 2018,
         top_k: int | None = None,
@@ -131,7 +131,7 @@ class Evaluator:
                     if good == num_rel:
                         break
 
-            ap = float(np.mean(precisions)) if precisions else 0.0
+            ap = float(np.sum(precisions) / num_rel) if precisions else 0.0
             avg_precs.append(ap)
 
         self.map_score = float(np.mean(avg_precs)) if avg_precs else 0.0
