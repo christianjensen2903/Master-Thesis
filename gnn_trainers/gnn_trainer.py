@@ -18,39 +18,38 @@ from utils.temporal_graph import (
     validate_temporal_dag,
     print_temporal_graph_stats,
 )
-from sentence_trainers.base_trainer import BaseTrainer
-from typing import cast
+from validation_utils import split_data_by_date
 
 
-class GNNTrainer(BaseTrainer):
+class GNNTrainer:
     def __init__(
         self,
-        gnn_model: nn.Module,
         text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        hidden_dim: int = 256,
-        output_dim: int = 384,
-        num_layers: int = 3,
-        num_heads: int = 4,
-        dropout: float = 0.1,
+        output_path: str = "output/gnn",
+        batch_size: int = 16,
+        epochs: int = 5,
+        eval_every_n_epochs: int | None = None,
+        validation_split: float = 0.1,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
         num_negatives: int = 5,
+        use_wandb: bool = True,
+        project_name: str = "gnn-training",
         embeddings_cache_dir: str | None = None,
-        **kwargs,
     ):
-        super().__init__(**kwargs)
-        self.gnn_model = gnn_model
         self.text_encoder_name = text_encoder_name
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.dropout = dropout
+        self.output_path = output_path
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.eval_every_n_epochs = eval_every_n_epochs
+        self.validation_split = validation_split
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.temperature = temperature
         self.num_negatives = num_negatives
+        self.use_wandb = use_wandb
+        self.project_name = project_name
         self.embeddings_cache_dir = embeddings_cache_dir
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -59,6 +58,40 @@ class GNNTrainer(BaseTrainer):
         # Create cache directory if specified
         if self.embeddings_cache_dir:
             os.makedirs(self.embeddings_cache_dir, exist_ok=True)
+
+    def load_and_split_data(
+        self, paragraph_file: str, cutoff_date: pd.Timestamp
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Load data and split into train/validation sets."""
+        df = pd.read_csv(paragraph_file)
+        df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
+
+        # Add DATE_TO if it exists
+        if "DATE_TO" in df.columns:
+            df["DATE_TO"] = pd.to_datetime(df["DATE_TO"])
+
+        # Add ID columns if they don't exist
+        if "FROM_ID" not in df.columns and "CELEX_FROM" in df.columns:
+            df["FROM_ID"] = (
+                df["CELEX_FROM"].astype(str) + "::" + df["NUMBER_FROM"].astype(str)
+            )
+        if "TO_ID" not in df.columns and "CELEX_TO" in df.columns:
+            df["TO_ID"] = (
+                df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
+            )
+
+        return split_data_by_date(df, cutoff_date, self.validation_split)
+
+    def setup_wandb(self, config: dict) -> None:
+        """Initialize wandb with the given config."""
+        if self.use_wandb:
+            wandb.init(project=self.project_name, config=config)
+
+    def cleanup_wandb(self) -> None:
+        """Save model to wandb and finish the run."""
+        if self.use_wandb:
+            wandb.save(f"{self.output_path}/*")
+            wandb.finish()
 
     def build_citation_graph_from_df(
         self, df: pd.DataFrame
@@ -402,6 +435,7 @@ class GNNTrainer(BaseTrainer):
 
     def train(
         self,
+        gnn_model: nn.Module,
         paragraph_file: str,
         cutoff_date: pd.Timestamp,
         precomputed_embeddings: np.ndarray | None = None,
@@ -467,19 +501,9 @@ class GNNTrainer(BaseTrainer):
             all_texts, temporal_dag, text_encoder, precomputed_embeddings
         )
 
-        # Use provided GNN model
-        print("\nInitializing provided GNN model...")
-        model = self.gnn_model.to(self.device)
-
-        # Validate input dimension compatibility when possible
-        try:
-            model_input_dim = cast(int, getattr(self.gnn_model, "input_dim"))
-            if model_input_dim != input_dim:
-                raise ValueError(
-                    f"Provided GNN model input_dim={model_input_dim} does not match text encoder dim={input_dim}"
-                )
-        except AttributeError:
-            pass
+        # Use provided GNN model (already initialized with text encoder)
+        print("\nInitializing GNN model...")
+        model = gnn_model.to(self.device)
 
         # Initialize optimizer and scheduler
         optimizer = AdamW(
@@ -491,13 +515,8 @@ class GNNTrainer(BaseTrainer):
 
         # Setup wandb
         config = {
-            "model_type": "GNN-External",
+            "model_type": type(gnn_model).__name__,
             "text_encoder": self.text_encoder_name,
-            "hidden_dim": self.hidden_dim,
-            "output_dim": self.output_dim,
-            "num_layers": self.num_layers,
-            "num_heads": self.num_heads,
-            "dropout": self.dropout,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
             "temperature": self.temperature,

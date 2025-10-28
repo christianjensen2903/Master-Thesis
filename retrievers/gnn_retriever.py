@@ -4,7 +4,6 @@ import torch.nn as nn
 from torch_geometric.data import Data  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from .base_retriever import BaseRetriever
-from typing import cast
 
 
 class GNNRetriever(BaseRetriever):
@@ -13,32 +12,20 @@ class GNNRetriever(BaseRetriever):
         gnn_model: nn.Module,
         model_path: str | None = None,
         text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        hidden_dim: int = 256,
-        output_dim: int = 384,
-        num_layers: int = 3,
-        num_heads: int = 4,
-        dropout: float = 0.1,
         batch_size: int = 32,
         device: str | None = None,
         normalize_embeddings: bool = True,
     ) -> None:
         self.text_encoder_name = text_encoder_name
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.dropout = dropout
         self.batch_size = batch_size
         self.normalize_embeddings = normalize_embeddings
-        self.architecture = "external"
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
 
-        # If loading from a checkpoint, try to read config first to determine text encoder/architecture
-        checkpoint_config: dict[str, object] | None = None
+        # If loading from a checkpoint, try to read config first to determine text encoder
         if model_path is not None:
             try:
                 checkpoint = torch.load(model_path, map_location="cpu")
@@ -51,9 +38,6 @@ class GNNRetriever(BaseRetriever):
                     ) or checkpoint_config.get("text_encoder_name")
                     if isinstance(te_name, str):
                         self.text_encoder_name = te_name
-                    arch = checkpoint_config.get("architecture")
-                    if isinstance(arch, str):
-                        self.architecture = arch
             except Exception:
                 pass
 
@@ -64,16 +48,6 @@ class GNNRetriever(BaseRetriever):
             raise ValueError("Text encoder does not provide embedding dimension")
 
         self.gnn_model = gnn_model.to(self.device)
-
-        # Validate input dimension compatibility when possible
-        try:
-            model_input_dim = cast(int, getattr(self.gnn_model, "input_dim"))
-            if model_input_dim != input_dim:
-                raise ValueError(
-                    f"Provided GNN model input_dim={model_input_dim} does not match text encoder dim={input_dim}"
-                )
-        except AttributeError:
-            pass
 
         # Load pretrained weights if provided
         if model_path is not None:
@@ -99,13 +73,8 @@ class GNNRetriever(BaseRetriever):
             {
                 "model_state_dict": self.gnn_model.state_dict(),
                 "config": {
-                    "architecture": "external",
+                    "model_type": type(self.gnn_model).__name__,
                     "text_encoder": self.text_encoder_name,
-                    "hidden_dim": self.hidden_dim,
-                    "output_dim": self.output_dim,
-                    "num_layers": self.num_layers,
-                    "num_heads": self.num_heads,
-                    "dropout": self.dropout,
                 },
             },
             model_path,
