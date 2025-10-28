@@ -121,17 +121,8 @@ def evaluate_gnn_map(
         num_heads=2,
     )
 
-    # Fit on corpus with TRAINING temporal DAG only (no leakage)
-    print("\nFitting retriever on corpus (TRAIN temporal DAG only - no leakage)...")
+    print("\nFitting retriever on corpus...")
 
-    # Option 1: Let GNN compute embeddings internally (default behavior)
-    # retriever.fit(
-    #     texts=pid_to_text,
-    #     citation_graph=train_temporal_dag,
-    #     paragraph_dates=paragraph_dates,
-    # )
-
-    # Option 2: Use pre-computed embeddings from cache
     embeddings_cache_dir = "artifacts/embeddings_cache"
     cache_files = [f for f in os.listdir(embeddings_cache_dir) if f.endswith(".pkl")]
 
