@@ -160,6 +160,7 @@ class BaseTrainer(ABC):
             checkpoint_save_steps=self.checkpoint_save_steps,
             save_best_model=True,
         )
+        model.save(self.output_path)
 
         print(f"Training finished. Model saved to {self.output_path}")
         return model
