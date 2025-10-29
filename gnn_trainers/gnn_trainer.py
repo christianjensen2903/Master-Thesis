@@ -373,7 +373,9 @@ class GNNTrainer:
         recall_at_100 = 0
         average_precisions = []
 
-        for anchor_id, cited_ids in val_citation_graph.items():
+        for anchor_id, cited_ids in tqdm(
+            val_citation_graph.items(), desc="Evaluating", leave=False
+        ):
             if not cited_ids or anchor_id >= len(embeddings):
                 continue
 
@@ -532,9 +534,9 @@ class GNNTrainer:
 
         # Training loop
         print(f"\nStarting training for {self.epochs} epochs...")
-        best_mrr = 0.0
+        best_loss = float("inf")
 
-        for epoch in range(self.epochs):
+        for epoch in tqdm(range(self.epochs), desc="Training Progress"):
             train_loss = self.train_epoch(
                 model, graph_data, temporal_dag, optimizer, epoch
             )
@@ -548,45 +550,19 @@ class GNNTrainer:
                         "train_loss": train_loss,
                     }
                 )
-
-            # Evaluate on validation set based on configured frequency
-            eval_interval = self.eval_every_n_epochs or max(1, self.epochs // 5)
-            if (epoch + 1) % eval_interval == 0:
-                val_metrics = self.evaluate(model, graph_data, val_citation_graph)
-                print(f"  Validation MRR: {val_metrics['mrr']:.4f}")
-                print(f"  Validation MAP: {val_metrics['map']:.4f}")
-                print(f"  Recall@5: {val_metrics['recall@5']:.4f}")
-                print(f"  Recall@10: {val_metrics['recall@10']:.4f}")
-                print(f"  Recall@50: {val_metrics['recall@50']:.4f}")
-                print(f"  Recall@100: {val_metrics['recall@100']:.4f}")
-
-                if self.use_wandb:
-                    wandb.log(
-                        {
-                            "epoch": epoch + 1,
-                            "val_mrr": val_metrics["mrr"],
-                            "val_map": val_metrics["map"],
-                            "val_recall@5": val_metrics["recall@5"],
-                            "val_recall@10": val_metrics["recall@10"],
-                            "val_recall@50": val_metrics["recall@50"],
-                            "val_recall@100": val_metrics["recall@100"],
-                        }
-                    )
-
-                # Save best model
-                if val_metrics["mrr"] > best_mrr:
-                    best_mrr = val_metrics["mrr"]
-                    print(f"  New best MRR: {best_mrr:.4f}")
-                    torch.save(
-                        {
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "epoch": epoch,
-                            "best_mrr": best_mrr,
-                            "config": config,
-                        },
-                        f"{self.output_path}/best_model.pt",
-                    )
+            # Save best model
+            if train_loss < best_loss:
+                best_loss = train_loss
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "epoch": epoch,
+                        "best_loss": best_loss,
+                        "config": config,
+                    },
+                    f"{self.output_path}/best_model.pt",
+                )
 
             scheduler.step()
 
@@ -599,7 +575,7 @@ class GNNTrainer:
             f"{self.output_path}/final_model.pt",
         )
 
-        print(f"\nTraining complete! Best validation MRR: {best_mrr:.4f}")
+        print(f"\nTraining complete! Best loss: {best_loss:.4f}")
         print(f"Model saved to {self.output_path}")
 
         self.cleanup_wandb()
