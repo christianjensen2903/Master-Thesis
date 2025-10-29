@@ -338,7 +338,13 @@ class GNNTrainer:
         num_batches = 0
         optimizer.zero_grad(set_to_none=True)
 
-        for step in range(0, len(anchor_ids), self.batch_size):
+        batch_pbar = tqdm(
+            range(0, len(anchor_ids), self.batch_size),
+            desc=f"Epoch {epoch + 1} batches",
+            leave=False,
+        )
+
+        for step in batch_pbar:
             batch_end = min(step + self.batch_size, len(anchor_ids))
             batch_anchor_ids = anchor_ids[step:batch_end]
             batch_positive_ids = positive_ids[step:batch_end]
@@ -375,6 +381,9 @@ class GNNTrainer:
 
             total_loss += loss.item() * num_total_batches
             num_batches += 1
+
+            # Update progress bar with current loss
+            batch_pbar.set_postfix({"loss": f"{total_loss / num_batches:.4f}"})
 
         # Update weights once after processing all batches
         if num_batches > 0:
@@ -570,11 +579,14 @@ class GNNTrainer:
         print(f"\nStarting training for {self.epochs} epochs...")
         best_mrr = 0.0
 
-        for epoch in range(self.epochs):
+        epoch_pbar = tqdm(range(self.epochs), desc="Training")
+
+        for epoch in epoch_pbar:
             train_loss = self.train_epoch(
                 model, graph_data, temporal_dag, optimizer, epoch
             )
 
+            epoch_pbar.set_postfix({"loss": f"{train_loss:.4f}"})
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
             if self.use_wandb:
@@ -589,6 +601,12 @@ class GNNTrainer:
             eval_interval = self.eval_every_n_epochs or max(1, self.epochs // 5)
             if (epoch + 1) % eval_interval == 0:
                 val_metrics = self.evaluate(model, graph_data, val_citation_graph)
+                epoch_pbar.set_postfix(
+                    {
+                        "loss": f"{train_loss:.4f}",
+                        "val_mrr": f"{val_metrics['mrr']:.4f}",
+                    }
+                )
                 print(f"  Validation MRR: {val_metrics['mrr']:.4f}")
                 print(f"  Validation MAP: {val_metrics['map']:.4f}")
                 print(f"  Recall@5: {val_metrics['recall@5']:.4f}")
