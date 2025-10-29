@@ -366,19 +366,15 @@ class GNNTrainer:
             loss = loss / self.gradient_accumulation_steps
 
             # Backward pass
-            # Retain graph for all backward calls except the last one
+            # Retain graph for all batches except the very last one
             is_last_batch = batch_end >= len(anchor_ids)
-            is_accumulation_step = (
-                num_batches + 1
-            ) % self.gradient_accumulation_steps == 0
-            should_retain = not (is_last_batch or is_accumulation_step)
-
-            loss.backward(retain_graph=should_retain)
+            loss.backward(retain_graph=not is_last_batch)
 
             total_loss += loss.item() * self.gradient_accumulation_steps
             num_batches += 1
 
             # Update weights every N accumulation steps
+            is_accumulation_step = num_batches % self.gradient_accumulation_steps == 0
             if is_accumulation_step or is_last_batch:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
