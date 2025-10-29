@@ -44,24 +44,24 @@ def train_example() -> None:
     # Option 2: GAT with attention (uncomment to use)
     # model = GAT(
     #     in_channels=384,  # MiniLM embedding dimension
-    #     hidden_channels=256,
-    #     out_channels=512,
-    #     num_layers=3,
-    #     dropout=0.3,
-    #     v2=True,  # Use GATv2
-    #     heads=4,  # Attention heads
+    #     hidden_channels=256,  # Memory-efficient size
+    #     out_channels=512,  # Good representation capacity
+    #     num_layers=3,  # Optimal depth
+    #     dropout=0.2,  # GAT regularization
+    #     v2=True,  # Use GATv2 (better than GAT)
+    #     heads=4,  # 4 heads for memory efficiency
     # )
 
-    # Initialize trainer with optimized hyperparameters
+    # Initialize trainer with memory-efficient hyperparameters
     trainer = GNNTrainer(
         text_encoder_name="sentence-transformers/all-MiniLM-L6-v2",
         output_path="checkpoints/gnn",
-        batch_size=128,  # Increased for better gradient estimates
-        epochs=40,  # Reduced from 50 due to larger batch size
-        learning_rate=1e-3,  # Scaled with batch size (√4 from baseline 32)
+        batch_size=32,  # Low batch size for memory efficiency
+        epochs=60,  # More epochs to compensate for smaller batches
+        learning_rate=3e-4,  # Lower LR for small batches with GAT
         temperature=0.05,  # Lower for harder negatives
-        num_negatives=20,  # Increased for better discrimination
-        gradient_accumulation_steps=1,  # Set >1 if memory-constrained (e.g., 4 for batch=32 → effective 128)
+        num_negatives=16,  # Reduced for memory efficiency
+        gradient_accumulation_steps=8,  # Effective batch_size = 32*8 = 256
         validation_split=0.1,
         use_wandb=False,
         embeddings_cache_dir="artifacts/embeddings_cache",
@@ -115,6 +115,7 @@ def evaluate_gnn_map(
     text_encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
     # Use same architecture as training
+    # Option 1: GraphSAGE
     model = GraphSAGE(
         in_channels=text_encoder.get_sentence_embedding_dimension(),  # 384
         hidden_channels=256,
@@ -123,6 +124,17 @@ def evaluate_gnn_map(
         dropout=0.3,
         aggr="mean",
     )
+
+    # Option 2: GAT (uncomment if you trained with GAT)
+    # model = GAT(
+    #     in_channels=text_encoder.get_sentence_embedding_dimension(),  # 384
+    #     hidden_channels=256,
+    #     out_channels=512,
+    #     num_layers=3,
+    #     dropout=0.2,
+    #     v2=True,
+    #     heads=4,
+    # )
     retriever = GNNRetriever(
         gnn_model=model,
         model_path=model_path,
