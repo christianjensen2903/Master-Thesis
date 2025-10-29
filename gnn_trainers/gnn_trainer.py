@@ -34,7 +34,6 @@ class GNNTrainer:
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
         num_negatives: int = 5,
-        gradient_accumulation_steps: int = 1,
         use_wandb: bool = True,
         project_name: str = "gnn-training",
         embeddings_cache_dir: str | None = None,
@@ -49,19 +48,12 @@ class GNNTrainer:
         self.weight_decay = weight_decay
         self.temperature = temperature
         self.num_negatives = num_negatives
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.effective_batch_size = batch_size * gradient_accumulation_steps
         self.use_wandb = use_wandb
         self.project_name = project_name
         self.embeddings_cache_dir = embeddings_cache_dir
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
-        if gradient_accumulation_steps > 1:
-            print(
-                f"Gradient accumulation enabled: {gradient_accumulation_steps} steps "
-                f"(effective batch size: {self.effective_batch_size})"
-            )
 
         # Create cache directory if specified
         if self.embeddings_cache_dir:
@@ -314,92 +306,48 @@ class GNNTrainer:
             return 0.0
 
         # Sample negatives (excluding anchor and cited nodes)
-        # Optimized: use numpy for faster sampling
         num_nodes = len(embeddings)
-        all_nodes = np.arange(num_nodes)
         negative_ids: list[list[int]] = []
-
-        for anchor_id in anchor_ids:
+        for i, anchor_id in enumerate(anchor_ids):
             cited_set = set(citation_graph.get(anchor_id, []))
             excluded = cited_set.union({anchor_id})
-
-            # Create mask for valid candidates (much faster than list comprehension)
-            mask = np.ones(num_nodes, dtype=bool)
-            mask[list(excluded)] = False
-            candidates = all_nodes[mask]
+            candidates = [n for n in range(num_nodes) if n not in excluded]
 
             if len(candidates) >= self.num_negatives:
-                sampled = np.random.choice(
-                    candidates, size=self.num_negatives, replace=False
-                ).tolist()
+                sampled = random.sample(candidates, self.num_negatives)
             else:
                 # Pad with random choices if needed
-                sampled = candidates.tolist()
-                while len(sampled) < self.num_negatives and len(candidates) > 0:
-                    sampled.append(np.random.choice(candidates))
+                sampled = candidates.copy()
+                while len(sampled) < self.num_negatives and candidates:
+                    sampled.append(random.choice(candidates))
                 # Final fallback
                 while len(sampled) < self.num_negatives:
                     sampled.append(0)
             negative_ids.append(sampled)
 
-        # Process in mini-batches for gradient accumulation
-        total_loss = 0.0
-        num_batches = 0
-        optimizer.zero_grad(set_to_none=True)
-
-        batch_pbar = tqdm(
-            range(0, len(anchor_ids), self.batch_size),
-            desc=f"Epoch {epoch + 1} batches",
-            leave=False,
+        # Gather embeddings
+        anchor_tensor = torch.tensor(anchor_ids, dtype=torch.long, device=self.device)
+        positive_tensor = torch.tensor(
+            positive_ids, dtype=torch.long, device=self.device
+        )
+        negative_tensor = torch.tensor(
+            negative_ids, dtype=torch.long, device=self.device
         )
 
-        for step in batch_pbar:
-            batch_end = min(step + self.batch_size, len(anchor_ids))
-            batch_anchor_ids = anchor_ids[step:batch_end]
-            batch_positive_ids = positive_ids[step:batch_end]
-            batch_negative_ids = negative_ids[step:batch_end]
+        anchor_emb = embeddings[anchor_tensor]
+        positive_emb = embeddings[positive_tensor]
+        negative_emb = embeddings[negative_tensor]
 
-            # Gather embeddings for this batch
-            anchor_tensor = torch.tensor(
-                batch_anchor_ids, dtype=torch.long, device=self.device
-            )
-            positive_tensor = torch.tensor(
-                batch_positive_ids, dtype=torch.long, device=self.device
-            )
-            negative_tensor = torch.tensor(
-                batch_negative_ids, dtype=torch.long, device=self.device
-            )
+        # Compute loss
+        loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
 
-            anchor_emb = embeddings[anchor_tensor]
-            positive_emb = embeddings[positive_tensor]
-            negative_emb = embeddings[negative_tensor]
+        # Backward pass
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
-            # Compute loss
-            loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
-
-            # Scale loss by accumulation steps
-            loss = loss / self.gradient_accumulation_steps
-
-            # Check if this is the last batch
-            is_last_batch = batch_end >= len(anchor_ids)
-
-            # Backward pass - retain graph for all but the last batch
-            # since embeddings tensor is shared across all batches
-            loss.backward(retain_graph=not is_last_batch)
-
-            total_loss += loss.item() * self.gradient_accumulation_steps
-            num_batches += 1
-
-            # Update weights every N accumulation steps
-            if (num_batches % self.gradient_accumulation_steps == 0) or is_last_batch:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            # Update progress bar with current loss
-            batch_pbar.set_postfix({"loss": f"{total_loss / num_batches:.4f}"})
-
-        return total_loss / num_batches if num_batches > 0 else 0.0
+        return float(loss.item())
 
     @torch.no_grad()
     def evaluate(
@@ -574,8 +522,6 @@ class GNNTrainer:
             "temperature": self.temperature,
             "num_negatives": self.num_negatives,
             "batch_size": self.batch_size,
-            "gradient_accumulation_steps": self.gradient_accumulation_steps,
-            "effective_batch_size": self.effective_batch_size,
             "epochs": self.epochs,
             "eval_every_n_epochs": self.eval_every_n_epochs,
             "num_nodes": len(all_texts),
@@ -588,14 +534,11 @@ class GNNTrainer:
         print(f"\nStarting training for {self.epochs} epochs...")
         best_mrr = 0.0
 
-        epoch_pbar = tqdm(range(self.epochs), desc="Training")
-
-        for epoch in epoch_pbar:
+        for epoch in range(self.epochs):
             train_loss = self.train_epoch(
                 model, graph_data, temporal_dag, optimizer, epoch
             )
 
-            epoch_pbar.set_postfix({"loss": f"{train_loss:.4f}"})
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
             if self.use_wandb:
@@ -610,12 +553,6 @@ class GNNTrainer:
             eval_interval = self.eval_every_n_epochs or max(1, self.epochs // 5)
             if (epoch + 1) % eval_interval == 0:
                 val_metrics = self.evaluate(model, graph_data, val_citation_graph)
-                epoch_pbar.set_postfix(
-                    {
-                        "loss": f"{train_loss:.4f}",
-                        "val_mrr": f"{val_metrics['mrr']:.4f}",
-                    }
-                )
                 print(f"  Validation MRR: {val_metrics['mrr']:.4f}")
                 print(f"  Validation MAP: {val_metrics['map']:.4f}")
                 print(f"  Recall@5: {val_metrics['recall@5']:.4f}")
