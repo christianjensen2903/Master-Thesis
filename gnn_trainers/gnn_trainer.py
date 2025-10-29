@@ -314,20 +314,29 @@ class GNNTrainer:
             return 0.0
 
         # Sample negatives (excluding anchor and cited nodes)
+        # Optimized: use numpy for faster sampling
         num_nodes = len(embeddings)
+        all_nodes = np.arange(num_nodes)
         negative_ids: list[list[int]] = []
-        for i, anchor_id in enumerate(anchor_ids):
+
+        for anchor_id in anchor_ids:
             cited_set = set(citation_graph.get(anchor_id, []))
             excluded = cited_set.union({anchor_id})
-            candidates = [n for n in range(num_nodes) if n not in excluded]
+
+            # Create mask for valid candidates (much faster than list comprehension)
+            mask = np.ones(num_nodes, dtype=bool)
+            mask[list(excluded)] = False
+            candidates = all_nodes[mask]
 
             if len(candidates) >= self.num_negatives:
-                sampled = random.sample(candidates, self.num_negatives)
+                sampled = np.random.choice(
+                    candidates, size=self.num_negatives, replace=False
+                ).tolist()
             else:
                 # Pad with random choices if needed
-                sampled = candidates.copy()
-                while len(sampled) < self.num_negatives and candidates:
-                    sampled.append(random.choice(candidates))
+                sampled = candidates.tolist()
+                while len(sampled) < self.num_negatives and len(candidates) > 0:
+                    sampled.append(np.random.choice(candidates))
                 # Final fallback
                 while len(sampled) < self.num_negatives:
                     sampled.append(0)
@@ -368,27 +377,25 @@ class GNNTrainer:
             # Compute loss
             loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
 
-            # Scale loss by number of batches (for averaging)
-            num_total_batches = (
-                len(anchor_ids) + self.batch_size - 1
-            ) // self.batch_size
-            loss = loss / num_total_batches
+            # Scale loss by accumulation steps
+            loss = loss / self.gradient_accumulation_steps
 
-            # Backward pass
-            # Retain graph for all batches except the very last one
-            is_last_batch = batch_end >= len(anchor_ids)
-            loss.backward(retain_graph=not is_last_batch)
+            # Backward pass (no retain_graph needed!)
+            loss.backward()
 
-            total_loss += loss.item() * num_total_batches
+            total_loss += loss.item() * self.gradient_accumulation_steps
             num_batches += 1
+
+            # Update weights every N accumulation steps
+            if (num_batches % self.gradient_accumulation_steps == 0) or (
+                batch_end >= len(anchor_ids)
+            ):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             # Update progress bar with current loss
             batch_pbar.set_postfix({"loss": f"{total_loss / num_batches:.4f}"})
-
-        # Update weights once after processing all batches
-        if num_batches > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
 
         return total_loss / num_batches if num_batches > 0 else 0.0
 

@@ -56,12 +56,14 @@ def train_example() -> None:
     trainer = GNNTrainer(
         text_encoder_name="sentence-transformers/all-MiniLM-L6-v2",
         output_path="checkpoints/gnn",
-        batch_size=32,  # Low batch size for memory efficiency
-        epochs=60,  # More epochs to compensate for smaller batches
-        learning_rate=3e-4,  # Lower LR for small batches with GAT
+        batch_size=64,  # Increased slightly for faster batching
+        epochs=30,  # Reduced - GNNs converge faster than you think!
+        eval_every_n_epochs=5,  # Evaluate every 5 epochs (not every epoch)
+        learning_rate=5e-4,  # Slightly higher LR for faster convergence
+        weight_decay=1e-4,  # Good regularization
         temperature=0.05,  # Lower for harder negatives
-        num_negatives=16,  # Reduced for memory efficiency
-        gradient_accumulation_steps=8,  # Effective batch_size = 32*8 = 256
+        num_negatives=16,  # Good balance of quality vs speed
+        gradient_accumulation_steps=4,  # Effective batch_size = 64*4 = 256
         validation_split=0.1,
         use_wandb=False,
         embeddings_cache_dir="artifacts/embeddings_cache",
