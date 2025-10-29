@@ -380,16 +380,18 @@ class GNNTrainer:
             # Scale loss by accumulation steps
             loss = loss / self.gradient_accumulation_steps
 
-            # Backward pass (no retain_graph needed!)
-            loss.backward()
+            # Check if this is the last batch
+            is_last_batch = batch_end >= len(anchor_ids)
+
+            # Backward pass - retain graph for all but the last batch
+            # since embeddings tensor is shared across all batches
+            loss.backward(retain_graph=not is_last_batch)
 
             total_loss += loss.item() * self.gradient_accumulation_steps
             num_batches += 1
 
             # Update weights every N accumulation steps
-            if (num_batches % self.gradient_accumulation_steps == 0) or (
-                batch_end >= len(anchor_ids)
-            ):
+            if (num_batches % self.gradient_accumulation_steps == 0) or is_last_batch:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
