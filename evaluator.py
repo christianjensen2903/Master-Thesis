@@ -297,6 +297,14 @@ class Evaluator:
         print(f"Train paragraphs: {np.sum(self.paragraph_set == 'train')}")
         print(f"Test paragraphs: {np.sum(self.paragraph_set == 'test')}")
 
+        # Validate embeddings match paragraph index
+        if len(self.embeddings) != len(self.pid_to_text):
+            raise ValueError(
+                f"Embeddings size mismatch: got {len(self.embeddings)} embeddings "
+                f"but have {len(self.pid_to_text)} paragraphs. "
+                f"You must regenerate embeddings in '{self.mode}' mode."
+            )
+
         if self.mode == "citation_pairs":
             assert self.df is not None
             print(f"Citation pairs: {len(self.df)}")
