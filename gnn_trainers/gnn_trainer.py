@@ -362,23 +362,24 @@ class GNNTrainer:
             # Compute loss
             loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
 
-            # Scale loss by accumulation steps
-            loss = loss / self.gradient_accumulation_steps
+            # Scale loss by number of batches (for averaging)
+            num_total_batches = (
+                len(anchor_ids) + self.batch_size - 1
+            ) // self.batch_size
+            loss = loss / num_total_batches
 
             # Backward pass
             # Retain graph for all batches except the very last one
             is_last_batch = batch_end >= len(anchor_ids)
             loss.backward(retain_graph=not is_last_batch)
 
-            total_loss += loss.item() * self.gradient_accumulation_steps
+            total_loss += loss.item() * num_total_batches
             num_batches += 1
 
-            # Update weights every N accumulation steps
-            is_accumulation_step = num_batches % self.gradient_accumulation_steps == 0
-            if is_accumulation_step or is_last_batch:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+        # Update weights once after processing all batches
+        if num_batches > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         return total_loss / num_batches if num_batches > 0 else 0.0
 
