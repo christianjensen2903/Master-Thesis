@@ -227,6 +227,8 @@ class BaseTripletTrainer(BaseTrainer):
         config = {
             "model_name": self.model_name,
             "batch_size": self.batch_size,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "effective_batch_size": self.effective_batch_size,
             "epochs": self.epochs,
             "warmup_steps": self.warmup_steps,
             "margin": self.margin,

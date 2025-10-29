@@ -4,7 +4,7 @@ import pickle
 import os
 from sentence_transformers import SentenceTransformer  # type: ignore
 from gnn_trainers import GNNTrainer
-from torch_geometric.nn import GraphSAGE
+from torch_geometric.nn import GraphSAGE, GAT
 from retrievers import GNNRetriever, DenseRetriever
 from data_loader import (
     load_citation_data,
@@ -31,23 +31,37 @@ def train_example() -> None:
     # Initialize text encoder
     text_encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
+    # Option 1: Optimized GraphSAGE
     model = GraphSAGE(
-        in_channels=text_encoder.get_sentence_embedding_dimension(),
-        hidden_channels=32,
-        out_channels=192,
-        num_layers=2,
-        dropout=0.2,
+        in_channels=text_encoder.get_sentence_embedding_dimension(),  # 384 for MiniLM
+        hidden_channels=256,  # Increased from 32 for better expressiveness
+        out_channels=512,  # Increased from 192 for richer embeddings
+        num_layers=3,  # Increased from 2 for better graph structure learning
+        dropout=0.3,  # Increased for better regularization
+        aggr="mean",
     )
 
-    # Initialize trainer (no model-specific parameters needed)
+    # Option 2: GAT with attention (uncomment to use)
+    # model = GAT(
+    #     in_channels=384,  # MiniLM embedding dimension
+    #     hidden_channels=256,
+    #     out_channels=512,
+    #     num_layers=3,
+    #     dropout=0.3,
+    #     v2=True,  # Use GATv2
+    #     heads=4,  # Attention heads
+    # )
+
+    # Initialize trainer with optimized hyperparameters
     trainer = GNNTrainer(
         text_encoder_name="sentence-transformers/all-MiniLM-L6-v2",
         output_path="checkpoints/gnn",
-        batch_size=2,
-        epochs=10,
-        learning_rate=1e-4,
-        temperature=0.07,
-        num_negatives=2,
+        batch_size=128,  # Increased for better gradient estimates
+        epochs=40,  # Reduced from 50 due to larger batch size
+        learning_rate=1e-3,  # Scaled with batch size (√4 from baseline 32)
+        temperature=0.05,  # Lower for harder negatives
+        num_negatives=20,  # Increased for better discrimination
+        gradient_accumulation_steps=1,  # Set >1 if memory-constrained (e.g., 4 for batch=32 → effective 128)
         validation_split=0.1,
         use_wandb=False,
         embeddings_cache_dir="artifacts/embeddings_cache",
@@ -100,12 +114,14 @@ def evaluate_gnn_map(
     print("\nInitializing GNN retriever...")
     text_encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
+    # Use same architecture as training
     model = GraphSAGE(
-        in_channels=text_encoder.get_sentence_embedding_dimension(),
-        hidden_channels=64,
-        out_channels=192,
-        num_layers=2,
-        dropout=0.2,
+        in_channels=text_encoder.get_sentence_embedding_dimension(),  # 384
+        hidden_channels=256,
+        out_channels=512,
+        num_layers=3,
+        dropout=0.3,
+        aggr="mean",
     )
     retriever = GNNRetriever(
         gnn_model=model,

@@ -25,6 +25,7 @@ class BaseTrainer(ABC):
         eval_every_n_epochs: int | None = None,
         show_progress_bar: bool = True,
         validation_split: float = 0.1,
+        gradient_accumulation_steps: int = 1,
         use_wandb: bool = True,
         project_name: str = "training-project",
     ):
@@ -38,11 +39,19 @@ class BaseTrainer(ABC):
         self.eval_every_n_epochs = eval_every_n_epochs
         self.show_progress_bar = show_progress_bar
         self.validation_split = validation_split
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.effective_batch_size = batch_size * gradient_accumulation_steps
         self.use_wandb = use_wandb
         self.project_name = project_name
 
         # Create output directory if it doesn't exist
         os.makedirs(self.output_path, exist_ok=True)
+
+        if gradient_accumulation_steps > 1:
+            print(
+                f"Gradient accumulation enabled: {gradient_accumulation_steps} steps "
+                f"(effective batch size: {self.effective_batch_size})"
+            )
 
     def load_and_split_data(
         self, paragraph_file: str, cutoff_date: pd.Timestamp
@@ -148,18 +157,21 @@ class BaseTrainer(ABC):
         print(f"\n{description}...")
         print(f"Total batches: {len(train_dataloader)}")
 
-        model.fit(
-            train_objectives=[(train_dataloader, train_loss)],
-            epochs=self.epochs,
-            warmup_steps=self.warmup_steps,
-            output_path=self.output_path,
-            scheduler="WarmupLinear",
-            show_progress_bar=self.show_progress_bar,
-            evaluator=evaluator,
-            evaluation_steps=self.evaluation_steps,
-            checkpoint_save_steps=self.checkpoint_save_steps,
-            save_best_model=True,
-        )
+        # Build fit kwargs
+        fit_kwargs: dict = {
+            "train_objectives": [(train_dataloader, train_loss)],
+            "epochs": self.epochs,
+            "warmup_steps": self.warmup_steps,
+            "output_path": self.output_path,
+            "scheduler": "WarmupLinear",
+            "show_progress_bar": self.show_progress_bar,
+            "evaluator": evaluator,
+            "evaluation_steps": self.evaluation_steps,
+            "checkpoint_save_steps": self.checkpoint_save_steps,
+            "save_best_model": True,
+        }
+
+        model.fit(**fit_kwargs)
         model.save(self.output_path)
 
         print(f"Training finished. Model saved to {self.output_path}")

@@ -34,6 +34,7 @@ class GNNTrainer:
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
         num_negatives: int = 5,
+        gradient_accumulation_steps: int = 1,
         use_wandb: bool = True,
         project_name: str = "gnn-training",
         embeddings_cache_dir: str | None = None,
@@ -48,12 +49,19 @@ class GNNTrainer:
         self.weight_decay = weight_decay
         self.temperature = temperature
         self.num_negatives = num_negatives
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.effective_batch_size = batch_size * gradient_accumulation_steps
         self.use_wandb = use_wandb
         self.project_name = project_name
         self.embeddings_cache_dir = embeddings_cache_dir
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
+        if gradient_accumulation_steps > 1:
+            print(
+                f"Gradient accumulation enabled: {gradient_accumulation_steps} steps "
+                f"(effective batch size: {self.effective_batch_size})"
+            )
 
         # Create cache directory if specified
         if self.embeddings_cache_dir:
@@ -325,29 +333,53 @@ class GNNTrainer:
                     sampled.append(0)
             negative_ids.append(sampled)
 
-        # Gather embeddings
-        anchor_tensor = torch.tensor(anchor_ids, dtype=torch.long, device=self.device)
-        positive_tensor = torch.tensor(
-            positive_ids, dtype=torch.long, device=self.device
-        )
-        negative_tensor = torch.tensor(
-            negative_ids, dtype=torch.long, device=self.device
-        )
-
-        anchor_emb = embeddings[anchor_tensor]
-        positive_emb = embeddings[positive_tensor]
-        negative_emb = embeddings[negative_tensor]
-
-        # Compute loss
-        loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
-
-        # Backward pass
+        # Process in mini-batches for gradient accumulation
+        total_loss = 0.0
+        num_batches = 0
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
 
-        return float(loss.item())
+        for step in range(0, len(anchor_ids), self.batch_size):
+            batch_end = min(step + self.batch_size, len(anchor_ids))
+            batch_anchor_ids = anchor_ids[step:batch_end]
+            batch_positive_ids = positive_ids[step:batch_end]
+            batch_negative_ids = negative_ids[step:batch_end]
+
+            # Gather embeddings for this batch
+            anchor_tensor = torch.tensor(
+                batch_anchor_ids, dtype=torch.long, device=self.device
+            )
+            positive_tensor = torch.tensor(
+                batch_positive_ids, dtype=torch.long, device=self.device
+            )
+            negative_tensor = torch.tensor(
+                batch_negative_ids, dtype=torch.long, device=self.device
+            )
+
+            anchor_emb = embeddings[anchor_tensor]
+            positive_emb = embeddings[positive_tensor]
+            negative_emb = embeddings[negative_tensor]
+
+            # Compute loss
+            loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
+
+            # Scale loss by accumulation steps
+            loss = loss / self.gradient_accumulation_steps
+
+            # Backward pass
+            loss.backward()
+
+            total_loss += loss.item() * self.gradient_accumulation_steps
+            num_batches += 1
+
+            # Update weights every N accumulation steps
+            if (num_batches % self.gradient_accumulation_steps == 0) or (
+                batch_end >= len(anchor_ids)
+            ):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        return total_loss / num_batches if num_batches > 0 else 0.0
 
     @torch.no_grad()
     def evaluate(
@@ -522,6 +554,8 @@ class GNNTrainer:
             "temperature": self.temperature,
             "num_negatives": self.num_negatives,
             "batch_size": self.batch_size,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "effective_batch_size": self.effective_batch_size,
             "epochs": self.epochs,
             "eval_every_n_epochs": self.eval_every_n_epochs,
             "num_nodes": len(all_texts),
