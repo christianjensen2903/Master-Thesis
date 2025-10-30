@@ -567,7 +567,9 @@ class GNNTrainer:
         patience_counter = 0
         patience = 10  # Early stopping patience
 
-        for epoch in tqdm(range(self.epochs), desc="Training Progress"):
+        for epoch in tqdm(
+            range(self.epochs), desc="Training Progress", position=0, ncols=80
+        ):
             train_loss = self.train_epoch(
                 model, graph_data, temporal_dag, optimizer, epoch
             )
