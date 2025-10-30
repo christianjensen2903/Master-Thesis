@@ -37,6 +37,7 @@ class GNNTrainer:
         use_wandb: bool = True,
         project_name: str = "gnn-training",
         embeddings_cache_dir: str | None = None,
+        use_temporal_validation: bool = True,
     ):
         self.text_encoder_name = text_encoder_name
         self.output_path = output_path
@@ -51,6 +52,7 @@ class GNNTrainer:
         self.use_wandb = use_wandb
         self.project_name = project_name
         self.embeddings_cache_dir = embeddings_cache_dir
+        self.use_temporal_validation = use_temporal_validation
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -80,7 +82,9 @@ class GNNTrainer:
                 df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
             )
 
-        return split_data_by_date(df, cutoff_date, self.validation_split)
+        return split_data_by_date(
+            df, cutoff_date, self.validation_split, self.use_temporal_validation
+        )
 
     def setup_wandb(self, config: dict) -> None:
         """Initialize wandb with the given config."""
@@ -477,10 +481,28 @@ class GNNTrainer:
         train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_date)
 
         # Build citation graphs for train and validation
-        print("\nBuilding training graph...")
-        train_citation_graph, par_id_to_idx, all_texts, paragraph_dates = (
-            self.build_citation_graph_from_df(train_df)
+        # For temporal validation, we need to include validation paragraphs in the graph
+        # even though we only train on training edges
+        print("\nBuilding graph from train + validation paragraphs...")
+        combined_df = pd.concat([train_df, val_df], ignore_index=True)
+        _, par_id_to_idx, all_texts, paragraph_dates = (
+            self.build_citation_graph_from_df(combined_df)
         )
+
+        # Now build separate training citation graph (only train edges)
+        print("Building training citation graph...")
+        train_citation_graph: dict[int, list[int]] = {}
+        for _, row in train_df.iterrows():
+            from_id = str(row["FROM_ID"])
+            to_id = str(row["TO_ID"])
+
+            if from_id in par_id_to_idx and to_id in par_id_to_idx:
+                src_idx = par_id_to_idx[from_id]
+                tgt_idx = par_id_to_idx[to_id]
+
+                if src_idx not in train_citation_graph:
+                    train_citation_graph[src_idx] = []
+                train_citation_graph[src_idx].append(tgt_idx)
 
         # Build temporal DAG (respects causality: older → newer only)
         print("\nBuilding temporal DAG...")
@@ -494,30 +516,33 @@ class GNNTrainer:
         # Print statistics
         print_temporal_graph_stats(temporal_dag, paragraph_dates)
 
-        print("\nBuilding validation graph...")
-        # Build validation paragraph IDs if not present
-        if "FROM_ID" not in val_df.columns:
-            val_df["FROM_ID"] = (
-                val_df["CELEX_FROM"].astype(str)
-                + "::"
-                + val_df["NUMBER_FROM"].astype(str)
-            )
-        if "TO_ID" not in val_df.columns:
-            val_df["TO_ID"] = (
-                val_df["CELEX_TO"].astype(str) + "::" + val_df["NUMBER_TO"].astype(str)
-            )
-
+        print("\nBuilding validation citation graph...")
         val_citation_graph: dict[int, list[int]] = {}
+        skipped_citations = 0
         for _, row in val_df.iterrows():
             from_id = str(row["FROM_ID"])
             to_id = str(row["TO_ID"])
-            # Only include if both paragraphs are in training data
+            # Both paragraphs should be in the combined graph now
             if from_id in par_id_to_idx and to_id in par_id_to_idx:
                 src_idx = par_id_to_idx[from_id]
                 tgt_idx = par_id_to_idx[to_id]
                 if src_idx not in val_citation_graph:
                     val_citation_graph[src_idx] = []
                 val_citation_graph[src_idx].append(tgt_idx)
+            else:
+                skipped_citations += 1
+
+        if skipped_citations > 0:
+            print(
+                f"⚠️  Skipped {skipped_citations}/{len(val_df)} validation citations (missing paragraphs)"
+            )
+
+        print(
+            f"✓ Training citations: {sum(len(v) for v in train_citation_graph.values())}"
+        )
+        print(
+            f"✓ Validation citations: {sum(len(v) for v in val_citation_graph.values())}"
+        )
 
         # Initialize text encoder
         print(f"\nLoading text encoder: {self.text_encoder_name}")

@@ -5,34 +5,65 @@ from sklearn.model_selection import train_test_split  # type: ignore
 
 
 def split_data_by_date(
-    df: pd.DataFrame, cutoff_date: pd.Timestamp, validation_split: float = 0.1
+    df: pd.DataFrame,
+    cutoff_date: pd.Timestamp,
+    validation_split: float = 0.1,
+    use_temporal_validation: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Split data into train and validation sets based on date cutoff.
 
     Args:
         df: DataFrame with DATE_FROM column
-        cutoff_date: Date to split on
-        validation_split: Fraction of data to use for validation
+        cutoff_date: Test set cutoff date (e.g., 2018-01-01)
+        validation_split: Fraction of pre-cutoff period to use for validation (only used if use_temporal_validation=False)
+        use_temporal_validation: If True, use temporal split (train=pre-val_date, val=val_date to cutoff_date).
+                                If False, use random split of pre-cutoff data.
 
     Returns:
         Tuple of (train_df, val_df)
     """
     df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
 
-    # First split by date
-    train_df = df[df["DATE_FROM"] < cutoff_date].copy()
-
-    # Then split train into train/val
-    if len(train_df) > 0:
-        train_df, val_df = train_test_split(
-            train_df,
-            test_size=validation_split,
-            random_state=42,
-            stratify=None,  # No stratification for now
+    if use_temporal_validation:
+        # Temporal split: validation period is 1 year before test cutoff
+        # E.g., if cutoff_date is 2018-01-01:
+        #   - Train: pre-2017
+        #   - Val: 2017-2018
+        #   - Test: post-2018 (not returned here, handled by caller)
+        val_start_date = pd.Timestamp(
+            year=cutoff_date.year - 1, month=cutoff_date.month, day=cutoff_date.day
         )
+
+        train_df = df[df["DATE_FROM"] < val_start_date].copy()
+        val_df = df[
+            (df["DATE_FROM"] >= val_start_date) & (df["DATE_FROM"] < cutoff_date)
+        ].copy()
+
+        print(f"\n📅 Temporal Split:")
+        print(f"  Train: before {val_start_date.date()} ({len(train_df)} citations)")
+        print(
+            f"  Val: {val_start_date.date()} to {cutoff_date.date()} ({len(val_df)} citations)"
+        )
+        print(f"  Test: after {cutoff_date.date()} (handled separately)")
+
     else:
-        val_df = pd.DataFrame(columns=df.columns)
+        # Random split (original behavior)
+        train_df = df[df["DATE_FROM"] < cutoff_date].copy()
+
+        if len(train_df) > 0:
+            train_df, val_df = train_test_split(
+                train_df,
+                test_size=validation_split,
+                random_state=42,
+                stratify=None,
+            )
+        else:
+            val_df = pd.DataFrame(columns=df.columns)
+
+        print(f"\n📊 Random Split:")
+        print(f"  Train: {len(train_df)} citations (random {1-validation_split:.0%})")
+        print(f"  Val: {len(val_df)} citations (random {validation_split:.0%})")
 
     return train_df, val_df
 
