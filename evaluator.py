@@ -2,7 +2,7 @@ import json
 import re
 from datetime import datetime as dt
 from collections import defaultdict
-from typing import Literal
+from typing import Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -323,8 +323,12 @@ if __name__ == "__main__":
     from data_loader import load_citation_data, split_train_test, build_paragraph_index
 
     print("Loading data...")
-    df, metadata = load_citation_data()
-    train_meta, test_meta = split_train_test(metadata, cutoff_year=2018)
+    csv_path = "data/par-to-par-cleaned.csv"
+    metadata_path = "data/par-to-par.json"
+    judgments_path = "data/judgments_cleaned.json"
+    cutoff_year = 2018
+    df, metadata = load_citation_data(csv_path, metadata_path)
+    train_meta, test_meta = split_train_test(metadata, cutoff_year=cutoff_year)
 
     print("Building paragraph index...")
     pid_to_text, text_to_pid, paragraph_dates, paragraph_celex, paragraph_set = (
@@ -333,7 +337,6 @@ if __name__ == "__main__":
 
     print(f"Total paragraphs: {len(pid_to_text)}")
     print(f"Train paragraphs: {np.sum(paragraph_set == 'train')}")
-    print(f"Test paragraphs: {np.sum(paragraph_set == 'test')}")
 
     # Initialize and fit retriever
     print("\nFitting TF-IDF retriever...")
@@ -347,11 +350,28 @@ if __name__ == "__main__":
     embeddings = retriever.fit_transform(pid_to_text, train_mask)
     print(f"Embeddings shape: {embeddings.shape}")
 
-    # Run evaluation (with optional top_k for faster evaluation)
-    print("\nEvaluating...")
     evaluator = Evaluator(
-        retriever=retriever,
-        embeddings=embeddings,
-        top_k=1000,  # Use MAP@1000 for faster evaluation, or None for full MAP
+        retriever=None,  # We'll set this later
+        embeddings=None,  # We'll set this later
+        mode="all_paragraphs",
+        csv_path=csv_path,
+        metadata_path=metadata_path,
+        judgments_path=judgments_path,
+        train_cutoff_year=cutoff_year,
+        top_k=10000,
     )
-    evaluator.run()
+
+    # 2. Load the paragraph index
+    evaluator.load_and_prepare()
+
+    # Generate embeddings for ALL paragraphs in all_paragraphs mode
+    assert evaluator.pid_to_text is not None
+    embeddings = retriever.transform(evaluator.pid_to_text)
+
+    # 4. Now set the retriever and embeddings
+    evaluator.retriever = retriever
+    evaluator.embeddings = embeddings
+
+    # 5. Run evaluation (skip load_and_prepare since we already did it)
+    score = evaluator.evaluate_map()
+    print(f"MAP: {score:.4f}")

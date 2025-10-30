@@ -355,7 +355,12 @@ class GNNTrainer:
         model: nn.Module,
         graph_data: Data,
         val_citation_graph: dict[int, list[int]],
+        paragraph_dates: np.ndarray,
     ) -> dict[str, float]:
+        """
+        Evaluate with proper temporal filtering - only rank against older paragraphs.
+        This matches the real evaluation in evaluator.py.
+        """
         model.eval()
 
         # Compute embeddings for all nodes in one forward pass
@@ -364,6 +369,10 @@ class GNNTrainer:
 
         embeddings = model(x, edge_index)
         embeddings = F.normalize(embeddings, p=2, dim=1).cpu().numpy()
+
+        # Pre-sort by date for temporal filtering
+        sort_idx = np.argsort(paragraph_dates)
+        sorted_dates = paragraph_dates[sort_idx]
 
         # Compute MRR, MAP and Recall@k
         ranks = []
@@ -379,18 +388,37 @@ class GNNTrainer:
             if not cited_ids or anchor_id >= len(embeddings):
                 continue
 
-            anchor_emb = embeddings[anchor_id]
-            similarities = embeddings @ anchor_emb
+            # ✅ CRITICAL: Only rank against temporally valid candidates (strictly older)
+            anchor_date = paragraph_dates[anchor_id]
+            cutoff = int(np.searchsorted(sorted_dates, anchor_date, side="left"))
+            cand_pids = sort_idx[:cutoff]
 
-            # Rank all candidates
-            ranked_indices = np.argsort(-similarities)
+            if len(cand_pids) == 0:
+                continue
+
+            # Filter cited_ids to only those that are temporally valid
+            valid_cited_ids = [
+                cid
+                for cid in cited_ids
+                if cid < len(embeddings) and cid in set(cand_pids)
+            ]
+
+            if not valid_cited_ids:
+                continue
+
+            # Compute similarities only for valid candidates
+            anchor_emb = embeddings[anchor_id]
+            candidate_embs = embeddings[cand_pids]
+            similarities = candidate_embs @ anchor_emb
+
+            # Rank candidates
+            ranked_order = np.argsort(-similarities)
+            ranked_pids = cand_pids[ranked_order]
 
             # Find rank of positive samples and compute average precision
             query_ranks = []
-            for cited_id in cited_ids:
-                if cited_id >= len(embeddings):
-                    continue
-                rank = np.where(ranked_indices == cited_id)[0]
+            for cited_id in valid_cited_ids:
+                rank = np.where(ranked_pids == cited_id)[0]
                 if len(rank) > 0:
                     rank_val = rank[0] + 1  # 1-indexed rank
                     ranks.append(rank_val)
@@ -535,6 +563,9 @@ class GNNTrainer:
         # Training loop
         print(f"\nStarting training for {self.epochs} epochs...")
         best_loss = float("inf")
+        best_val_map = 0.0
+        patience_counter = 0
+        patience = 10  # Early stopping patience
 
         for epoch in tqdm(range(self.epochs), desc="Training Progress"):
             train_loss = self.train_epoch(
@@ -543,26 +574,76 @@ class GNNTrainer:
 
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
-            if self.use_wandb:
-                wandb.log(
-                    {
-                        "epoch": epoch + 1,
-                        "train_loss": train_loss,
-                    }
+
+            # Evaluate on validation set
+            should_eval = (
+                self.eval_every_n_epochs is not None
+                and (epoch + 1) % self.eval_every_n_epochs == 0
+            )
+
+            if should_eval or (epoch + 1) == self.epochs:
+                print("  Evaluating on validation set...")
+                val_metrics = self.evaluate(
+                    model, graph_data, val_citation_graph, paragraph_dates
                 )
-            # Save best model
-            if train_loss < best_loss:
-                best_loss = train_loss
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "epoch": epoch,
-                        "best_loss": best_loss,
-                        "config": config,
-                    },
-                    f"{self.output_path}/best_model.pt",
-                )
+                print(f"  Val MAP: {val_metrics['map']:.4f}")
+                print(f"  Val MRR: {val_metrics['mrr']:.4f}")
+                print(f"  Val Recall@10: {val_metrics['recall@10']:.4f}")
+
+                if self.use_wandb:
+                    wandb.log(
+                        {
+                            "epoch": epoch + 1,
+                            "train_loss": train_loss,
+                            "val_map": val_metrics["map"],
+                            "val_mrr": val_metrics["mrr"],
+                            "val_recall@5": val_metrics["recall@5"],
+                            "val_recall@10": val_metrics["recall@10"],
+                            "val_recall@50": val_metrics["recall@50"],
+                            "val_recall@100": val_metrics["recall@100"],
+                        }
+                    )
+                else:
+                    if self.use_wandb:
+                        wandb.log(
+                            {
+                                "epoch": epoch + 1,
+                                "train_loss": train_loss,
+                            }
+                        )
+
+                # Save best model based on validation MAP
+                if val_metrics["map"] > best_val_map:
+                    best_val_map = val_metrics["map"]
+                    patience_counter = 0
+                    torch.save(
+                        {
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "epoch": epoch,
+                            "best_val_map": best_val_map,
+                            "val_metrics": val_metrics,
+                            "config": config,
+                        },
+                        f"{self.output_path}/best_model.pt",
+                    )
+                    print(f"  ✓ New best model saved (MAP: {best_val_map:.4f})")
+                else:
+                    patience_counter += 1
+                    print(f"  No improvement ({patience_counter}/{patience})")
+
+                # Early stopping
+                if patience_counter >= patience:
+                    print(f"\n⚠ Early stopping triggered after {epoch + 1} epochs")
+                    break
+            else:
+                if self.use_wandb:
+                    wandb.log(
+                        {
+                            "epoch": epoch + 1,
+                            "train_loss": train_loss,
+                        }
+                    )
 
             scheduler.step()
 
@@ -575,7 +656,7 @@ class GNNTrainer:
             f"{self.output_path}/final_model.pt",
         )
 
-        print(f"\nTraining complete! Best loss: {best_loss:.4f}")
+        print(f"\nTraining complete! Best validation MAP: {best_val_map:.4f}")
         print(f"Model saved to {self.output_path}")
 
         self.cleanup_wandb()
