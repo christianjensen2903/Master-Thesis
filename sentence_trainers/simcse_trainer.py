@@ -56,6 +56,8 @@ class SimCSETrainer(BaseTrainer):
         )
 
         model = SentenceTransformer(self.model_name)
+        if self.max_seq_length is not None:
+            model.max_seq_length = self.max_seq_length
         train_loss = losses.MultipleNegativesRankingLoss(model=model)
 
         evaluator = self.create_ir_evaluator(val_df)

@@ -13,12 +13,16 @@ class DenseRetriever(BaseRetriever):
         batch_size: int = 32,
         show_progress_bar: bool = True,
         normalize_embeddings: bool = True,
+        max_seq_length: int | None = None,
     ):
         self.model_name = model_name
         self.batch_size = batch_size
         self.show_progress_bar = show_progress_bar
         self.normalize_embeddings = normalize_embeddings
+        self.max_seq_length = max_seq_length
         self.model = SentenceTransformer(model_name)
+        if max_seq_length is not None:
+            self.model.max_seq_length = max_seq_length
         self._is_fitted = True  # Dense models don't need explicit fitting
 
     def fit(self, texts: np.ndarray, mask: np.ndarray | None = None) -> None:

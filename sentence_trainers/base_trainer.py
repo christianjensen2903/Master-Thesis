@@ -28,6 +28,7 @@ class BaseTrainer(ABC):
         gradient_accumulation_steps: int = 1,
         use_wandb: bool = True,
         project_name: str = "training-project",
+        max_seq_length: int | None = None,
     ):
         self.model_name = model_name
         self.output_path = output_path
@@ -43,6 +44,7 @@ class BaseTrainer(ABC):
         self.effective_batch_size = batch_size * gradient_accumulation_steps
         self.use_wandb = use_wandb
         self.project_name = project_name
+        self.max_seq_length = max_seq_length
 
         # Create output directory if it doesn't exist
         os.makedirs(self.output_path, exist_ok=True)
@@ -153,6 +155,8 @@ class BaseTrainer(ABC):
     ) -> SentenceTransformer:
         """Train the model with the given dataloader and loss."""
         model = SentenceTransformer(self.model_name)
+        if self.max_seq_length is not None:
+            model.max_seq_length = self.max_seq_length
 
         print(f"\n{description}...")
         print(f"Total batches: {len(train_dataloader)}")
