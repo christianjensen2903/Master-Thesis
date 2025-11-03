@@ -29,6 +29,7 @@ class BaseTrainer(ABC):
         use_wandb: bool = True,
         project_name: str = "training-project",
         max_seq_length: int | None = None,
+        learning_rate: float = 2e-5,
     ):
         self.model_name = model_name
         self.output_path = output_path
@@ -45,6 +46,7 @@ class BaseTrainer(ABC):
         self.use_wandb = use_wandb
         self.project_name = project_name
         self.max_seq_length = max_seq_length
+        self.learning_rate = learning_rate
 
         # Create output directory if it doesn't exist
         os.makedirs(self.output_path, exist_ok=True)
@@ -173,6 +175,7 @@ class BaseTrainer(ABC):
             "evaluation_steps": self.evaluation_steps,
             "checkpoint_save_steps": self.checkpoint_save_steps,
             "save_best_model": True,
+            "optimizer_params": {"lr": self.learning_rate},
         }
 
         model.fit(**fit_kwargs)

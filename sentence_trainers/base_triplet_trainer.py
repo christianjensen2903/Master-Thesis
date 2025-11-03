@@ -236,6 +236,7 @@ class BaseTripletTrainer(BaseTrainer):
             "n_neighbors": self.n_neighbors,
             "validation_split": self.validation_split,
             "cutoff_date": str(cutoff_date),
+            "learning_rate": self.learning_rate,
         }
         self.setup_wandb(config)
 

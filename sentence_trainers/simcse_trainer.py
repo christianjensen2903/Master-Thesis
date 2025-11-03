@@ -161,6 +161,7 @@ class SentencePairTrainer(BaseTrainer):
             "cutoff_date": str(cutoff_date),
             "loss_type": self.loss_type,
             "loss_scale": self.loss_scale,
+            "learning_rate": self.learning_rate,
         }
         if self.guide_model_name is not None:
             config["guide_model_name"] = self.guide_model_name
