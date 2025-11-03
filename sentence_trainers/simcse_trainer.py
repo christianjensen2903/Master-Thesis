@@ -12,20 +12,6 @@ class SentencePairTrainer(BaseTrainer):
 
     def __init__(
         self,
-        model_name: str = "all-MiniLM-L6-v2",
-        output_path: str = "output/model",
-        batch_size: int = 16,
-        epochs: int = 5,
-        warmup_steps: int = 100,
-        checkpoint_save_steps: int = 1000,
-        evaluation_steps: int = 1000,
-        eval_every_n_epochs: int | None = None,
-        show_progress_bar: bool = True,
-        validation_split: float = 0.1,
-        gradient_accumulation_steps: int = 1,
-        use_wandb: bool = True,
-        project_name: str = "training-project",
-        max_seq_length: int | None = None,
         loss_type: str = "MultipleNegativesRankingLoss",
         loss_scale: float = 20.0,
         loss_mini_batch_size: int | None = None,
@@ -35,23 +21,9 @@ class SentencePairTrainer(BaseTrainer):
         gist_margin: float = 0.0,
         gist_contrast_anchors: bool = True,
         gist_contrast_positives: bool = True,
+        **kwargs: Any,
     ):
-        super().__init__(
-            model_name=model_name,
-            output_path=output_path,
-            batch_size=batch_size,
-            epochs=epochs,
-            warmup_steps=warmup_steps,
-            checkpoint_save_steps=checkpoint_save_steps,
-            evaluation_steps=evaluation_steps,
-            eval_every_n_epochs=eval_every_n_epochs,
-            show_progress_bar=show_progress_bar,
-            validation_split=validation_split,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            use_wandb=use_wandb,
-            project_name=project_name,
-            max_seq_length=max_seq_length,
-        )
+        super().__init__(**kwargs)
         self.loss_type = loss_type
         self.loss_scale = loss_scale
         self.loss_mini_batch_size = loss_mini_batch_size
