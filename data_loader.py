@@ -57,9 +57,16 @@ def build_paragraph_index(
     df: pd.DataFrame,
     train_meta: list[dict],
     test_meta: list[dict],
-) -> tuple[np.ndarray, dict, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    dict[tuple[str, int], int],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """
-    Build paragraph index from citation DataFrame.
+    Build paragraph index from citation DataFrame using (celex, number) as key.
 
     Args:
         df: DataFrame with citation pairs
@@ -69,107 +76,113 @@ def build_paragraph_index(
     Returns:
         Tuple of:
         - pid_to_text: Array mapping paragraph ID to text
-        - text_to_pid: Dict mapping text to paragraph ID
+        - celex_number_to_pid: Dict mapping (celex, number) to paragraph ID
         - paragraph_dates: Array of dates for each paragraph
         - paragraph_celex: Array of CELEX IDs for each paragraph
+        - paragraph_number: Array of paragraph numbers for each paragraph
         - paragraph_set: Array of "train"/"test"/None for each paragraph
     """
     train_celex = {m["case_id"] for m in train_meta}
     test_celex = {m["case_id"] for m in test_meta}
 
-    # Collect all unique paragraph texts
-    all_texts = pd.unique(
-        pd.concat([df["TEXT_FROM"], df["TEXT_TO"]], ignore_index=True)
-    )
-    all_texts = [t for t in all_texts if isinstance(t, str)]
+    # Collect all unique (celex, number) combinations with their first text and earliest date
+    tmp_info: dict[tuple[str, int], dict] = {}
 
-    text_to_pid = {t: i for i, t in enumerate(all_texts)}
-    pid_to_text = np.array(all_texts, dtype=object)
-    n_par = len(pid_to_text)
+    # Pass 1: Process FROM rows
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Building index (FROM)"):
+        celex = str(row["CELEX_FROM"])
+        number = int(row["NUMBER_FROM"])
+        text = row["TEXT_FROM"]
+        date_str = row["DATE_FROM"]
 
-    # Temporary storage to resolve earliest date + metadata per paragraph
-    tmp_info: dict[int, dict] = {
-        pid: {
-            "date": None,
-            "celex": None,
-            "number": None,
-            "set_type": None,
-        }
-        for pid in range(n_par)
-    }
-
-    # Pass 1: Fill from TEXT_FROM rows
-    for (celex_from, number_from), sub in tqdm(
-        df.groupby(["CELEX_FROM", "NUMBER_FROM"]), desc="Building index (FROM)"
-    ):
-        paragraph_text = sub["TEXT_FROM"].iloc[0]
-        date_str = sub["DATE_FROM"].iloc[0]
-        if not isinstance(paragraph_text, str):
+        if not isinstance(text, str):
             continue
-        pid = text_to_pid[paragraph_text]
+
         d = dt.strptime(date_str, "%Y-%m-%d")
+        key = (celex, number)
 
-        info = tmp_info[pid]
-        if info["date"] is None or d < info["date"]:
-            info["date"] = d
-            info["celex"] = celex_from
-            info["number"] = number_from
-            info["set_type"] = (
-                "train"
-                if celex_from in train_celex
-                else ("test" if celex_from in test_celex else info["set_type"])
-            )
-
-    # Pass 2: Fill from TEXT_TO rows
-    for (celex_to, number_to), sub in tqdm(
-        df.groupby(["CELEX_TO", "NUMBER_TO"]), desc="Building index (TO)"
-    ):
-        paragraph_text = sub["TEXT_TO"].iloc[0]
-        date_str = sub["DATE_TO"].iloc[0]
-        if not isinstance(paragraph_text, str):
-            continue
-        pid = text_to_pid[paragraph_text]
-        d = dt.strptime(date_str, "%Y-%m-%d")
-
-        info = tmp_info[pid]
-        if info["date"] is None or d < info["date"]:
-            info["date"] = d
-            info["celex"] = celex_to
-            info["number"] = number_to
-            if info["set_type"] is None:
-                info["set_type"] = (
+        if key not in tmp_info:
+            tmp_info[key] = {
+                "text": text,
+                "date": d,
+                "celex": celex,
+                "number": number,
+                "set_type": (
                     "train"
-                    if celex_to in train_celex
-                    else ("test" if celex_to in test_celex else None)
-                )
+                    if celex in train_celex
+                    else ("test" if celex in test_celex else None)
+                ),
+            }
+        elif d < tmp_info[key]["date"]:
+            tmp_info[key]["date"] = d
 
-    # Finalize arrays
+    # Pass 2: Process TO rows
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Building index (TO)"):
+        celex = str(row["CELEX_TO"])
+        number = int(row["NUMBER_TO"])
+        text = row["TEXT_TO"]
+        date_str = row["DATE_TO"]
+
+        if not isinstance(text, str):
+            continue
+
+        d = dt.strptime(date_str, "%Y-%m-%d")
+        key = (celex, number)
+
+        if key not in tmp_info:
+            tmp_info[key] = {
+                "text": text,
+                "date": d,
+                "celex": celex,
+                "number": number,
+                "set_type": (
+                    "train"
+                    if celex in train_celex
+                    else ("test" if celex in test_celex else None)
+                ),
+            }
+        elif d < tmp_info[key]["date"]:
+            tmp_info[key]["date"] = d
+
+    # Sort by (celex, number) for deterministic ordering
+    sorted_keys = sorted(tmp_info.keys())
+
+    # Build arrays
+    celex_number_to_pid = {key: pid for pid, key in enumerate(sorted_keys)}
+    pid_to_text = np.array([tmp_info[key]["text"] for key in sorted_keys], dtype=object)
     paragraph_dates = np.array(
-        [tmp_info[pid]["date"] for pid in range(n_par)],
-        dtype="datetime64[ns]",
+        [tmp_info[key]["date"] for key in sorted_keys], dtype="datetime64[ns]"
     )
     paragraph_celex = np.array(
-        [tmp_info[pid]["celex"] for pid in range(n_par)],
-        dtype=object,
+        [tmp_info[key]["celex"] for key in sorted_keys], dtype=object
+    )
+    paragraph_number = np.array(
+        [tmp_info[key]["number"] for key in sorted_keys], dtype=object
     )
     paragraph_set = np.array(
-        [tmp_info[pid]["set_type"] for pid in range(n_par)],
-        dtype=object,
+        [tmp_info[key]["set_type"] for key in sorted_keys], dtype=object
     )
 
-    return pid_to_text, text_to_pid, paragraph_dates, paragraph_celex, paragraph_set
+    return (
+        pid_to_text,
+        celex_number_to_pid,
+        paragraph_dates,
+        paragraph_celex,
+        paragraph_number,
+        paragraph_set,
+    )
 
 
 def build_citation_graph(
     df: pd.DataFrame,
-    text_to_pid: dict,
+    celex_number_to_pid: dict[tuple[str, int], int],
 ) -> dict[int, list[int]]:
     """
     Build citation graph mapping source paragraph to cited paragraphs.
 
     Args:
         df: DataFrame with citation pairs
-        text_to_pid: Mapping from text to paragraph ID
+        celex_number_to_pid: Mapping from (celex, number) to paragraph ID
 
     Returns:
         Dictionary mapping source pid to sorted list of cited pids
@@ -177,12 +190,19 @@ def build_citation_graph(
     cited_by_pid = defaultdict(set)
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Building citations"):
-        src_txt = row["TEXT_FROM"]
-        tgt_txt = row["TEXT_TO"]
-        if not isinstance(src_txt, str) or not isinstance(tgt_txt, str):
+        celex_from = row["CELEX_FROM"]
+        number_from = row["NUMBER_FROM"]
+        celex_to = row["CELEX_TO"]
+        number_to = row["NUMBER_TO"]
+
+        src_key = (str(celex_from), int(number_from))
+        tgt_key = (str(celex_to), int(number_to))
+
+        if src_key not in celex_number_to_pid or tgt_key not in celex_number_to_pid:
             continue
-        src_pid = text_to_pid[src_txt]
-        tgt_pid = text_to_pid[tgt_txt]
+
+        src_pid = celex_number_to_pid[src_key]
+        tgt_pid = celex_number_to_pid[tgt_key]
         cited_by_pid[src_pid].add(tgt_pid)
 
     # Make deterministic and convert to dict

@@ -24,8 +24,8 @@ EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
 class Evaluator:
     def __init__(
         self,
-        retriever: BaseRetriever | None,
-        embeddings: NDArray | None,
+        retriever: BaseRetriever,
+        embeddings: NDArray,
         mode: EvaluatorMode = "citation_pairs",
         csv_path: str = "data/par-to-par-cleaned.csv",
         metadata_path: str = "data/par-to-par.json",
@@ -55,7 +55,7 @@ class Evaluator:
         self.test_meta: list[dict] | None = None
 
         self.pid_to_text: NDArray[np.object_] | None = None
-        self.celex_number_to_pid: dict[tuple[str, int], int] | None = None
+        self.text_to_pid: dict | None = None
         self.paragraph_dates: NDArray | None = None
         self.paragraph_celex: NDArray[np.object_] | None = None
         self.paragraph_number: NDArray[np.object_] | None = None
@@ -86,15 +86,16 @@ class Evaluator:
 
         (
             self.pid_to_text,
-            self.celex_number_to_pid,
+            self.text_to_pid,
             self.paragraph_dates,
             self.paragraph_celex,
-            self.paragraph_number,
             self.paragraph_set,
         ) = build_paragraph_index(self.df, self.train_meta, self.test_meta)
 
+        self.paragraph_number = np.array([None] * len(self.pid_to_text), dtype=object)
+
         # Build citation graph
-        self.cited_by_pid = build_citation_graph(self.df, self.celex_number_to_pid)
+        self.cited_by_pid = build_citation_graph(self.df, self.text_to_pid)
 
     def _load_all_paragraphs_mode(self) -> None:
         """
@@ -163,9 +164,7 @@ class Evaluator:
 
         # Build arrays
         self.pid_to_text = np.array([p["text"] for p in paragraphs], dtype=object)
-        self.celex_number_to_pid = {
-            (p["celex"], p["number"]): pid for pid, p in enumerate(paragraphs)
-        }
+        self.text_to_pid = {text: pid for pid, text in enumerate(self.pid_to_text)}
         self.paragraph_dates = np.array(
             [p["date"] for p in paragraphs], dtype="datetime64[ns]"
         )
@@ -180,35 +179,32 @@ class Evaluator:
         self.df = pd.read_csv(self.csv_path).dropna()
 
         # Build citation graph from par-to-par (only for paragraphs that exist in our index)
-        self.cited_by_pid = self._build_citation_graph_safe(
-            self.df, self.celex_number_to_pid
-        )
+        self.cited_by_pid = self._build_citation_graph_safe(self.df, self.text_to_pid)
 
     def _build_citation_graph_safe(
-        self, df: pd.DataFrame, celex_number_to_pid: dict[tuple[str, int], int]
+        self, df: pd.DataFrame, text_to_pid: dict
     ) -> dict[int, list[int]]:
         """
-        Build citation graph using (celex, number) keys, skipping paragraphs that don't exist in the index.
+        Build citation graph, skipping paragraphs that don't exist in the index.
         """
         cited_by_pid = defaultdict(set)
         skipped = 0
 
         for _, row in tqdm(df.iterrows(), total=len(df), desc="Building citations"):
-            celex_from = row["CELEX_FROM"]
-            number_from = row["NUMBER_FROM"]
-            celex_to = row["CELEX_TO"]
-            number_to = row["NUMBER_TO"]
+            src_txt = row["TEXT_FROM"]
+            tgt_txt = row["TEXT_TO"]
 
-            src_key = (str(celex_from), int(number_from))
-            tgt_key = (str(celex_to), int(number_to))
-
-            # Skip if either key not in our index
-            if src_key not in celex_number_to_pid or tgt_key not in celex_number_to_pid:
+            if not isinstance(src_txt, str) or not isinstance(tgt_txt, str):
                 skipped += 1
                 continue
 
-            src_pid = celex_number_to_pid[src_key]
-            tgt_pid = celex_number_to_pid[tgt_key]
+            # Skip if either text not in our index
+            if src_txt not in text_to_pid or tgt_txt not in text_to_pid:
+                skipped += 1
+                continue
+
+            src_pid = text_to_pid[src_txt]
+            tgt_pid = text_to_pid[tgt_txt]
             cited_by_pid[src_pid].add(tgt_pid)
 
         if skipped > 0:
@@ -227,8 +223,6 @@ class Evaluator:
         self.sorted_dates = self.paragraph_dates[self.sort_idx]
 
     def evaluate_map(self) -> float:
-        assert self.retriever is not None
-        assert self.embeddings is not None
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
         assert self.cited_by_pid is not None
@@ -296,8 +290,6 @@ class Evaluator:
         print("Loading and preparing data...")
         self.load_and_prepare()
 
-        assert self.retriever is not None
-        assert self.embeddings is not None
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
 
@@ -339,14 +331,9 @@ if __name__ == "__main__":
     train_meta, test_meta = split_train_test(metadata, cutoff_year=cutoff_year)
 
     print("Building paragraph index...")
-    (
-        pid_to_text,
-        celex_number_to_pid,
-        paragraph_dates,
-        paragraph_celex,
-        paragraph_number,
-        paragraph_set,
-    ) = build_paragraph_index(df, train_meta, test_meta)
+    pid_to_text, text_to_pid, paragraph_dates, paragraph_celex, paragraph_set = (
+        build_paragraph_index(df, train_meta, test_meta)
+    )
 
     print(f"Total paragraphs: {len(pid_to_text)}")
     print(f"Train paragraphs: {np.sum(paragraph_set == 'train')}")
@@ -366,7 +353,7 @@ if __name__ == "__main__":
     evaluator = Evaluator(
         retriever=None,  # We'll set this later
         embeddings=None,  # We'll set this later
-        # mode="all_paragraphs",
+        mode="all_paragraphs",
         csv_path=csv_path,
         metadata_path=metadata_path,
         judgments_path=judgments_path,
