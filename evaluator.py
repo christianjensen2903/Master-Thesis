@@ -24,8 +24,8 @@ EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
 class Evaluator:
     def __init__(
         self,
-        retriever: BaseRetriever | None,
-        embeddings: NDArray | None,
+        retriever: BaseRetriever,
+        embeddings: NDArray | None = None,
         mode: EvaluatorMode = "citation_pairs",
         csv_path: str = "data/par-to-par-cleaned.csv",
         metadata_path: str = "data/par-to-par.json",
@@ -227,7 +227,6 @@ class Evaluator:
         self.sorted_dates = self.paragraph_dates[self.sort_idx]
 
     def evaluate_map(self) -> float:
-        assert self.retriever is not None
         assert self.embeddings is not None
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
@@ -296,8 +295,6 @@ class Evaluator:
         print("Loading and preparing data...")
         self.load_and_prepare()
 
-        assert self.retriever is not None
-        assert self.embeddings is not None
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
 
@@ -305,13 +302,22 @@ class Evaluator:
         print(f"Train paragraphs: {np.sum(self.paragraph_set == 'train')}")
         print(f"Test paragraphs: {np.sum(self.paragraph_set == 'test')}")
 
-        # Validate embeddings match paragraph index
-        if len(self.embeddings) != len(self.pid_to_text):
-            raise ValueError(
-                f"Embeddings size mismatch: got {len(self.embeddings)} embeddings "
-                f"but have {len(self.pid_to_text)} paragraphs. "
-                f"You must regenerate embeddings in '{self.mode}' mode."
-            )
+        # Generate embeddings if not provided
+        if self.embeddings is None:
+            print("\nGenerating embeddings from retriever...")
+            train_mask = self.paragraph_set == "train"
+            # Fit on training data, transform on all data
+            self.retriever.fit(self.pid_to_text, mask=train_mask)
+            self.embeddings = self.retriever.transform(self.pid_to_text)
+            print(f"Embeddings shape: {self.embeddings.shape}")
+        else:
+            # Validate embeddings match paragraph index
+            if len(self.embeddings) != len(self.pid_to_text):
+                raise ValueError(
+                    f"Embeddings size mismatch: got {len(self.embeddings)} embeddings "
+                    f"but have {len(self.pid_to_text)} paragraphs. "
+                    f"You must regenerate embeddings in '{self.mode}' mode."
+                )
 
         if self.mode == "citation_pairs":
             assert self.df is not None
@@ -328,63 +334,23 @@ class Evaluator:
 
 if __name__ == "__main__":
     from retrievers import TfidfRetriever
-    from data_loader import load_citation_data, split_train_test, build_paragraph_index
 
-    print("Loading data...")
-    csv_path = "data/par-to-par-cleaned.csv"
-    metadata_path = "data/par-to-par.json"
-    judgments_path = "data/judgments_cleaned.json"
-    cutoff_year = 2018
-    df, metadata = load_citation_data(csv_path, metadata_path)
-    train_meta, test_meta = split_train_test(metadata, cutoff_year=cutoff_year)
-
-    print("Building paragraph index...")
-    (
-        pid_to_text,
-        celex_number_to_pid,
-        paragraph_dates,
-        paragraph_celex,
-        paragraph_number,
-        paragraph_set,
-    ) = build_paragraph_index(df, train_meta, test_meta)
-
-    print(f"Total paragraphs: {len(pid_to_text)}")
-    print(f"Train paragraphs: {np.sum(paragraph_set == 'train')}")
-
-    # Initialize and fit retriever
-    print("\nFitting TF-IDF retriever...")
+    print("Initializing TF-IDF retriever...")
     retriever = TfidfRetriever(
         stop_words="english",
         strip_accents="ascii",
         norm="l2",
     )
 
-    train_mask = paragraph_set == "train"
-    embeddings = retriever.fit_transform(pid_to_text, train_mask)
-    print(f"Embeddings shape: {embeddings.shape}")
-
     evaluator = Evaluator(
-        retriever=None,  # We'll set this later
-        embeddings=None,  # We'll set this later
+        retriever=retriever,
         # mode="all_paragraphs",
-        csv_path=csv_path,
-        metadata_path=metadata_path,
-        judgments_path=judgments_path,
-        train_cutoff_year=cutoff_year,
+        csv_path="data/par-to-par-cleaned.csv",
+        metadata_path="data/par-to-par.json",
+        judgments_path="data/judgments_cleaned.json",
+        train_cutoff_year=2018,
         top_k=10000,
     )
 
-    # 2. Load the paragraph index
-    evaluator.load_and_prepare()
-
-    # Generate embeddings for ALL paragraphs in all_paragraphs mode
-    assert evaluator.pid_to_text is not None
-    embeddings = retriever.transform(evaluator.pid_to_text)
-
-    # 4. Now set the retriever and embeddings
-    evaluator.retriever = retriever
-    evaluator.embeddings = embeddings
-
-    # 5. Run evaluation (skip load_and_prepare since we already did it)
-    score = evaluator.evaluate_map()
-    print(f"MAP: {score:.4f}")
+    score = evaluator.run()
+    print(f"Final MAP: {score:.4f}")
