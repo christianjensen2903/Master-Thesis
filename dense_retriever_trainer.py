@@ -62,18 +62,6 @@ class DenseRetrieverTrainer:
         documents = {}
         relevant_docs: dict[str, set[str]] = {}
 
-        for _, row in val_df.iterrows():
-            text_from = str(row["TEXT_FROM"])
-            text_to = str(row["TEXT_TO"])
-            from_id = str(row["FROM_ID"])
-            to_id = str(row["TO_ID"])
-
-            if from_id not in queries:
-                queries[from_id] = text_from
-                relevant_docs[from_id] = set()
-
-            relevant_docs[from_id].add(to_id)
-
         for _, row in train_df.iterrows():
             text_from = str(row["TEXT_FROM"])
             text_to = str(row["TEXT_TO"])
@@ -82,6 +70,21 @@ class DenseRetrieverTrainer:
 
             documents[from_id] = text_from
             documents[to_id] = text_to
+
+        for _, row in val_df.iterrows():
+            text_from = str(row["TEXT_FROM"])
+            text_to = str(row["TEXT_TO"])
+            from_id = str(row["FROM_ID"])
+            to_id = str(row["TO_ID"])
+
+            if to_id not in documents:
+                continue
+
+            if from_id not in queries:
+                queries[from_id] = text_from
+                relevant_docs[from_id] = set()
+
+            relevant_docs[from_id].add(to_id)
 
         evaluator = InformationRetrievalEvaluator(
             queries=queries,
