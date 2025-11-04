@@ -384,12 +384,12 @@ class Evaluator:
         print(f"\nComputing {metric_name}...")
         score = self.evaluate_map()
 
-        print(f"\n{metric_name}: {score:.4f}")
+        print(f"\n{metric_name}: {score:.3f}")
 
         print("\nComputing Recall@k...")
-        recall_scores = self.evaluate_recall([5, 10, 50, 100])
+        recall_scores = self.evaluate_recall([5, 10, 100])
         for k, recall in sorted(recall_scores.items()):
-            print(f"Recall@{k}: {recall:.4f}")
+            print(f"Recall@{k}: {recall:.3f}")
 
         return score
 
@@ -406,7 +406,7 @@ if __name__ == "__main__":
 
     evaluator = Evaluator(
         retriever=retriever,
-        # mode="all_paragraphs",
+        mode="all_paragraphs",
         csv_path="data/par-to-par-cleaned.csv",
         metadata_path="data/par-to-par.json",
         judgments_path="data/judgments_cleaned.json",
@@ -415,4 +415,4 @@ if __name__ == "__main__":
     )
 
     score = evaluator.run()
-    print(f"Final MAP: {score:.4f}")
+    print(f"Final MAP: {score:.3f}")

@@ -31,7 +31,7 @@ class DenseRetriever(BaseRetriever):
 
     def transform(self, texts: np.ndarray) -> np.ndarray:
         embeddings = self.model.encode(
-            texts.tolist(),
+            texts,
             batch_size=self.batch_size,
             show_progress_bar=self.show_progress_bar,
             normalize_embeddings=self.normalize_embeddings,
