@@ -67,6 +67,7 @@ class Evaluator:
         self.sorted_dates: NDArray | None = None
 
         self.map_score: float | None = None
+        self.recall_scores: dict[int, float] | None = None
 
     def load_and_prepare(self) -> None:
         if self.mode == "citation_pairs":
@@ -290,6 +291,62 @@ class Evaluator:
         self.map_score = float(np.mean(avg_precs)) if avg_precs else 0.0
         return self.map_score
 
+    def evaluate_recall(
+        self, k_values: list[int] = [5, 10, 50, 100]
+    ) -> dict[int, float]:
+        assert self.embeddings is not None
+        assert self.pid_to_text is not None
+        assert self.paragraph_set is not None
+        assert self.cited_by_pid is not None
+
+        test_source_pids = [
+            pid
+            for pid in range(len(self.pid_to_text))
+            if self.paragraph_set[pid] == "test"
+            and len(self.cited_by_pid.get(pid, [])) > 0
+        ]
+
+        recall_at_k: dict[int, list[float]] = {k: [] for k in k_values}
+
+        desc = "Evaluating Recall"
+        for src_pid in tqdm(test_source_pids, desc=desc):  # type: ignore
+            assert self.paragraph_dates is not None
+            assert self.sorted_dates is not None
+            assert self.sort_idx is not None
+
+            src_date = self.paragraph_dates[src_pid]
+
+            # Get all paragraphs strictly older than source
+            cutoff = int(np.searchsorted(self.sorted_dates, src_date, side="left"))
+            cand_pids = self.sort_idx[:cutoff]
+
+            if len(cand_pids) == 0:
+                continue
+
+            # Ground truth: cited paragraphs that are also older
+            relevant = set(self.cited_by_pid[src_pid]).intersection(set(cand_pids))
+            num_rel = len(relevant)
+            if num_rel == 0:
+                continue
+
+            # Retrieve and rank candidates (with optional top_k limit)
+            ranked_pids = self.retriever.retrieve(
+                src_pid, self.embeddings, cand_pids, top_k=self.top_k
+            )
+
+            # Compute recall at each k
+            for k in k_values:
+                top_k_pids = ranked_pids[:k]
+                num_retrieved_relevant = len(set(top_k_pids).intersection(relevant))
+                recall = num_retrieved_relevant / num_rel if num_rel > 0 else 0.0
+                recall_at_k[k].append(recall)
+
+        self.recall_scores = {
+            k: float(np.mean(recalls)) if recalls else 0.0
+            for k, recalls in recall_at_k.items()
+        }
+        return self.recall_scores
+
     def run(self) -> float:
         print(f"Mode: {self.mode}")
         print("Loading and preparing data...")
@@ -328,6 +385,11 @@ class Evaluator:
         score = self.evaluate_map()
 
         print(f"\n{metric_name}: {score:.4f}")
+
+        print("\nComputing Recall@k...")
+        recall_scores = self.evaluate_recall([5, 10, 50, 100])
+        for k, recall in sorted(recall_scores.items()):
+            print(f"Recall@{k}: {recall:.4f}")
 
         return score
 
