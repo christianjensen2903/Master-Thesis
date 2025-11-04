@@ -48,7 +48,12 @@ class GNNTrainer:
         self.embeddings_cache_dir = embeddings_cache_dir
         self.use_temporal_validation = use_temporal_validation
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         print(f"Using device: {self.device}")
 
         # Create cache directory if specified
@@ -101,35 +106,23 @@ class GNNTrainer:
             wandb.finish()
 
     def build_par_id_to_idx(
-        self, train_df: pd.DataFrame, val_df: pd.DataFrame
+        self, df: pd.DataFrame
     ) -> tuple[dict[str, int], np.ndarray]:
-        """Build paragraph ID to index mapping from both train and validation data."""
-        # Combine train and val dataframes
-        combined_df = pd.concat([train_df, val_df], ignore_index=True)
-
-        # Ensure FROM_ID and TO_ID exist (if not already created by load_and_split_data)
-        if "FROM_ID" not in combined_df.columns and "CELEX_FROM" in combined_df.columns:
-            combined_df["FROM_ID"] = (
-                combined_df["CELEX_FROM"]
-                + "::"
-                + combined_df["NUMBER_FROM"].astype(str)
-            )
-        if "TO_ID" not in combined_df.columns and "CELEX_TO" in combined_df.columns:
-            combined_df["TO_ID"] = (
-                combined_df["CELEX_TO"] + "::" + combined_df["NUMBER_TO"].astype(str)
-            )
+        """Build paragraph ID to index mapping"""
+        df["FROM_ID"] = df["CELEX_FROM"] + "::" + df["NUMBER_FROM"].astype(str)
+        df["TO_ID"] = df["CELEX_TO"] + "::" + df["NUMBER_TO"].astype(str)
 
         # Get all unique paragraph IDs and their texts
-        combined_ids = pd.DataFrame(
+        ids = pd.DataFrame(
             {
-                "PAR_ID": pd.concat([combined_df["FROM_ID"], combined_df["TO_ID"]]),
-                "TEXT": pd.concat([combined_df["TEXT_FROM"], combined_df["TEXT_TO"]]),
+                "PAR_ID": pd.concat([df["FROM_ID"], df["TO_ID"]]),
+                "TEXT": pd.concat([df["TEXT_FROM"], df["TEXT_TO"]]),
             }
         ).drop_duplicates(subset=["PAR_ID"])
 
         # Create ID to integer mapping
-        par_id_to_idx = {par_id: i for i, par_id in enumerate(combined_ids["PAR_ID"])}
-        all_texts = combined_ids["TEXT"].fillna("").values
+        par_id_to_idx = {par_id: i for i, par_id in enumerate(ids["PAR_ID"])}
+        all_texts = ids["TEXT"].fillna("").values
 
         return par_id_to_idx, all_texts
 
@@ -149,26 +142,24 @@ class GNNTrainer:
         basename = os.path.basename(model_name)
         return basename.replace("/", "_").replace("\\", "_")
 
-    def _load_cached_embeddings(self, model_name: str) -> np.ndarray | None:
+    def _load_cached_embeddings(self, key: str) -> np.ndarray | None:
         """Load embeddings from cache if they exist."""
         if not self.embeddings_cache_dir:
             return None
 
-        sanitized_name = self._sanitize_model_name(model_name)
-        cache_path = os.path.join(self.embeddings_cache_dir, f"{sanitized_name}.pkl")
+        cache_path = os.path.join(self.embeddings_cache_dir, f"{key}.pkl")
         if os.path.exists(cache_path):
             print(f"Loading cached embeddings from {cache_path}")
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
         return None
 
-    def _save_cached_embeddings(self, embeddings: np.ndarray, model_name: str) -> None:
+    def _save_cached_embeddings(self, embeddings: np.ndarray, key: str) -> None:
         """Save embeddings to cache."""
         if not self.embeddings_cache_dir:
             return
 
-        sanitized_name = self._sanitize_model_name(model_name)
-        cache_path = os.path.join(self.embeddings_cache_dir, f"{sanitized_name}.pkl")
+        cache_path = os.path.join(self.embeddings_cache_dir, f"{key}.pkl")
         print(f"Saving embeddings to cache: {cache_path}")
         with open(cache_path, "wb") as f:
             pickle.dump(embeddings, f)
@@ -200,8 +191,6 @@ class GNNTrainer:
                     continue
 
                 edge_list.append([src, tgt])
-                # Add reverse edge for undirected message passing
-                edge_list.append([tgt, src])
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -252,11 +241,8 @@ class GNNTrainer:
         model.train()
 
         # Move graph to device
-        x = graph_data.x.to(self.device)
-        edge_index = graph_data.edge_index.to(self.device)
-
-        # Forward pass on entire graph
-        embeddings = model(x, edge_index)
+        raw_embeddings = graph_data.x.to(self.device)
+        gnn_embeddings = model(raw_embeddings, graph_data.edge_index.to(self.device))
 
         # Build anchor/positive pairs from citation graph
         anchor_ids: list[int] = []
@@ -266,7 +252,7 @@ class GNNTrainer:
             positive_ids.append(random.choice(cited_ids))
 
         # Sample negatives (excluding anchor and cited nodes)
-        num_nodes = len(embeddings)
+        num_nodes = len(gnn_embeddings)
         negative_ids: list[list[int]] = []
         for anchor_id in anchor_ids:
             cited_set = set(citation_graph.get(anchor_id, []))
@@ -294,9 +280,9 @@ class GNNTrainer:
             negative_ids, dtype=torch.long, device=self.device
         )
 
-        anchor_emb = embeddings[anchor_tensor]
-        positive_emb = embeddings[positive_tensor]
-        negative_emb = embeddings[negative_tensor]
+        anchor_emb = raw_embeddings[anchor_tensor]
+        positive_emb = gnn_embeddings[positive_tensor]
+        negative_emb = gnn_embeddings[negative_tensor]
 
         # Compute loss
         loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
@@ -311,11 +297,11 @@ class GNNTrainer:
 
     def create_validation_data(
         self, val_df: pd.DataFrame, train_df: pd.DataFrame
-    ) -> tuple[dict[str, str], dict[str, str], dict[str, set[str]]]:
+    ) -> tuple[dict[str, set[str]], dict[str, str], np.ndarray]:
         """Create validation data structures for IR evaluation."""
-        queries: dict[str, str] = {}
-        documents: dict[str, str] = {}
-        relevant_docs: dict[str, set[str]] = {}
+        docs: dict[str, str] = {}
+        qrels: dict[str, set[str]] = {}
+        queries: list[str] = []
 
         # Build document corpus from training data
         for _, row in train_df.iterrows():
@@ -324,8 +310,8 @@ class GNNTrainer:
             from_id = str(row["FROM_ID"])
             to_id = str(row["TO_ID"])
 
-            documents[from_id] = text_from
-            documents[to_id] = text_to
+            docs[from_id] = text_from
+            docs[to_id] = text_to
 
         # Build queries and relevant docs from validation data
         for _, row in val_df.iterrows():
@@ -334,25 +320,24 @@ class GNNTrainer:
             to_id = str(row["TO_ID"])
 
             # Only include if target document exists in training corpus
-            if to_id not in documents:
+            if to_id not in docs:
                 continue
 
-            if from_id not in queries:
-                queries[from_id] = text_from
-                relevant_docs[from_id] = set()
+            if from_id not in qrels:
+                queries.append(text_from)
+                qrels[from_id] = set()
 
-            relevant_docs[from_id].add(to_id)
+            qrels[from_id].add(to_id)
 
-        return queries, documents, relevant_docs
+        return qrels, docs, np.array(queries, dtype=object)
 
     def evaluate_ir_metrics(
         self,
         model: nn.Module,
         graph_data: Data,
-        queries: dict[str, str],
-        documents: dict[str, str],
-        relevant_docs: dict[str, set[str]],
-        par_id_to_idx: dict[str, int],
+        query_embeddings: np.ndarray,
+        qrels: dict[str, set[str]],
+        train_id_to_idx: dict[str, int],
         k_values: list[int] = [5, 10, 50, 100],
     ) -> dict[str, float]:
         """Evaluate IR metrics using GNN embeddings."""
@@ -362,27 +347,14 @@ class GNNTrainer:
         with torch.no_grad():
             x = graph_data.x.to(self.device)
             edge_index = graph_data.edge_index.to(self.device)
-            embeddings = model(x, edge_index)
-            embeddings = F.normalize(embeddings, p=2, dim=1)
-            embeddings = embeddings.cpu().numpy()
+            doc_embeddings = model(x, edge_index)
+            doc_embeddings = F.normalize(doc_embeddings, p=2, dim=1)
+            doc_embeddings = doc_embeddings.cpu().numpy()
 
-        # Build document embedding matrix (only training documents)
-        doc_ids = list(documents.keys())
-        doc_embeddings = np.zeros((len(doc_ids), embeddings.shape[1]), dtype=np.float32)
-        for i, doc_id in enumerate(doc_ids):
-            if doc_id in par_id_to_idx:
-                idx = par_id_to_idx[doc_id]
-                doc_embeddings[i] = embeddings[idx]
+        doc_embeddings = graph_data.x.cpu().numpy()
 
-        # Build query embeddings
-        query_ids = list(queries.keys())
-        query_embeddings = np.zeros(
-            (len(query_ids), embeddings.shape[1]), dtype=np.float32
-        )
-        for i, query_id in enumerate(query_ids):
-            if query_id in par_id_to_idx:
-                idx = par_id_to_idx[query_id]
-                query_embeddings[i] = embeddings[idx]
+        print(f"Doc embeddings shape: {doc_embeddings.shape}")
+        print(f"Query embeddings shape: {query_embeddings.shape}")
 
         # Compute similarities
         similarities = query_embeddings @ doc_embeddings.T
@@ -393,18 +365,13 @@ class GNNTrainer:
         precision_scores: dict[int, list[float]] = {k: [] for k in k_values}
         recall_scores: dict[int, list[float]] = {k: [] for k in k_values}
 
-        for i, query_id in enumerate(query_ids):
-            if query_id not in relevant_docs:
-                continue
+        train_idx_to_id = {v: k for k, v in train_id_to_idx.items()}
 
-            rel_docs = relevant_docs[query_id]
-            if not rel_docs:
-                continue
-
+        for i, rel_docs in enumerate(qrels.values()):
             # Get top-k documents
             top_k = max(k_values)
             top_indices = np.argsort(-similarities[i])[:top_k]
-            top_doc_ids = [doc_ids[idx] for idx in top_indices]
+            top_doc_ids = [train_idx_to_id[idx] for idx in top_indices]
 
             # Compute MAP@1000 (using all top-k)
             map_score = 0.0
@@ -458,23 +425,34 @@ class GNNTrainer:
 
         train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_year)
 
-        par_id_to_idx, all_texts = self.build_par_id_to_idx(train_df, val_df)
+        # Build paragraph mapping only from training data
+        train_id_to_idx, train_texts = self.build_par_id_to_idx(train_df)
+        # _, val_texts = self.build_par_id_to_idx(val_df)
+        qrels, docs, val_texts = self.create_validation_data(val_df, train_df)
 
         train_citation_graph = self.build_citation_graph_from_df(
-            train_df, par_id_to_idx
+            train_df, train_id_to_idx
         )
 
         print(f"\nLoading text encoder: {self.text_encoder_name}")
         text_encoder = SentenceTransformer(self.text_encoder_name)
 
         print("Loading embeddings...")
-        text_embeddings = self._load_cached_embeddings(self.text_encoder_name)
-        if text_embeddings is None:
-            text_embeddings = self._encode_texts(all_texts, text_encoder)
-            self._save_cached_embeddings(text_embeddings, self.text_encoder_name)
+        model_name = self._sanitize_model_name(self.text_encoder_name)
+        train_embeddings_key = f"{model_name}_train"
+        train_embeddings = self._load_cached_embeddings(train_embeddings_key)
+        if train_embeddings is None:
+            train_embeddings = self._encode_texts(train_texts, text_encoder)
+            self._save_cached_embeddings(train_embeddings, train_embeddings_key)
+
+        val_embeddings_key = f"{model_name}_val"
+        val_embeddings = self._load_cached_embeddings(val_embeddings_key)
+        if val_embeddings is None:
+            val_embeddings = self._encode_texts(val_texts, text_encoder)
+            self._save_cached_embeddings(val_embeddings, val_embeddings_key)
 
         graph_data = self.build_graph_data(
-            all_texts, train_citation_graph, text_embeddings
+            train_texts, train_citation_graph, train_embeddings
         )
 
         print("\nInitializing GNN model...")
@@ -491,10 +469,8 @@ class GNNTrainer:
         self.setup_wandb()
 
         # Prepare validation data
-        queries, documents, relevant_docs = self.create_validation_data(
-            val_df, train_df
-        )
-        print(f"\nValidation: {len(queries)} queries, {len(documents)} documents")
+
+        print(f"\nValidation: {len(qrels)} queries, {len(docs)} documents")
 
         print(f"\nStarting training for {self.epochs} epochs...")
         best_loss = float("inf")
@@ -522,14 +498,13 @@ class GNNTrainer:
                 or epoch == self.epochs - 1
             )
 
-            if should_eval and len(queries) > 0:
+            if should_eval:
                 val_metrics = self.evaluate_ir_metrics(
                     model,
                     graph_data,
-                    queries,
-                    documents,
-                    relevant_docs,
-                    par_id_to_idx,
+                    val_embeddings,
+                    qrels,
+                    train_id_to_idx,
                 )
 
                 print(f"  Validation Metrics:")

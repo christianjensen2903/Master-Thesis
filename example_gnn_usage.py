@@ -1,7 +1,7 @@
 import pandas as pd  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from gnn_trainers import GNNTrainer
-from torch_geometric.nn import GAT
+from torch_geometric.nn import GAT, GCN
 
 
 def train_example() -> None:
@@ -17,15 +17,15 @@ def train_example() -> None:
     in_channels = text_encoder.get_sentence_embedding_dimension()
 
     # Option 1: Optimized GraphSAGE
-    model = GAT(
+    model = GCN(
         in_channels=in_channels,
         hidden_channels=in_channels,
         out_channels=in_channels,
         num_layers=2,
         dropout=0.2,
-        v2=True,
-        heads=2,
-        concat=True,
+        # v2=True,
+        # heads=2,
+        # concat=True,
     )
 
     trainer = GNNTrainer(
