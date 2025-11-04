@@ -19,6 +19,7 @@ from utils.temporal_graph import (
     print_temporal_graph_stats,
 )
 from validation_utils import split_data_by_date
+from torch_geometric.nn import GAT
 
 
 class GNNTrainer:
@@ -62,7 +63,7 @@ class GNNTrainer:
             os.makedirs(self.embeddings_cache_dir, exist_ok=True)
 
     def load_and_split_data(
-        self, paragraph_file: str, cutoff_date: pd.Timestamp
+        self, paragraph_file: str, cutoff_year: int
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Load data and split into train/validation sets."""
         df = pd.read_csv(paragraph_file)
@@ -82,9 +83,7 @@ class GNNTrainer:
                 df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
             )
 
-        return split_data_by_date(
-            df, cutoff_date, self.validation_split, self.use_temporal_validation
-        )
+        return split_data_by_date(df, cutoff_year)
 
     def setup_wandb(self, config: dict) -> None:
         """Initialize wandb with the given config."""
@@ -471,14 +470,14 @@ class GNNTrainer:
         self,
         gnn_model: nn.Module,
         paragraph_file: str,
-        cutoff_date: pd.Timestamp,
+        cutoff_year: int,
         precomputed_embeddings: np.ndarray | None = None,
     ) -> torch.nn.Module:
         # Create output directory if it doesn't exist
         os.makedirs(self.output_path, exist_ok=True)
 
         # Load and split data
-        train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_date)
+        train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_year)
 
         # Build citation graphs for train and validation
         # For temporal validation, we need to include validation paragraphs in the graph

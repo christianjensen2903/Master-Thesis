@@ -11,7 +11,7 @@ def train_example() -> None:
     print("=" * 80 + "\n")
 
     # Initialize text encoder
-    encoding_model = "sentence-transformers/all-MiniLM-L6-v2"
+    encoding_model = "checkpoints/simcse_citation_model"
     text_encoder = SentenceTransformer(encoding_model)
 
     # Option 1: Optimized GraphSAGE
@@ -37,13 +37,13 @@ def train_example() -> None:
         temperature=0.05,
         num_negatives=12,
         validation_split=0.1,
-        use_wandb=True,
+        use_wandb=False,
         embeddings_cache_dir="artifacts/embeddings_cache",
     )
 
     # Train on paragraph pairs (pass model to train method)
-    cutoff_date = pd.Timestamp("2018-01-01")
-    trainer.train(model, "data/par-to-par-og.csv", cutoff_date)
+    cutoff_year = 2018
+    trainer.train(model, "data/par-to-par-cleaned.csv", cutoff_year)
 
     print("\nTraining complete!")
 
