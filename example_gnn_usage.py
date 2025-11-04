@@ -35,7 +35,7 @@ def train_example() -> None:
         epochs=50,
         eval_every_n_epochs=1,
         learning_rate=3e-4,
-        weight_decay=1e-4,
+        weight_decay=1e-2,
         temperature=0.05,
         num_negatives=12,
         validation_split=0.1,

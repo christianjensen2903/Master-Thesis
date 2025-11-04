@@ -351,11 +351,6 @@ class GNNTrainer:
             doc_embeddings = F.normalize(doc_embeddings, p=2, dim=1)
             doc_embeddings = doc_embeddings.cpu().numpy()
 
-        doc_embeddings = graph_data.x.cpu().numpy()
-
-        print(f"Doc embeddings shape: {doc_embeddings.shape}")
-        print(f"Query embeddings shape: {query_embeddings.shape}")
-
         # Compute similarities
         similarities = query_embeddings @ doc_embeddings.T
 
