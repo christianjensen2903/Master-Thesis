@@ -1,7 +1,6 @@
 import os
 import random
 import pickle
-import hashlib
 import wandb
 import pandas as pd  # type: ignore
 import numpy as np
@@ -13,13 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.data import Data  # type: ignore
 from tqdm import tqdm  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
-from utils.temporal_graph import (
-    build_temporal_dag,
-    validate_temporal_dag,
-    print_temporal_graph_stats,
-)
 from validation_utils import split_data_by_date
-from torch_geometric.nn import GAT
 
 
 class GNNTrainer:
@@ -85,8 +78,19 @@ class GNNTrainer:
 
         return split_data_by_date(df, cutoff_year)
 
-    def setup_wandb(self, config: dict) -> None:
+    def setup_wandb(self) -> None:
         """Initialize wandb with the given config."""
+
+        config = {
+            "text_encoder": self.text_encoder_name,
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "temperature": self.temperature,
+            "num_negatives": self.num_negatives,
+            "batch_size": self.batch_size,
+            "epochs": self.epochs,
+            "eval_every_n_epochs": self.eval_every_n_epochs,
+        }
         if self.use_wandb:
             wandb.init(project=self.project_name, config=config)
 
@@ -98,134 +102,77 @@ class GNNTrainer:
 
     def build_citation_graph_from_df(
         self, df: pd.DataFrame
-    ) -> tuple[dict[int, list[int]], dict[str, int], np.ndarray, np.ndarray]:
-        """
-        Build citation graph using (CELEX, PARAGRAPH_NUMBER) as unique node IDs.
+    ) -> tuple[dict[int, list[int]], dict[str, int], np.ndarray]:
+        """Build citation graph using (CELEX, NUMBER) as unique node IDs."""
 
-        This ensures:
-        - Same text in different cases = different nodes
-        - No date ambiguity (each case has one date)
-        - Preserved provenance (know which case each paragraph comes from)
-        """
-        # Build unique paragraph IDs: CELEX::NUMBER
-        if "FROM_ID" not in df.columns:
-            df["FROM_ID"] = (
-                df["CELEX_FROM"].astype(str) + "::" + df["NUMBER_FROM"].astype(str)
-            )
-        if "TO_ID" not in df.columns:
-            df["TO_ID"] = (
-                df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
-            )
+        df["FROM_ID"] = df["CELEX_FROM"] + "::" + df["NUMBER_FROM"].astype(str)
+        df["TO_ID"] = df["CELEX_TO"] + "::" + df["NUMBER_TO"].astype(str)
 
-        # Collect all unique paragraph IDs and their texts
-        all_from_data = df[["FROM_ID", "TEXT_FROM", "DATE_FROM"]].drop_duplicates(
-            subset=["FROM_ID"]
-        )
-        all_to_data = df[["TO_ID", "TEXT_TO", "DATE_TO"]].drop_duplicates(
-            subset=["TO_ID"]
-        )
-
-        # Combine and create unified mapping
-        combined_ids = pd.concat(
-            [
-                all_from_data.rename(
-                    columns={
-                        "FROM_ID": "PAR_ID",
-                        "TEXT_FROM": "TEXT",
-                        "DATE_FROM": "DATE",
-                    }
-                ),
-                all_to_data.rename(
-                    columns={"TO_ID": "PAR_ID", "TEXT_TO": "TEXT", "DATE_TO": "DATE"}
-                ),
-            ]
+        combined_ids = pd.DataFrame(
+            {
+                "PAR_ID": pd.concat([df["FROM_ID"], df["TO_ID"]]),
+                "TEXT": pd.concat([df["TEXT_FROM"], df["TEXT_TO"]]),
+            }
         ).drop_duplicates(subset=["PAR_ID"])
 
         # Create ID to integer mapping
-        par_id_to_idx = {
-            str(par_id): i for i, par_id in enumerate(combined_ids["PAR_ID"])
-        }
+        par_id_to_idx = {par_id: i for i, par_id in enumerate(combined_ids["PAR_ID"])}
 
-        # Extract texts and dates arrays
         all_texts = combined_ids["TEXT"].fillna("").values
-        paragraph_dates = pd.to_datetime(combined_ids["DATE"]).values
 
         # Build citation graph
-        citation_graph: dict[int, list[int]] = {}
-        for _, row in df.iterrows():
-            from_id = str(row["FROM_ID"])
-            to_id = str(row["TO_ID"])
+        df["src_idx"] = df["FROM_ID"].map(par_id_to_idx)
+        df["tgt_idx"] = df["TO_ID"].map(par_id_to_idx)
+        citation_graph = df.groupby("src_idx")["tgt_idx"].apply(list).to_dict()
 
-            if from_id in par_id_to_idx and to_id in par_id_to_idx:
-                src_idx = par_id_to_idx[from_id]
-                tgt_idx = par_id_to_idx[to_id]
+        return citation_graph, par_id_to_idx, all_texts
 
-                if src_idx not in citation_graph:
-                    citation_graph[src_idx] = []
-                citation_graph[src_idx].append(tgt_idx)
+    def _sanitize_model_name(self, model_name: str) -> str:
+        """Sanitize model name to be a valid filename by removing path separators."""
+        # Extract basename and replace any remaining path separators with underscores
+        basename = os.path.basename(model_name)
+        return basename.replace("/", "_").replace("\\", "_")
 
-        return citation_graph, par_id_to_idx, all_texts, paragraph_dates
-
-    def _compute_cache_key(self, texts: np.ndarray, encoder_name: str) -> str:
-        """Compute a unique cache key based on texts and encoder name."""
-        # Create hash from encoder name and texts
-        hasher = hashlib.sha256()
-        hasher.update(encoder_name.encode("utf-8"))
-        for text in texts:
-            hasher.update(str(text).encode("utf-8"))
-        return hasher.hexdigest()
-
-    def _load_cached_embeddings(self, cache_key: str) -> np.ndarray | None:
+    def _load_cached_embeddings(self, model_name: str) -> np.ndarray | None:
         """Load embeddings from cache if they exist."""
         if not self.embeddings_cache_dir:
             return None
 
-        cache_path = os.path.join(self.embeddings_cache_dir, f"{cache_key}.pkl")
+        sanitized_name = self._sanitize_model_name(model_name)
+        cache_path = os.path.join(self.embeddings_cache_dir, f"{sanitized_name}.pkl")
         if os.path.exists(cache_path):
             print(f"Loading cached embeddings from {cache_path}")
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
         return None
 
-    def _save_cached_embeddings(self, embeddings: np.ndarray, cache_key: str) -> None:
+    def _save_cached_embeddings(self, embeddings: np.ndarray, model_name: str) -> None:
         """Save embeddings to cache."""
         if not self.embeddings_cache_dir:
             return
 
-        cache_path = os.path.join(self.embeddings_cache_dir, f"{cache_key}.pkl")
+        sanitized_name = self._sanitize_model_name(model_name)
+        cache_path = os.path.join(self.embeddings_cache_dir, f"{sanitized_name}.pkl")
         print(f"Saving embeddings to cache: {cache_path}")
         with open(cache_path, "wb") as f:
             pickle.dump(embeddings, f)
+
+    def _encode_texts(
+        self, texts: np.ndarray, text_encoder: SentenceTransformer
+    ) -> np.ndarray:
+        return text_encoder.encode(
+            texts.tolist(),
+            batch_size=self.batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
 
     def build_graph_data(
         self,
         texts: np.ndarray,
         citation_graph: dict[int, list[int]],
-        text_encoder: SentenceTransformer,
-        precomputed_embeddings: np.ndarray | None = None,
+        text_embeddings: np.ndarray,
     ) -> Data:
-        # Use pre-computed embeddings if provided
-        if precomputed_embeddings is not None:
-            print("Using pre-computed embeddings...")
-            text_embeddings = precomputed_embeddings
-        else:
-            # Try to load cached embeddings
-            cache_key = self._compute_cache_key(texts, self.text_encoder_name)
-            cached_embeddings = self._load_cached_embeddings(cache_key)
-
-            if cached_embeddings is None:
-                print("Encoding texts...")
-                text_embeddings = text_encoder.encode(
-                    texts.tolist(),
-                    batch_size=self.batch_size,
-                    show_progress_bar=True,
-                    convert_to_numpy=True,
-                )
-                # Save to cache for future use
-                self._save_cached_embeddings(text_embeddings, cache_key)
-            else:
-                print("Using cached embeddings")
-                text_embeddings = cached_embeddings
 
         x = torch.tensor(text_embeddings, dtype=torch.float32)
 
@@ -233,10 +180,12 @@ class GNNTrainer:
         edge_list = []
         for src, targets in citation_graph.items():
             for tgt in targets:
-                if src < len(texts) and tgt < len(texts):
-                    edge_list.append([src, tgt])
-                    # Add reverse edge for undirected message passing
-                    edge_list.append([tgt, src])
+                if src >= len(texts) or tgt >= len(texts):
+                    continue
+
+                edge_list.append([src, tgt])
+                # Add reverse edge for undirected message passing
+                edge_list.append([tgt, src])
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -283,7 +232,6 @@ class GNNTrainer:
         graph_data: Data,
         citation_graph: dict[int, list[int]],
         optimizer: torch.optim.Optimizer,
-        epoch: int,
     ) -> float:
         model.train()
 
@@ -352,210 +300,34 @@ class GNNTrainer:
 
         return float(loss.item())
 
-    @torch.no_grad()
-    def evaluate(
-        self,
-        model: nn.Module,
-        graph_data: Data,
-        val_citation_graph: dict[int, list[int]],
-        paragraph_dates: np.ndarray,
-    ) -> dict[str, float]:
-        """
-        Evaluate with proper temporal filtering - only rank against older paragraphs.
-        This matches the real evaluation in evaluator.py.
-        """
-        model.eval()
-
-        # Compute embeddings for all nodes in one forward pass
-        x = graph_data.x.to(self.device)
-        edge_index = graph_data.edge_index.to(self.device)
-
-        embeddings = model(x, edge_index)
-        embeddings = F.normalize(embeddings, p=2, dim=1).cpu().numpy()
-
-        # Pre-sort by date for temporal filtering
-        sort_idx = np.argsort(paragraph_dates)
-        sorted_dates = paragraph_dates[sort_idx]
-
-        # Compute MRR, MAP and Recall@k
-        ranks = []
-        recall_at_5 = 0
-        recall_at_10 = 0
-        recall_at_50 = 0
-        recall_at_100 = 0
-        average_precisions = []
-
-        for anchor_id, cited_ids in tqdm(
-            val_citation_graph.items(), desc="Evaluating", leave=False
-        ):
-            if not cited_ids or anchor_id >= len(embeddings):
-                continue
-
-            # ✅ CRITICAL: Only rank against temporally valid candidates (strictly older)
-            anchor_date = paragraph_dates[anchor_id]
-            cutoff = int(np.searchsorted(sorted_dates, anchor_date, side="left"))
-            cand_pids = sort_idx[:cutoff]
-
-            if len(cand_pids) == 0:
-                continue
-
-            # Filter cited_ids to only those that are temporally valid
-            valid_cited_ids = [
-                cid
-                for cid in cited_ids
-                if cid < len(embeddings) and cid in set(cand_pids)
-            ]
-
-            if not valid_cited_ids:
-                continue
-
-            # Compute similarities only for valid candidates
-            anchor_emb = embeddings[anchor_id]
-            candidate_embs = embeddings[cand_pids]
-            similarities = candidate_embs @ anchor_emb
-
-            # Rank candidates
-            ranked_order = np.argsort(-similarities)
-            ranked_pids = cand_pids[ranked_order]
-
-            # Find rank of positive samples and compute average precision
-            query_ranks = []
-            for cited_id in valid_cited_ids:
-                rank = np.where(ranked_pids == cited_id)[0]
-                if len(rank) > 0:
-                    rank_val = rank[0] + 1  # 1-indexed rank
-                    ranks.append(rank_val)
-                    query_ranks.append(rank_val)
-                    if rank_val <= 5:
-                        recall_at_5 += 1
-                    if rank_val <= 10:
-                        recall_at_10 += 1
-                    if rank_val <= 50:
-                        recall_at_50 += 1
-                    if rank_val <= 100:
-                        recall_at_100 += 1
-
-            # Compute average precision for this query
-            if query_ranks:
-                query_ranks_sorted = sorted(query_ranks)
-                precisions = []
-                for i, rank in enumerate(query_ranks_sorted):
-                    precision_at_rank = (i + 1) / rank
-                    precisions.append(precision_at_rank)
-                avg_precision = np.mean(precisions)
-                average_precisions.append(avg_precision)
-
-        if ranks:
-            mrr = float(np.mean([1.0 / r for r in ranks]))
-            recall_5 = float(recall_at_5 / len(ranks))
-            recall_10 = float(recall_at_10 / len(ranks))
-            recall_50 = float(recall_at_50 / len(ranks))
-            recall_100 = float(recall_at_100 / len(ranks))
-            map_score = (
-                float(np.mean(average_precisions)) if average_precisions else 0.0
-            )
-        else:
-            mrr = recall_5 = recall_10 = recall_50 = recall_100 = map_score = 0.0
-
-        return {
-            "mrr": mrr,
-            "recall@5": recall_5,
-            "recall@10": recall_10,
-            "recall@50": recall_50,
-            "recall@100": recall_100,
-            "map": map_score,
-        }
-
     def train(
         self,
         gnn_model: nn.Module,
         paragraph_file: str,
         cutoff_year: int,
-        precomputed_embeddings: np.ndarray | None = None,
     ) -> torch.nn.Module:
-        # Create output directory if it doesn't exist
         os.makedirs(self.output_path, exist_ok=True)
 
         # Load and split data
-        train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_year)
+        train_df, _ = self.load_and_split_data(paragraph_file, cutoff_year)
 
-        # Build citation graphs for train and validation
-        # For temporal validation, we need to include validation paragraphs in the graph
-        # even though we only train on training edges
-        print("\nBuilding graph from train + validation paragraphs...")
-        combined_df = pd.concat([train_df, val_df], ignore_index=True)
-        _, par_id_to_idx, all_texts, paragraph_dates = (
-            self.build_citation_graph_from_df(combined_df)
+        train_citation_graph, par_id_to_idx, all_texts = (
+            self.build_citation_graph_from_df(train_df)
         )
 
-        # Now build separate training citation graph (only train edges)
-        print("Building training citation graph...")
-        train_citation_graph: dict[int, list[int]] = {}
-        for _, row in train_df.iterrows():
-            from_id = str(row["FROM_ID"])
-            to_id = str(row["TO_ID"])
-
-            if from_id in par_id_to_idx and to_id in par_id_to_idx:
-                src_idx = par_id_to_idx[from_id]
-                tgt_idx = par_id_to_idx[to_id]
-
-                if src_idx not in train_citation_graph:
-                    train_citation_graph[src_idx] = []
-                train_citation_graph[src_idx].append(tgt_idx)
-
-        # Build temporal DAG (respects causality: older → newer only)
-        print("\nBuilding temporal DAG...")
-        temporal_dag = build_temporal_dag(train_citation_graph, paragraph_dates)
-
-        # Validate temporal DAG
-        print("\nValidating temporal DAG...")
-        if not validate_temporal_dag(temporal_dag, paragraph_dates):
-            raise ValueError("Invalid temporal DAG structure!")
-
-        # Print statistics
-        print_temporal_graph_stats(temporal_dag, paragraph_dates)
-
-        print("\nBuilding validation citation graph...")
-        val_citation_graph: dict[int, list[int]] = {}
-        skipped_citations = 0
-        for _, row in val_df.iterrows():
-            from_id = str(row["FROM_ID"])
-            to_id = str(row["TO_ID"])
-            # Both paragraphs should be in the combined graph now
-            if from_id in par_id_to_idx and to_id in par_id_to_idx:
-                src_idx = par_id_to_idx[from_id]
-                tgt_idx = par_id_to_idx[to_id]
-                if src_idx not in val_citation_graph:
-                    val_citation_graph[src_idx] = []
-                val_citation_graph[src_idx].append(tgt_idx)
-            else:
-                skipped_citations += 1
-
-        if skipped_citations > 0:
-            print(
-                f"⚠️  Skipped {skipped_citations}/{len(val_df)} validation citations (missing paragraphs)"
-            )
-
-        print(
-            f"✓ Training citations: {sum(len(v) for v in train_citation_graph.values())}"
-        )
-        print(
-            f"✓ Validation citations: {sum(len(v) for v in val_citation_graph.values())}"
-        )
-
-        # Initialize text encoder
         print(f"\nLoading text encoder: {self.text_encoder_name}")
         text_encoder = SentenceTransformer(self.text_encoder_name)
-        input_dim = text_encoder.get_sentence_embedding_dimension()
-        if input_dim is None:
-            raise ValueError("Text encoder does not provide embedding dimension")
 
-        # Build graph data using temporal DAG (causally masked)
+        print("Loading embeddings...")
+        text_embeddings = self._load_cached_embeddings(self.text_encoder_name)
+        if text_embeddings is None:
+            text_embeddings = self._encode_texts(all_texts, text_encoder)
+            self._save_cached_embeddings(text_embeddings, self.text_encoder_name)
+
         graph_data = self.build_graph_data(
-            all_texts, temporal_dag, text_encoder, precomputed_embeddings
+            all_texts, train_citation_graph, text_embeddings
         )
 
-        # Use provided GNN model (already initialized with text encoder)
         print("\nInitializing GNN model...")
         model = gnn_model.to(self.device)
 
@@ -567,125 +339,39 @@ class GNNTrainer:
         )
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
-        # Setup wandb
-        config = {
-            "model_type": type(gnn_model).__name__,
-            "text_encoder": self.text_encoder_name,
-            "learning_rate": self.learning_rate,
-            "weight_decay": self.weight_decay,
-            "temperature": self.temperature,
-            "num_negatives": self.num_negatives,
-            "batch_size": self.batch_size,
-            "epochs": self.epochs,
-            "eval_every_n_epochs": self.eval_every_n_epochs,
-            "num_nodes": len(all_texts),
-            "num_train_edges": sum(len(v) for k, v in temporal_dag.items()),
-            "num_val_edges": sum(len(v) for k, v in val_citation_graph.items()),
-        }
-        self.setup_wandb(config)
+        self.setup_wandb()
 
-        # Training loop
         print(f"\nStarting training for {self.epochs} epochs...")
         best_loss = float("inf")
-        best_val_map = 0.0
-        patience_counter = 0
-        patience = 10  # Early stopping patience
 
         for epoch in tqdm(
             range(self.epochs), desc="Training Progress", position=0, ncols=80
         ):
             train_loss = self.train_epoch(
-                model, graph_data, temporal_dag, optimizer, epoch
+                model, graph_data, train_citation_graph, optimizer
             )
 
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
-            # Evaluate on validation set
-            should_eval = (
-                self.eval_every_n_epochs is not None
-                and (epoch + 1) % self.eval_every_n_epochs == 0
-            )
+            if train_loss < best_loss:
+                best_loss = train_loss
+                torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
+                print(f"  ✓ New best model saved (Loss: {best_loss:.4f})")
 
-            if should_eval or (epoch + 1) == self.epochs:
-                print("  Evaluating on validation set...")
-                val_metrics = self.evaluate(
-                    model, graph_data, val_citation_graph, paragraph_dates
+            if self.use_wandb:
+                wandb.log(
+                    {
+                        "epoch": epoch + 1,
+                        "train_loss": train_loss,
+                    }
                 )
-                print(f"  Val MAP: {val_metrics['map']:.4f}")
-                print(f"  Val MRR: {val_metrics['mrr']:.4f}")
-                print(f"  Val Recall@10: {val_metrics['recall@10']:.4f}")
-
-                if self.use_wandb:
-                    wandb.log(
-                        {
-                            "epoch": epoch + 1,
-                            "train_loss": train_loss,
-                            "val_map": val_metrics["map"],
-                            "val_mrr": val_metrics["mrr"],
-                            "val_recall@5": val_metrics["recall@5"],
-                            "val_recall@10": val_metrics["recall@10"],
-                            "val_recall@50": val_metrics["recall@50"],
-                            "val_recall@100": val_metrics["recall@100"],
-                        }
-                    )
-                else:
-                    if self.use_wandb:
-                        wandb.log(
-                            {
-                                "epoch": epoch + 1,
-                                "train_loss": train_loss,
-                            }
-                        )
-
-                # Save best model based on validation MAP
-                if val_metrics["map"] > best_val_map:
-                    best_val_map = val_metrics["map"]
-                    patience_counter = 0
-                    torch.save(
-                        {
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "epoch": epoch,
-                            "best_val_map": best_val_map,
-                            "val_metrics": val_metrics,
-                            "config": config,
-                        },
-                        f"{self.output_path}/best_model.pt",
-                    )
-                    print(f"  ✓ New best model saved (MAP: {best_val_map:.4f})")
-                else:
-                    patience_counter += 1
-                    print(f"  No improvement ({patience_counter}/{patience})")
-
-                # Early stopping
-                if patience_counter >= patience:
-                    print(f"\n⚠ Early stopping triggered after {epoch + 1} epochs")
-                    break
-            else:
-                if self.use_wandb:
-                    wandb.log(
-                        {
-                            "epoch": epoch + 1,
-                            "train_loss": train_loss,
-                        }
-                    )
 
             scheduler.step()
 
-        # Save final model
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "config": config,
-            },
-            f"{self.output_path}/final_model.pt",
-        )
+        torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
 
-        print(f"\nTraining complete! Best validation MAP: {best_val_map:.4f}")
         print(f"Model saved to {self.output_path}")
 
         self.cleanup_wandb()
-
-        # Return the text encoder used for training
         return model
