@@ -35,7 +35,7 @@ def clean_judgments(
     print(f"Loaded {len(judgments)} judgments")
 
     # Clean each judgment
-    cleaned_judgments = []
+    cleaned_judgments = {}
     total_paragraphs = 0
     cleaned_paragraphs = 0
 
@@ -65,7 +65,7 @@ def clean_judgments(
                 cleaned_judgment["paragraphs"][para_num] = cleaned_text
                 cleaned_paragraphs += 1
 
-        cleaned_judgments.append(cleaned_judgment)
+        cleaned_judgments[celex_id] = cleaned_judgment
 
     # Save cleaned judgments
     print(f"\nSaving cleaned judgments to {output_path}...")
