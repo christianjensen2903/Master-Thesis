@@ -32,6 +32,7 @@ class GNNTrainer:
         project_name: str = "gnn-training",
         embeddings_cache_dir: str | None = None,
         use_temporal_validation: bool = True,
+        max_citations_per_anchor: int = 5,
     ):
         self.text_encoder_name = text_encoder_name
         self.output_path = output_path
@@ -47,6 +48,7 @@ class GNNTrainer:
         self.project_name = project_name
         self.embeddings_cache_dir = embeddings_cache_dir
         self.use_temporal_validation = use_temporal_validation
+        self.max_citations_per_anchor = max_citations_per_anchor
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -231,69 +233,127 @@ class GNNTrainer:
         loss = F.cross_entropy(logits, labels)
         return loss
 
-    def train_epoch(
+    def create_training_batches(
         self,
-        model: nn.Module,
-        graph_data: Data,
         citation_graph: dict[int, list[int]],
-        optimizer: torch.optim.Optimizer,
-    ) -> float:
-        model.train()
+        num_nodes: int,
+    ) -> list[tuple[list[int], list[int], list[list[int]]]]:
+        """Pre-compute training batches with negatives."""
+        print("Creating training batches...")
 
-        # Move graph to device
-        raw_embeddings = graph_data.x.to(self.device)
-        gnn_embeddings = model(raw_embeddings, graph_data.edge_index.to(self.device))
+        # Build all anchor-positive pairs
+        all_anchors = []
+        all_positives = []
 
-        # Build anchor/positive pairs from citation graph
-        anchor_ids: list[int] = []
-        positive_ids: list[int] = []
         for anchor_id, cited_ids in citation_graph.items():
-            anchor_ids.append(anchor_id)
-            positive_ids.append(random.choice(cited_ids))
+            # Limit citations per anchor to avoid huge batches
+            sampled_cites = (
+                cited_ids if len(cited_ids) <= 10 else random.sample(cited_ids, 10)
+            )
+            for cited_id in sampled_cites:
+                all_anchors.append(anchor_id)
+                all_positives.append(cited_id)
 
-        # Sample negatives (excluding anchor and cited nodes)
-        num_nodes = len(gnn_embeddings)
-        negative_ids: list[list[int]] = []
-        for anchor_id in anchor_ids:
-            cited_set = set(citation_graph.get(anchor_id, []))
-            excluded = cited_set.union({anchor_id})
+        print(f"Total training pairs: {len(all_anchors)}")
+
+        # Pre-sample negatives for all pairs
+        all_negatives = []
+        cited_by_node = {i: set(citation_graph.get(i, [])) for i in range(num_nodes)}
+
+        for anchor_id, positive_id in tqdm(
+            zip(all_anchors, all_positives),
+            total=len(all_anchors),
+            desc="Sampling negatives",
+        ):
+            excluded = cited_by_node[anchor_id].union({anchor_id, positive_id})
             candidates = [n for n in range(num_nodes) if n not in excluded]
 
             if len(candidates) >= self.num_negatives:
                 sampled = random.sample(candidates, self.num_negatives)
             else:
-                # Pad with random choices if needed
-                sampled = candidates.copy()
-                while len(sampled) < self.num_negatives and candidates:
-                    sampled.append(random.choice(candidates))
-                # Final fallback
-                while len(sampled) < self.num_negatives:
-                    sampled.append(0)
-            negative_ids.append(sampled)
+                # Fallback for small graphs
+                sampled = candidates + [
+                    random.choice(candidates) if candidates else 0
+                ] * (self.num_negatives - len(candidates))
 
-        # Gather embeddings
-        anchor_tensor = torch.tensor(anchor_ids, dtype=torch.long, device=self.device)
-        positive_tensor = torch.tensor(
-            positive_ids, dtype=torch.long, device=self.device
-        )
-        negative_tensor = torch.tensor(
-            negative_ids, dtype=torch.long, device=self.device
-        )
+            all_negatives.append(sampled)
 
-        anchor_emb = raw_embeddings[anchor_tensor]
-        positive_emb = gnn_embeddings[positive_tensor]
-        negative_emb = gnn_embeddings[negative_tensor]
+        # Shuffle and create batches
+        indices = list(range(len(all_anchors)))
+        random.shuffle(indices)
 
-        # Compute loss
-        loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
+        batches = []
+        for i in range(0, len(indices), self.batch_size):
+            batch_indices = indices[i : i + self.batch_size]
+            batch_anchors = [all_anchors[idx] for idx in batch_indices]
+            batch_positives = [all_positives[idx] for idx in batch_indices]
+            batch_negatives = [all_negatives[idx] for idx in batch_indices]
+            batches.append((batch_anchors, batch_positives, batch_negatives))
 
-        # Backward pass
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        print(f"Created {len(batches)} batches of size {self.batch_size}")
+        return batches
 
-        return float(loss.item())
+    def train_epoch(
+        self,
+        model: nn.Module,
+        graph_data: Data,
+        training_batches: list[tuple[list[int], list[int], list[list[int]]]],
+        optimizer: torch.optim.Optimizer,
+    ) -> float:
+        """Train one epoch with pre-computed batches."""
+        model.train()
+
+        # Compute GNN embeddings once for the entire graph
+        raw_embeddings = graph_data.x.to(self.device)
+        edge_index = graph_data.edge_index.to(self.device)
+
+        # Forward pass through GNN once per epoch
+        with torch.no_grad():
+            gnn_embeddings = model(raw_embeddings, edge_index)
+
+        gnn_embeddings.requires_grad = True  # Enable gradients for this tensor
+
+        total_loss = 0.0
+        num_batches = 0
+
+        for batch_anchors, batch_positives, batch_negatives in tqdm(
+            training_batches, desc="Training batches", leave=False
+        ):
+            # Convert to tensors
+            anchor_tensor = torch.tensor(
+                batch_anchors, dtype=torch.long, device=self.device
+            )
+            positive_tensor = torch.tensor(
+                batch_positives, dtype=torch.long, device=self.device
+            )
+            negative_tensor = torch.tensor(
+                batch_negatives, dtype=torch.long, device=self.device
+            )
+
+            # Gather embeddings
+            if hasattr(model, "encode_query"):
+                # Use query projection if available
+                anchor_emb = model.encode_query(raw_embeddings[anchor_tensor])
+            else:
+                # Use raw embeddings
+                anchor_emb = raw_embeddings[anchor_tensor]
+
+            positive_emb = gnn_embeddings[positive_tensor]
+            negative_emb = gnn_embeddings[negative_tensor]
+
+            # Compute loss
+            loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
+
+            # Backward pass
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        return total_loss / num_batches if num_batches > 0 else 0.0
 
     def create_validation_data(
         self, val_df: pd.DataFrame, train_df: pd.DataFrame
@@ -335,24 +395,32 @@ class GNNTrainer:
         self,
         model: nn.Module,
         graph_data: Data,
-        query_embeddings: np.ndarray,
+        query_embeddings: np.ndarray,  # Raw query embeddings
         qrels: dict[str, set[str]],
         train_id_to_idx: dict[str, int],
         k_values: list[int] = [5, 10, 50, 100],
     ) -> dict[str, float]:
-        """Evaluate IR metrics using GNN embeddings."""
+        """Evaluate IR metrics using projected queries and GNN documents."""
         model.eval()
 
-        # Get all document embeddings
         with torch.no_grad():
+            # Get GNN embeddings for documents
             x = graph_data.x.to(self.device)
             edge_index = graph_data.edge_index.to(self.device)
             doc_embeddings = model(x, edge_index)
             doc_embeddings = F.normalize(doc_embeddings, p=2, dim=1)
             doc_embeddings = doc_embeddings.cpu().numpy()
 
-        # Compute similarities
-        similarities = query_embeddings @ doc_embeddings.T
+            # Project queries through query encoder
+            query_tensor = torch.tensor(
+                query_embeddings, dtype=torch.float32, device=self.device
+            )
+            projected_queries = model.encode_query(query_tensor)
+            projected_queries = F.normalize(projected_queries, p=2, dim=1)
+            projected_queries = projected_queries.cpu().numpy()
+
+        # Compute similarities with projected queries
+        similarities = projected_queries @ doc_embeddings.T
 
         # Compute metrics
         metrics: dict[str, float] = {}
@@ -453,7 +521,11 @@ class GNNTrainer:
         print("\nInitializing GNN model...")
         model = gnn_model.to(self.device)
 
-        # Initialize optimizer and scheduler
+        # Pre-compute training batches ONCE
+        training_batches = self.create_training_batches(
+            train_citation_graph, len(train_texts)
+        )
+
         optimizer = AdamW(
             model.parameters(),
             lr=self.learning_rate,
@@ -463,19 +535,20 @@ class GNNTrainer:
 
         self.setup_wandb()
 
-        # Prepare validation data
-
-        print(f"\nValidation: {len(qrels)} queries, {len(docs)} documents")
-
         print(f"\nStarting training for {self.epochs} epochs...")
         best_loss = float("inf")
         best_map = 0.0
 
-        for epoch in tqdm(
-            range(self.epochs), desc="Training Progress", position=0, ncols=80
-        ):
+        for epoch in range(self.epochs):
+            # Resample negatives every few epochs for variety
+            if epoch > 0 and epoch % 3 == 0:
+                print("Resampling training batches...")
+                training_batches = self.create_training_batches(
+                    train_citation_graph, len(train_texts)
+                )
+
             train_loss = self.train_epoch(
-                model, graph_data, train_citation_graph, optimizer
+                model, graph_data, training_batches, optimizer
             )
 
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
