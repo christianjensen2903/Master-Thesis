@@ -1,40 +1,63 @@
 import pandas as pd  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from gnn_trainers import GNNTrainer
-from torch_geometric.nn import GATConv, GCN
+from torch_geometric.nn import SAGEConv, GCNConv
 import torch.nn as nn
 import torch.nn.functional as F
+import torch
 
 
 class CitationGNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim=512, output_dim=None):
+    def __init__(self, input_dim, hidden_dim=256, output_dim=None, num_layers=3):
         super().__init__()
         if output_dim is None:
             output_dim = input_dim
 
-        # GNN layers for documents in the graph
-        self.conv1 = GATConv(input_dim, hidden_dim, heads=4)
-        self.conv2 = GATConv(hidden_dim * 4, output_dim, heads=1)
-        self.dropout = nn.Dropout(0.1)
+        # Keep same dimensions for residual
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
 
-        # Query projection layer (for paragraphs NOT in graph)
+        for _ in range(num_layers):
+            self.convs.append(GCNConv(input_dim, input_dim))  # Same dims!
+            self.norms.append(nn.LayerNorm(input_dim))
+
+        # Optional projection at the end only
+        self.final_proj = (
+            nn.Linear(input_dim, output_dim)
+            if output_dim != input_dim
+            else nn.Identity()
+        )
+
+        self.dropout = nn.Dropout(0.1)
+        self.alpha = nn.Parameter(torch.tensor(0.1))  # Learnable mix parameter
+
+        # Query projection with residual connection
         self.query_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
             nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, x, edge_index):
-        """Process documents through GNN."""
-        x = F.relu(self.conv1(x, edge_index))
-        x = self.dropout(x)
-        x = self.conv2(x, edge_index)
-        return x
+        x_orig = x  # Store original
+
+        for i, conv in enumerate(self.convs):
+            x_new = conv(x, edge_index)
+            x_new = self.norms[i](x_new)
+            x_new = F.relu(x_new)
+            x_new = self.dropout(x_new)
+            x = x + x_new  # Always add residual
+
+        # Mix original embeddings with GNN output
+        x = (1 - self.alpha) * x_orig + self.alpha * x
+        return self.final_proj(x)
 
     def encode_query(self, x):
         """Process queries (not in graph) through projection."""
-        return self.query_proj(x)
+        return x
+        # return self.query_proj(x)
 
 
 def train_example() -> None:
@@ -61,14 +84,16 @@ def train_example() -> None:
     #     # concat=True,
     # )
 
-    model = CitationGNN(in_channels)
+    model = CitationGNN(
+        in_channels, hidden_dim=128, output_dim=in_channels, num_layers=3
+    )
 
     trainer = GNNTrainer(
         text_encoder_name=encoding_model,
         output_path="checkpoints/gnn",
         batch_size=256,
         epochs=50,
-        eval_every_n_epochs=1,
+        eval_every_n_epochs=5,
         learning_rate=3e-4,
         weight_decay=1e-2,
         temperature=0.05,
