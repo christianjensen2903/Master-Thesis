@@ -27,35 +27,34 @@ class MultipleNegativesRankingLoss(nn.Module):
         gather_across_devices: bool = False,
         citation_graph: dict[str, set[str]] | None = None,
     ) -> None:
+        """
+        Args:
+            model: SentenceTransformer model
+            scale: Output of similarity function is multiplied by scale value
+            similarity_fct: similarity function between sentence embeddings
+            gather_across_devices: If True, gather embeddings across all devices
+            citation_graph: Dictionary mapping from_id -> set of all to_ids it cites
+        """
         super().__init__()
         self.model = model
         self.scale = scale
         self.similarity_fct = similarity_fct
         self.gather_across_devices = gather_across_devices
         self.cross_entropy_loss = nn.CrossEntropyLoss()
+        self.citation_graph = citation_graph or {}
 
+        # Convert citation graph to use hashed IDs for faster lookup
+        self.citation_graph_hashed = {}
         if citation_graph:
-            self._build_optimized_lookup(citation_graph)
-        else:
-            self.citation_graph_hashed = {}
+            for from_id, to_id_set in citation_graph.items():
+                from_hash = self._hash_id(from_id)
+                to_hash_set = {self._hash_id(to_id) for to_id in to_id_set}
+                self.citation_graph_hashed[from_hash] = to_hash_set
 
     @staticmethod
     def _hash_id(id_str: str) -> int:
+        """Create a stable hash for an ID string."""
         return hash(id_str) % (2**31)
-
-    def _build_optimized_lookup(self, citation_graph: dict[str, set[str]]):
-        """Build lookup optimized for large batches and sparse graphs."""
-        # Hash all IDs once
-        self.citation_graph_hashed = {}
-        for from_id, to_id_set in citation_graph.items():
-            from_hash = self._hash_id(from_id)
-            to_hash_set = frozenset(self._hash_id(to_id) for to_id in to_id_set)
-            self.citation_graph_hashed[from_hash] = to_hash_set
-
-        print(
-            f"Built citation graph: {len(self.citation_graph_hashed)} documents, "
-            f"{sum(len(v) for v in self.citation_graph_hashed.values())} citations"
-        )
 
     def forward(
         self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor
@@ -64,18 +63,33 @@ class MultipleNegativesRankingLoss(nn.Module):
             self.model(sentence_feature)["sentence_embedding"]
             for sentence_feature in sentence_features
         ]
+
         return self.compute_loss_from_embeddings(embeddings, labels)
 
     def compute_loss_from_embeddings(
         self, embeddings: list[Tensor], labels: Tensor
     ) -> Tensor:
-        anchors = embeddings[0]
+        """
+        Compute the multiple negatives ranking loss from embeddings.
+
+        Args:
+            embeddings: List of embeddings [anchors, positives]
+            labels: Tensor of shape (batch_size, 2) where each row is:
+                   [anchor_id_hash, positive_id_hash]
+                   - anchor_id_hash: hash of the FROM_ID
+                   - positive_id_hash: hash of the TO_ID
+
+        Returns:
+            Loss value
+        """
+        anchors = embeddings[0]  # (batch_size, embedding_dim)
         candidates = embeddings[1:]
         batch_size = anchors.size(0)
         offset = 0
 
-        anchor_ids = labels[:, 0] if labels is not None else None
-        positive_ids = labels[:, 1] if labels is not None else None
+        # Extract IDs from labels
+        anchor_ids = labels[:, 0] if labels is not None else None  # FROM_IDs (hashed)
+        positive_ids = labels[:, 1] if labels is not None else None  # TO_IDs (hashed)
 
         if self.gather_across_devices:
             candidates = [
@@ -87,6 +101,7 @@ class MultipleNegativesRankingLoss(nn.Module):
                 rank = torch.distributed.get_rank()
                 offset = rank * batch_size
 
+                # Gather the IDs from all devices
                 if positive_ids is not None:
                     world_size = torch.distributed.get_world_size()
                     gathered_anchor_ids = [
@@ -97,72 +112,66 @@ class MultipleNegativesRankingLoss(nn.Module):
                     ]
                     torch.distributed.all_gather(gathered_anchor_ids, anchor_ids)
                     torch.distributed.all_gather(gathered_positive_ids, positive_ids)
+                    all_anchor_ids = torch.cat(gathered_anchor_ids, dim=0)
                     all_positive_ids = torch.cat(gathered_positive_ids, dim=0)
                 else:
+                    all_anchor_ids = anchor_ids
                     all_positive_ids = positive_ids
             else:
+                all_anchor_ids = anchor_ids
                 all_positive_ids = positive_ids
         else:
+            all_anchor_ids = anchor_ids
             all_positive_ids = positive_ids
 
         candidates = torch.cat(candidates, dim=0)
+
+        # Compute similarity scores
         scores = self.similarity_fct(anchors, candidates) * self.scale
+        # (batch_size, num_candidates)
+
+        # Create labels for the target (which candidate is the designated positive)
         range_labels = torch.arange(offset, offset + batch_size, device=anchors.device)
 
-        # Optimized masking for large batch, sparse graph
+        # Mask out false negatives using the citation graph
         if (
             anchor_ids is not None
             and all_positive_ids is not None
             and self.citation_graph_hashed
         ):
-            false_negative_mask = self._create_mask_optimized(
-                anchor_ids, all_positive_ids, scores.device
-            )
+            # Create false negative mask: (batch_size, num_candidates)
+            false_negative_mask = torch.zeros_like(scores, dtype=torch.bool)
 
-            # Unmask designated positives
+            # For each anchor, check if any candidate is actually a positive based on citation graph
+            for i in range(batch_size):
+                anchor_id = anchor_ids[i].item()
+
+                # Get all documents that this anchor cites
+                cited_docs = self.citation_graph_hashed.get(anchor_id, set())
+
+                if cited_docs:
+                    # Check each candidate
+                    for j in range(all_positive_ids.size(0)):
+                        candidate_id = all_positive_ids[j].item()
+
+                        # If this candidate is cited by the anchor, it's a false negative
+                        if candidate_id in cited_docs:
+                            false_negative_mask[i, j] = True
+
+            # The designated positive should still be included (not masked)
+            # So we unmask it
             designated_positive_mask = torch.zeros_like(false_negative_mask)
             designated_positive_mask[
                 torch.arange(batch_size, device=scores.device), range_labels
             ] = True
+
+            # Remove the designated positive from false negatives
             false_negative_mask = false_negative_mask & ~designated_positive_mask
 
+            # Set false negative scores to -inf
             scores = scores.masked_fill(false_negative_mask, float("-inf"))
 
         return self.cross_entropy_loss(scores, range_labels)
-
-    def _create_mask_optimized(
-        self, anchor_ids: Tensor, candidate_ids: Tensor, device: torch.device
-    ) -> Tensor:
-        """Optimized masking for large batches with sparse graphs."""
-        num_candidates = candidate_ids.size(0)
-
-        # Move to CPU once and convert to list (faster than repeated .item() calls)
-        anchor_ids_list = anchor_ids.cpu().tolist()
-        candidate_ids_list = candidate_ids.cpu().tolist()
-
-        # Pre-create candidate set for O(1) lookup
-        candidate_ids_set = set(candidate_ids_list)
-
-        # Build mask efficiently
-        mask_data = []
-        for anchor_id in anchor_ids_list:
-            cited = self.citation_graph_hashed.get(anchor_id, frozenset())
-            # Only check intersection if there are citations
-            if cited:
-                # Find which candidates are cited (set intersection is fast)
-                cited_in_batch = cited & candidate_ids_set
-                if cited_in_batch:
-                    # Create row mask
-                    row_mask = [cid in cited_in_batch for cid in candidate_ids_list]
-                else:
-                    row_mask = [False] * num_candidates
-            else:
-                row_mask = [False] * num_candidates
-            mask_data.append(row_mask)
-
-        # Convert to tensor once
-        mask = torch.tensor(mask_data, dtype=torch.bool, device=device)
-        return mask
 
     def get_config_dict(self) -> dict[str, Any]:
         return {
