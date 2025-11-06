@@ -1,7 +1,5 @@
 import os
-import random
 import pickle
-import wandb
 import pandas as pd  # type: ignore
 import numpy as np
 import torch
@@ -13,6 +11,35 @@ from torch_geometric.data import Data  # type: ignore
 from tqdm import tqdm  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from validation_utils import split_data_by_date
+
+
+def info_nce_loss(anchor, positive, negatives, temperature=0.07):
+    """
+    anchor: [batch_size, dim]
+    positive: [batch_size, dim]
+    negatives: [batch_size, num_negatives, dim]
+    """
+    # Normalize embeddings
+    anchor = F.normalize(anchor, dim=-1)
+    positive = F.normalize(positive, dim=-1)
+    negatives = F.normalize(negatives, dim=-1)
+
+    # Positive similarity
+    pos_sim = torch.sum(anchor * positive, dim=-1) / temperature  # [batch_size]
+
+    # Negative similarities
+    neg_sim = (
+        torch.bmm(negatives, anchor.unsqueeze(-1)).squeeze(-1) / temperature
+    )  # [batch_size, num_negatives]
+
+    # InfoNCE loss
+    logits = torch.cat(
+        [pos_sim.unsqueeze(1), neg_sim], dim=1
+    )  # [batch_size, 1 + num_negatives]
+    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+
+    loss = F.cross_entropy(logits, labels)
+    return loss
 
 
 class GNNTrainer:
@@ -27,12 +54,8 @@ class GNNTrainer:
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
-        num_negatives: int = 5,
-        use_wandb: bool = True,
-        project_name: str = "gnn-training",
         embeddings_cache_dir: str | None = None,
-        use_temporal_validation: bool = True,
-        max_citations_per_anchor: int = 5,
+        num_negatives: int = 5,
     ):
         self.text_encoder_name = text_encoder_name
         self.output_path = output_path
@@ -43,12 +66,8 @@ class GNNTrainer:
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.temperature = temperature
-        self.num_negatives = num_negatives
-        self.use_wandb = use_wandb
-        self.project_name = project_name
         self.embeddings_cache_dir = embeddings_cache_dir
-        self.use_temporal_validation = use_temporal_validation
-        self.max_citations_per_anchor = max_citations_per_anchor
+        self.num_negatives = num_negatives
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -69,43 +88,12 @@ class GNNTrainer:
         df = pd.read_csv(paragraph_file)
         df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
 
-        # Add DATE_TO if it exists
-        if "DATE_TO" in df.columns:
-            df["DATE_TO"] = pd.to_datetime(df["DATE_TO"])
+        df["DATE_TO"] = pd.to_datetime(df["DATE_TO"])
 
-        # Add ID columns if they don't exist
-        if "FROM_ID" not in df.columns and "CELEX_FROM" in df.columns:
-            df["FROM_ID"] = (
-                df["CELEX_FROM"].astype(str) + "::" + df["NUMBER_FROM"].astype(str)
-            )
-        if "TO_ID" not in df.columns and "CELEX_TO" in df.columns:
-            df["TO_ID"] = (
-                df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
-            )
+        df["FROM_ID"] = df["CELEX_FROM"] + "::" + df["NUMBER_FROM"].astype(str)
+        df["TO_ID"] = df["CELEX_TO"] + "::" + df["NUMBER_TO"].astype(str)
 
         return split_data_by_date(df, cutoff_year)
-
-    def setup_wandb(self) -> None:
-        """Initialize wandb with the given config."""
-
-        config = {
-            "text_encoder": self.text_encoder_name,
-            "learning_rate": self.learning_rate,
-            "weight_decay": self.weight_decay,
-            "temperature": self.temperature,
-            "num_negatives": self.num_negatives,
-            "batch_size": self.batch_size,
-            "epochs": self.epochs,
-            "eval_every_n_epochs": self.eval_every_n_epochs,
-        }
-        if self.use_wandb:
-            wandb.init(project=self.project_name, config=config)
-
-    def cleanup_wandb(self) -> None:
-        """Save model to wandb and finish the run."""
-        if self.use_wandb:
-            wandb.save(f"{self.output_path}/*")
-            wandb.finish()
 
     def build_par_id_to_idx(
         self, df: pd.DataFrame
@@ -192,7 +180,7 @@ class GNNTrainer:
                 if src >= len(texts) or tgt >= len(texts):
                     continue
 
-                edge_list.append([src, tgt])
+                edge_list.append([tgt, src])
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -203,157 +191,167 @@ class GNNTrainer:
 
         return Data(x=x, edge_index=edge_index, num_nodes=len(texts))
 
-    def contrastive_loss(
-        self,
-        anchor: torch.Tensor,
-        positive: torch.Tensor,
-        negatives: torch.Tensor,
-    ) -> torch.Tensor:
-        # Normalize embeddings
-        anchor = F.normalize(anchor, p=2, dim=1)
-        positive = F.normalize(positive, p=2, dim=1)
-        negatives = F.normalize(negatives, p=2, dim=2)
-
-        # Positive similarity
-        pos_sim = (
-            torch.sum(anchor * positive, dim=1) / self.temperature
-        )  # (batch_size,)
-
-        # Negative similarities
-        neg_sim = (
-            torch.bmm(negatives, anchor.unsqueeze(2)).squeeze(2) / self.temperature
-        )  # (batch_size, num_negatives)
-
-        # InfoNCE loss
-        logits = torch.cat(
-            [pos_sim.unsqueeze(1), neg_sim], dim=1
-        )  # (batch_size, 1 + num_negatives)
-        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
-
-        loss = F.cross_entropy(logits, labels)
-        return loss
-
-    def create_training_batches(
-        self,
-        citation_graph: dict[int, list[int]],
-        num_nodes: int,
-    ) -> list[tuple[list[int], list[int], list[list[int]]]]:
-        """Pre-compute training batches with negatives."""
-        print("Creating training batches...")
-
-        # Build all anchor-positive pairs
-        all_anchors = []
-        all_positives = []
-
-        for anchor_id, cited_ids in citation_graph.items():
-            # Limit citations per anchor to avoid huge batches
-            sampled_cites = (
-                cited_ids if len(cited_ids) <= 10 else random.sample(cited_ids, 10)
-            )
-            for cited_id in sampled_cites:
-                all_anchors.append(anchor_id)
-                all_positives.append(cited_id)
-
-        print(f"Total training pairs: {len(all_anchors)}")
-
-        # Pre-sample negatives for all pairs
-        all_negatives = []
-        cited_by_node = {i: set(citation_graph.get(i, [])) for i in range(num_nodes)}
-
-        for anchor_id, positive_id in tqdm(
-            zip(all_anchors, all_positives),
-            total=len(all_anchors),
-            desc="Sampling negatives",
-        ):
-            excluded = cited_by_node[anchor_id].union({anchor_id, positive_id})
-            candidates = [n for n in range(num_nodes) if n not in excluded]
-
-            if len(candidates) >= self.num_negatives:
-                sampled = random.sample(candidates, self.num_negatives)
-            else:
-                # Fallback for small graphs
-                sampled = candidates + [
-                    random.choice(candidates) if candidates else 0
-                ] * (self.num_negatives - len(candidates))
-
-            all_negatives.append(sampled)
-
-        # Shuffle and create batches
-        indices = list(range(len(all_anchors)))
-        random.shuffle(indices)
-
-        batches = []
-        for i in range(0, len(indices), self.batch_size):
-            batch_indices = indices[i : i + self.batch_size]
-            batch_anchors = [all_anchors[idx] for idx in batch_indices]
-            batch_positives = [all_positives[idx] for idx in batch_indices]
-            batch_negatives = [all_negatives[idx] for idx in batch_indices]
-            batches.append((batch_anchors, batch_positives, batch_negatives))
-
-        print(f"Created {len(batches)} batches of size {self.batch_size}")
-        return batches
-
     def train_epoch(
-        self,
-        model: nn.Module,
-        graph_data: Data,
-        training_batches: list[tuple[list[int], list[int], list[list[int]]]],
-        optimizer: torch.optim.Optimizer,
+        self, model: nn.Module, data: Data, optimizer: torch.optim.Optimizer
     ) -> float:
-        """Train one epoch with pre-computed batches."""
         model.train()
-
-        # Compute GNN embeddings once for the entire graph
-        raw_embeddings = graph_data.x.to(self.device)
-        edge_index = graph_data.edge_index.to(self.device)
-
-        # Forward pass through GNN once per epoch
-        with torch.no_grad():
-            gnn_embeddings = model(raw_embeddings, edge_index)
-
-        gnn_embeddings.requires_grad = True  # Enable gradients for this tensor
-
-        total_loss = 0.0
+        total_loss = 0
         num_batches = 0
 
-        for batch_anchors, batch_positives, batch_negatives in tqdm(
-            training_batches, desc="Training batches", leave=False
-        ):
-            # Convert to tensors
-            anchor_tensor = torch.tensor(
-                batch_anchors, dtype=torch.long, device=self.device
+        # Move data to device
+        x = data.x.to(self.device)
+        edge_index = data.edge_index.to(self.device)
+
+        # Sample anchor nodes
+        num_nodes = x.shape[0]
+
+        # Get embeddings for all nodes
+        embeddings = model(x, edge_index)
+
+        # Get anchor embeddings
+        anchor_emb = x
+
+        src, dst = edge_index
+
+        # Sort edges by source for efficient grouping
+        sorted_idx = torch.argsort(src)
+        src_sorted = src[sorted_idx]
+        dst_sorted = dst[sorted_idx]
+
+        # Find unique sources and their edge counts
+        unique_src, counts = torch.unique_consecutive(src_sorted, return_counts=True)
+
+        # Random sampling: generate random offset for each unique source
+        random_offsets = torch.randint_like(counts, 0, 1).float()
+        random_offsets = (torch.rand_like(counts.float()) * counts.float()).long()
+
+        # Compute cumulative positions
+        cumsum = torch.cat(
+            [torch.tensor([0], device=self.device), counts.cumsum(0)[:-1]]
+        )
+        selected_edges = cumsum + random_offsets
+
+        # Get positive samples
+        positive_indices = torch.arange(
+            num_nodes, device=self.device
+        )  # Default to self
+        positive_indices[unique_src] = dst_sorted[selected_edges]
+
+        positive_emb = embeddings[positive_indices]
+
+        # Sample negative pairs (random nodes)
+        negative_indices = torch.randint(
+            0,
+            num_nodes,
+            (num_nodes, self.num_negatives),
+            device=self.device,
+        )
+        negative_emb = embeddings[negative_indices]
+
+        # Compute loss
+        loss = info_nce_loss(anchor_emb, positive_emb, negative_emb)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+        return total_loss / num_batches
+
+    def train(
+        self,
+        gnn_model: nn.Module,
+        paragraph_file: str,
+        cutoff_year: int,
+    ) -> torch.nn.Module:
+        os.makedirs(self.output_path, exist_ok=True)
+
+        train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_year)
+
+        # Build paragraph mapping only from training data
+        train_id_to_idx, train_texts = self.build_par_id_to_idx(train_df)
+        # _, val_texts = self.build_par_id_to_idx(val_df)
+        qrels, docs, val_texts = self.create_validation_data(val_df, train_df)
+
+        train_citation_graph = self.build_citation_graph_from_df(
+            train_df, train_id_to_idx
+        )
+
+        print(f"\nLoading text encoder: {self.text_encoder_name}")
+        text_encoder = SentenceTransformer(self.text_encoder_name)
+
+        print("Loading embeddings...")
+        model_name = self._sanitize_model_name(self.text_encoder_name)
+        train_embeddings_key = f"{model_name}_train"
+        train_embeddings = self._load_cached_embeddings(train_embeddings_key)
+        if train_embeddings is None:
+            train_embeddings = self._encode_texts(train_texts, text_encoder)
+            self._save_cached_embeddings(train_embeddings, train_embeddings_key)
+
+        val_embeddings_key = f"{model_name}_val"
+        val_embeddings = self._load_cached_embeddings(val_embeddings_key)
+        if val_embeddings is None:
+            val_embeddings = self._encode_texts(val_texts, text_encoder)
+            self._save_cached_embeddings(val_embeddings, val_embeddings_key)
+
+        graph_data = self.build_graph_data(
+            train_texts, train_citation_graph, train_embeddings
+        )
+
+        print("\nInitializing GNN model...")
+        model = gnn_model.to(self.device)
+
+        optimizer = AdamW(
+            model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+
+        print(f"\nStarting training for {self.epochs} epochs...")
+        best_map = 0.0
+
+        for epoch in range(self.epochs):
+            train_loss = self.train_epoch(model, graph_data, optimizer)
+
+            print(f"\nEpoch {epoch + 1}/{self.epochs}")
+            print(f"  Train Loss: {train_loss:.4f}")
+
+            # Evaluate on validation set
+            should_eval = (
+                self.eval_every_n_epochs is None
+                or (epoch + 1) % self.eval_every_n_epochs == 0
+                or epoch == self.epochs - 1
             )
-            positive_tensor = torch.tensor(
-                batch_positives, dtype=torch.long, device=self.device
-            )
-            negative_tensor = torch.tensor(
-                batch_negatives, dtype=torch.long, device=self.device
-            )
 
-            # Gather embeddings
-            if hasattr(model, "encode_query"):
-                # Use query projection if available
-                anchor_emb = model.encode_query(raw_embeddings[anchor_tensor])
-            else:
-                # Use raw embeddings
-                anchor_emb = raw_embeddings[anchor_tensor]
+            if should_eval:
+                val_metrics = self.evaluate_ir_metrics(
+                    model,
+                    graph_data,
+                    val_embeddings,
+                    qrels,
+                    train_id_to_idx,
+                )
 
-            positive_emb = gnn_embeddings[positive_tensor]
-            negative_emb = gnn_embeddings[negative_tensor]
+                print(f"  Validation Metrics:")
+                print(f"    MAP@1000: {val_metrics['map@1000']:.4f}")
+                for k in [5, 10, 100]:
+                    print(f"R@{k}: {val_metrics[f'recall@{k}']:.4f}")
 
-            # Compute loss
-            loss = self.contrastive_loss(anchor_emb, positive_emb, negative_emb)
+                # Save best model based on MAP@1000
+                if val_metrics["map@1000"] > best_map:
+                    best_map = val_metrics["map@1000"]
+                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
+                    print(f"  ✓ New best model saved (MAP@1000: {best_map:.4f})")
 
-            # Backward pass
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scheduler.step()
 
-            total_loss += loss.item()
-            num_batches += 1
+        torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
 
-        return total_loss / num_batches if num_batches > 0 else 0.0
+        print(f"Model saved to {self.output_path}")
+        return model
 
     def create_validation_data(
         self, val_df: pd.DataFrame, train_df: pd.DataFrame
@@ -477,136 +475,3 @@ class GNNTrainer:
 
         model.train()
         return metrics
-
-    def train(
-        self,
-        gnn_model: nn.Module,
-        paragraph_file: str,
-        cutoff_year: int,
-    ) -> torch.nn.Module:
-        os.makedirs(self.output_path, exist_ok=True)
-
-        train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_year)
-
-        # Build paragraph mapping only from training data
-        train_id_to_idx, train_texts = self.build_par_id_to_idx(train_df)
-        # _, val_texts = self.build_par_id_to_idx(val_df)
-        qrels, docs, val_texts = self.create_validation_data(val_df, train_df)
-
-        train_citation_graph = self.build_citation_graph_from_df(
-            train_df, train_id_to_idx
-        )
-
-        print(f"\nLoading text encoder: {self.text_encoder_name}")
-        text_encoder = SentenceTransformer(self.text_encoder_name)
-
-        print("Loading embeddings...")
-        model_name = self._sanitize_model_name(self.text_encoder_name)
-        train_embeddings_key = f"{model_name}_train"
-        train_embeddings = self._load_cached_embeddings(train_embeddings_key)
-        if train_embeddings is None:
-            train_embeddings = self._encode_texts(train_texts, text_encoder)
-            self._save_cached_embeddings(train_embeddings, train_embeddings_key)
-
-        val_embeddings_key = f"{model_name}_val"
-        val_embeddings = self._load_cached_embeddings(val_embeddings_key)
-        if val_embeddings is None:
-            val_embeddings = self._encode_texts(val_texts, text_encoder)
-            self._save_cached_embeddings(val_embeddings, val_embeddings_key)
-
-        graph_data = self.build_graph_data(
-            train_texts, train_citation_graph, train_embeddings
-        )
-
-        print("\nInitializing GNN model...")
-        model = gnn_model.to(self.device)
-
-        # Pre-compute training batches ONCE
-        training_batches = self.create_training_batches(
-            train_citation_graph, len(train_texts)
-        )
-
-        optimizer = AdamW(
-            model.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-        )
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
-
-        self.setup_wandb()
-
-        print(f"\nStarting training for {self.epochs} epochs...")
-        best_loss = float("inf")
-        best_map = 0.0
-
-        for epoch in range(self.epochs):
-            # Resample negatives every few epochs for variety
-            if epoch > 0 and epoch % 3 == 0:
-                print("Resampling training batches...")
-                training_batches = self.create_training_batches(
-                    train_citation_graph, len(train_texts)
-                )
-
-            train_loss = self.train_epoch(
-                model, graph_data, training_batches, optimizer
-            )
-
-            print(f"\nEpoch {epoch + 1}/{self.epochs}")
-            print(f"  Train Loss: {train_loss:.4f}")
-
-            log_dict = {
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-            }
-
-            # Evaluate on validation set
-            should_eval = (
-                self.eval_every_n_epochs is None
-                or (epoch + 1) % self.eval_every_n_epochs == 0
-                or epoch == self.epochs - 1
-            )
-
-            if should_eval:
-                val_metrics = self.evaluate_ir_metrics(
-                    model,
-                    graph_data,
-                    val_embeddings,
-                    qrels,
-                    train_id_to_idx,
-                )
-
-                print(f"  Validation Metrics:")
-                print(f"    MAP@1000: {val_metrics['map@1000']:.4f}")
-                for k in [5, 10, 50, 100]:
-                    print(
-                        f"    P@{k}: {val_metrics[f'precision@{k}']:.4f}, "
-                        f"R@{k}: {val_metrics[f'recall@{k}']:.4f}"
-                    )
-
-                log_dict.update({f"val_{k}": v for k, v in val_metrics.items()})
-
-                # Save best model based on MAP@1000
-                if val_metrics["map@1000"] > best_map:
-                    best_map = val_metrics["map@1000"]
-                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                    print(f"  ✓ New best model saved (MAP@1000: {best_map:.4f})")
-                elif train_loss < best_loss:
-                    best_loss = train_loss
-                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                    print(f"  ✓ New best model saved (Loss: {best_loss:.4f})")
-            elif train_loss < best_loss:
-                best_loss = train_loss
-                torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                print(f"  ✓ New best model saved (Loss: {best_loss:.4f})")
-
-            if self.use_wandb:
-                wandb.log(log_dict)
-
-            scheduler.step()
-
-        torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
-
-        print(f"Model saved to {self.output_path}")
-
-        self.cleanup_wandb()
-        return model

@@ -18,18 +18,19 @@ class CitationGNN(nn.Module):
         self.norms = nn.ModuleList()
 
         for _ in range(num_layers):
-            self.convs.append(GCNConv(input_dim, input_dim))  # Same dims!
+            self.convs.append(GCNConv(input_dim, input_dim))
             self.norms.append(nn.LayerNorm(input_dim))
 
         # Optional projection at the end only
-        self.final_proj = (
-            nn.Linear(input_dim, output_dim)
-            if output_dim != input_dim
-            else nn.Identity()
+        self.final_proj = nn.Sequential(
+            nn.Linear(input_dim * 2, input_dim * 2),
+            nn.LayerNorm(input_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(input_dim * 2, output_dim),
         )
 
         self.dropout = nn.Dropout(0.1)
-        self.alpha = nn.Parameter(torch.tensor(0.1))  # Learnable mix parameter
 
         # Query projection with residual connection
         self.query_proj = nn.Sequential(
@@ -41,17 +42,16 @@ class CitationGNN(nn.Module):
         )
 
     def forward(self, x, edge_index):
-        x_orig = x  # Store original
 
         for i, conv in enumerate(self.convs):
             x_new = conv(x, edge_index)
             x_new = self.norms[i](x_new)
             x_new = F.relu(x_new)
             x_new = self.dropout(x_new)
-            x = x + x_new  # Always add residual
+            x_new = x + x_new  # Always add residual
 
-        # Mix original embeddings with GNN output
-        x = (1 - self.alpha) * x_orig + self.alpha * x
+        # Concat original embeddings with GNN output
+        x = torch.cat([x, x_new], dim=1)
         return self.final_proj(x)
 
     def encode_query(self, x):
@@ -72,36 +72,22 @@ def train_example() -> None:
 
     in_channels = text_encoder.get_sentence_embedding_dimension()
 
-    # Option 1: Optimized GraphSAGE
-    # model = GCN(
-    #     in_channels=in_channels,
-    #     hidden_channels=in_channels,
-    #     out_channels=in_channels,
-    #     num_layers=2,
-    #     dropout=0.2,
-    #     # v2=True,
-    #     # heads=2,
-    #     # concat=True,
-    # )
-
     model = CitationGNN(
-        in_channels, hidden_dim=128, output_dim=in_channels, num_layers=3
+        in_channels, hidden_dim=512, output_dim=in_channels, num_layers=3
     )
 
     trainer = GNNTrainer(
         text_encoder_name=encoding_model,
         output_path="checkpoints/gnn",
-        batch_size=256,
-        epochs=50,
-        eval_every_n_epochs=5,
+        batch_size=1024,
+        epochs=400,
+        eval_every_n_epochs=50,
         learning_rate=3e-4,
         weight_decay=1e-2,
         temperature=0.05,
-        num_negatives=5,
         validation_split=0.1,
-        use_wandb=False,
         embeddings_cache_dir="artifacts/embeddings_cache",
-        max_citations_per_anchor=5,
+        num_negatives=10,
     )
 
     # Train on paragraph pairs (pass model to train method)
