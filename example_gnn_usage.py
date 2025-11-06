@@ -21,24 +21,14 @@ class CitationGNN(nn.Module):
             self.convs.append(GCNConv(input_dim, input_dim))
             self.norms.append(nn.LayerNorm(input_dim))
 
-        # Optional projection at the end only
-        self.final_proj = nn.Sequential(
-            nn.Linear(input_dim * 2, input_dim * 2),
-            nn.LayerNorm(input_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(input_dim * 2, output_dim),
-        )
-
+        # Learnable residual weight
+        self.residual_weight = nn.Parameter(torch.tensor(0.5))
         self.dropout = nn.Dropout(0.1)
 
-        # Query projection with residual connection
+        # Simplified query projection
         self.query_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(input_dim, input_dim),
+            nn.LayerNorm(input_dim),
         )
 
     def forward(self, x, edge_index):
@@ -51,9 +41,10 @@ class CitationGNN(nn.Module):
             x_new = self.dropout(x_new)
             x = x + x_new
 
-        # Concat original embeddings with GNN output
-        x = torch.cat([x_orig, x], dim=1)
-        return self.final_proj(x)
+        alpha = torch.sigmoid(self.residual_weight)
+        x = alpha * x_orig + (1 - alpha) * x
+
+        return x
 
     def encode_query(self, x):
         """Process queries (not in graph) through projection."""
