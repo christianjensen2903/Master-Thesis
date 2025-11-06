@@ -2,6 +2,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer  # type: ignore
 
 from .base_retriever import BaseRetriever
+import faiss  # type: ignore
 
 
 class DenseRetriever(BaseRetriever):
@@ -46,29 +47,19 @@ class DenseRetriever(BaseRetriever):
         candidate_indices: np.ndarray,
         top_k: int | None = None,
     ) -> np.ndarray:
-        query_vec = embeddings[query_idx]
-        candidate_vecs = embeddings[candidate_indices]
+        """Create temporary index with only candidates - efficient for flat indices."""
+        # Extract candidate embeddings
+        candidate_embeddings = embeddings[candidate_indices]
 
-        # Cosine similarity via dot product (if embeddings are normalized)
-        if self.normalize_embeddings:
-            similarities = candidate_vecs @ query_vec
-        else:
-            # Compute cosine similarity manually if not normalized
-            query_norm = np.linalg.norm(query_vec)
-            candidate_norms = np.linalg.norm(candidate_vecs, axis=1)
-            similarities = (candidate_vecs @ query_vec) / (
-                candidate_norms * query_norm + 1e-8
-            )
+        # Build temporary index
+        temp_index = faiss.IndexFlatIP(embeddings.shape[1])
+        temp_index.add(candidate_embeddings)
 
-        # Use efficient top-k selection if requested
-        if top_k is not None and top_k < len(similarities):
-            # argpartition is O(n) vs argsort O(n log n)
-            # Get indices of top_k largest values (unsorted)
-            top_k_indices = np.argpartition(-similarities, top_k)[:top_k]
-            # Sort only the top_k values
-            sorted_top_k = top_k_indices[np.argsort(-similarities[top_k_indices])]
-            return candidate_indices[sorted_top_k]
-        else:
-            # Full sort by similarity (high to low)
-            ranked_order = np.argsort(-similarities)
-            return candidate_indices[ranked_order]
+        # Search
+        query_vec = embeddings[query_idx : query_idx + 1]
+        k = top_k if top_k is not None else len(candidate_indices)
+
+        _, local_indices = temp_index.search(query_vec, k)
+
+        # Map back to original indices
+        return candidate_indices[local_indices[0]]
