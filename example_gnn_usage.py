@@ -42,16 +42,17 @@ class CitationGNN(nn.Module):
         )
 
     def forward(self, x, edge_index):
+        x_orig = x
 
         for i, conv in enumerate(self.convs):
             x_new = conv(x, edge_index)
             x_new = self.norms[i](x_new)
             x_new = F.relu(x_new)
             x_new = self.dropout(x_new)
-            x_new = x + x_new  # Always add residual
+            x = x + x_new
 
         # Concat original embeddings with GNN output
-        x = torch.cat([x, x_new], dim=1)
+        x = torch.cat([x_orig, x], dim=1)
         return self.final_proj(x)
 
     def encode_query(self, x):
