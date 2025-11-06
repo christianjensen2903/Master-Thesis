@@ -81,7 +81,7 @@ def train_example() -> None:
         output_path="checkpoints/gnn",
         batch_size=1024,
         epochs=400,
-        eval_every_n_epochs=50,
+        eval_every_n_epochs=25,
         learning_rate=3e-4,
         weight_decay=1e-2,
         temperature=0.05,

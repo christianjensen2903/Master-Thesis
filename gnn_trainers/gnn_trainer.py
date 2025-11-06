@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.data import Data  # type: ignore
+from torch_geometric.loader import NeighborLoader  # type: ignore
 from tqdm import tqdm  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from validation_utils import split_data_by_date
@@ -56,6 +57,7 @@ class GNNTrainer:
         temperature: float = 0.07,
         embeddings_cache_dir: str | None = None,
         num_negatives: int = 5,
+        num_hops: int = -1,
     ):
         self.text_encoder_name = text_encoder_name
         self.output_path = output_path
@@ -68,11 +70,12 @@ class GNNTrainer:
         self.temperature = temperature
         self.embeddings_cache_dir = embeddings_cache_dir
         self.num_negatives = num_negatives
+        self.num_hops = num_hops
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
+        # elif torch.backends.mps.is_available():
+        #     self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
         print(f"Using device: {self.device}")
@@ -192,73 +195,83 @@ class GNNTrainer:
         return Data(x=x, edge_index=edge_index, num_nodes=len(texts))
 
     def train_epoch(
-        self, model: nn.Module, data: Data, optimizer: torch.optim.Optimizer
+        self, model: nn.Module, loader: NeighborLoader, optimizer: torch.optim.Optimizer
     ) -> float:
         model.train()
         total_loss = 0
         num_batches = 0
 
-        # Move data to device
-        x = data.x.to(self.device)
-        edge_index = data.edge_index.to(self.device)
+        for batch in tqdm(loader, desc="Training batches", leave=False):
+            # Get batch data
+            x = batch.x
+            edge_index = batch.edge_index
+            batch_size = batch.batch_size
 
-        # Sample anchor nodes
-        num_nodes = x.shape[0]
+            # Get embeddings for nodes in this batch
+            embeddings = model(x, edge_index)
 
-        # Get embeddings for all nodes
-        embeddings = model(x, edge_index)
+            anchor_emb = x[:batch_size]
 
-        # Get anchor embeddings
-        anchor_emb = x
+            # Get positive samples from edges
+            src, dst = edge_index
 
-        src, dst = edge_index
+            # Find edges where source is in the input batch
+            input_mask = src < batch_size
+            if input_mask.sum() == 0:
+                # No edges for this batch, skip
+                continue
 
-        # Sort edges by source for efficient grouping
-        sorted_idx = torch.argsort(src)
-        src_sorted = src[sorted_idx]
-        dst_sorted = dst[sorted_idx]
+            batch_src = src[input_mask]
+            batch_dst = dst[input_mask]
 
-        # Find unique sources and their edge counts
-        unique_src, counts = torch.unique_consecutive(src_sorted, return_counts=True)
+            # Sort edges by source for efficient grouping
+            sorted_idx = torch.argsort(batch_src)
+            src_sorted = batch_src[sorted_idx]
+            dst_sorted = batch_dst[sorted_idx]
 
-        # Random sampling: generate random offset for each unique source
-        random_offsets = torch.randint_like(counts, 0, 1).float()
-        random_offsets = (torch.rand_like(counts.float()) * counts.float()).long()
+            # Find unique sources and their edge counts
+            unique_src, counts = torch.unique_consecutive(
+                src_sorted, return_counts=True
+            )
 
-        # Compute cumulative positions
-        cumsum = torch.cat(
-            [torch.tensor([0], device=self.device), counts.cumsum(0)[:-1]]
-        )
-        selected_edges = cumsum + random_offsets
+            # Random sampling: generate random offset for each unique source
+            random_offsets = (torch.rand_like(counts.float()) * counts.float()).long()
 
-        # Get positive samples
-        positive_indices = torch.arange(
-            num_nodes, device=self.device
-        )  # Default to self
-        positive_indices[unique_src] = dst_sorted[selected_edges]
+            # Compute cumulative positions
+            cumsum = torch.cat(
+                [torch.tensor([0], device=self.device), counts.cumsum(0)[:-1]]
+            )
+            selected_edges = cumsum + random_offsets
 
-        positive_emb = embeddings[positive_indices]
+            # Get positive samples
+            positive_indices = torch.arange(
+                batch_size, device=self.device
+            )  # Default to self
+            positive_indices[unique_src] = dst_sorted[selected_edges]
 
-        # Sample negative pairs (random nodes)
-        negative_indices = torch.randint(
-            0,
-            num_nodes,
-            (num_nodes, self.num_negatives),
-            device=self.device,
-        )
-        negative_emb = embeddings[negative_indices]
+            positive_emb = embeddings[positive_indices]
 
-        # Compute loss
-        loss = info_nce_loss(anchor_emb, positive_emb, negative_emb)
+            # Sample negative pairs (random nodes from the batch)
+            num_nodes_in_batch = embeddings.shape[0]
+            negative_indices = torch.randint(
+                0,
+                num_nodes_in_batch,
+                (batch_size, self.num_negatives),
+                device=self.device,
+            )
+            negative_emb = embeddings[negative_indices]
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # Compute loss
+            loss = info_nce_loss(anchor_emb, positive_emb, negative_emb)
 
-        total_loss += loss.item()
-        num_batches += 1
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        return total_loss / num_batches
+            total_loss += loss.item()
+            num_batches += 1
+
+        return total_loss / num_batches if num_batches > 0 else 0.0
 
     def train(
         self,
@@ -313,8 +326,18 @@ class GNNTrainer:
         print(f"\nStarting training for {self.epochs} epochs...")
         best_map = 0.0
 
+        graph_data = graph_data.to(self.device)
+
+        loader = NeighborLoader(
+            graph_data,
+            num_neighbors=[-1] * self.num_hops,
+            batch_size=self.batch_size,
+            input_nodes=None,  # Sample all nodes
+            shuffle=True,
+        )
+
         for epoch in range(self.epochs):
-            train_loss = self.train_epoch(model, graph_data, optimizer)
+            train_loss = self.train_epoch(model, loader, optimizer)
 
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
