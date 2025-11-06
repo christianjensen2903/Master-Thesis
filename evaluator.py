@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from datetime import datetime as dt
 from collections import defaultdict
@@ -32,6 +33,7 @@ class Evaluator:
         judgments_path: str = "data/judgments_cleaned.json",
         train_cutoff_year: int = 2018,
         top_k: int | None = None,
+        save_embeddings_path: str | None = None,
     ):
         self.retriever = retriever
         self.embeddings = embeddings
@@ -41,6 +43,7 @@ class Evaluator:
         self.judgments_path = judgments_path
         self.train_cutoff_year = train_cutoff_year
         self.top_k = top_k
+        self.save_embeddings_path = save_embeddings_path
 
         # Validate mode
         if mode not in ["citation_pairs", "all_paragraphs"]:
@@ -347,6 +350,38 @@ class Evaluator:
         }
         return self.recall_scores
 
+    def load_embeddings(self, path: str | None = None) -> NDArray | None:
+        """Load embeddings from disk using numpy's load format."""
+        load_path = path or self.save_embeddings_path
+        if load_path is None:
+            return None
+
+        if not os.path.exists(load_path):
+            return None
+
+        try:
+            embeddings = np.load(load_path)
+            print(f"Loaded embeddings from {load_path} (shape: {embeddings.shape})")
+            return embeddings
+        except Exception as e:
+            print(f"Failed to load embeddings from {load_path}: {e}")
+            return None
+
+    def save_embeddings(self, path: str | None = None) -> None:
+        """Save embeddings to disk using numpy's save format."""
+        if self.embeddings is None:
+            raise ValueError("No embeddings to save. Run evaluation first.")
+
+        save_path = path or self.save_embeddings_path
+        if save_path is None:
+            return
+
+        dir_path = os.path.dirname(save_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        np.save(save_path, self.embeddings)
+        print(f"Saved embeddings to {save_path} (shape: {self.embeddings.shape})")
+
     def run(self) -> float:
         print(f"Mode: {self.mode}")
         print("Loading and preparing data...")
@@ -359,7 +394,22 @@ class Evaluator:
         print(f"Train paragraphs: {np.sum(self.paragraph_set == 'train')}")
         print(f"Test paragraphs: {np.sum(self.paragraph_set == 'test')}")
 
-        # Generate embeddings if not provided
+        # Try to load embeddings if not provided
+        if self.embeddings is None and self.save_embeddings_path:
+            print("\nAttempting to load embeddings from disk...")
+            loaded_embeddings = self.load_embeddings()
+            if loaded_embeddings is not None:
+                # Validate loaded embeddings match paragraph index
+                if len(loaded_embeddings) != len(self.pid_to_text):
+                    print(
+                        f"Warning: Loaded embeddings size mismatch "
+                        f"({len(loaded_embeddings)} vs {len(self.pid_to_text)}). "
+                        f"Regenerating embeddings..."
+                    )
+                else:
+                    self.embeddings = loaded_embeddings
+
+        # Generate embeddings if still not available
         if self.embeddings is None:
             print("\nGenerating embeddings from retriever...")
             train_mask = self.paragraph_set == "train"
@@ -375,6 +425,10 @@ class Evaluator:
                     f"but have {len(self.pid_to_text)} paragraphs. "
                     f"You must regenerate embeddings in '{self.mode}' mode."
                 )
+
+        # Save embeddings if path is specified
+        if self.save_embeddings_path:
+            self.save_embeddings()
 
         if self.mode == "citation_pairs":
             assert self.df is not None
@@ -395,23 +449,22 @@ class Evaluator:
 
 
 if __name__ == "__main__":
-    from retrievers import TfidfRetriever
+    from retrievers import DenseRetriever
 
-    print("Initializing TF-IDF retriever...")
-    retriever = TfidfRetriever(
-        stop_words="english",
-        strip_accents="ascii",
-        norm="l2",
+    retriever = DenseRetriever(
+        model_name="checkpoints/simcse_citation_model",
+        max_seq_length=256,
     )
 
     evaluator = Evaluator(
         retriever=retriever,
-        mode="all_paragraphs",
+        # mode="all_paragraphs",
         csv_path="data/par-to-par-cleaned.csv",
         metadata_path="data/par-to-par.json",
         judgments_path="data/judgments_cleaned.json",
         train_cutoff_year=2018,
         top_k=10000,
+        save_embeddings_path="artifacts/simcse_embeddings.npy",
     )
 
     score = evaluator.run()
