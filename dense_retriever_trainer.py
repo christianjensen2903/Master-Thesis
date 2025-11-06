@@ -1,5 +1,4 @@
 import os
-import json
 import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
 from datasets import Dataset  # type: ignore
@@ -24,7 +23,6 @@ class DenseRetrieverTrainer:
         use_wandb: bool = True,
         max_seq_length: int | None = None,
         loss_scale: float = 20.0,
-        judgments_file: str = "data/judgments_cleaned.json",
     ):
         self.model_name = model_name
         self.training_args = training_args
@@ -32,8 +30,6 @@ class DenseRetrieverTrainer:
         self.use_wandb = use_wandb
         self.max_seq_length = max_seq_length
         self.loss_scale = loss_scale
-        self.judgments_file = judgments_file
-        self.judgments: dict[str, dict] = {}
 
         if self.training_args is not None:
             output_dir_init = self.training_args.output_dir
@@ -41,50 +37,6 @@ class DenseRetrieverTrainer:
                 os.makedirs(output_dir_init, exist_ok=True)
         else:
             os.makedirs("output/model", exist_ok=True)
-
-    def load_judgments(self) -> None:
-        """Load judgments from JSON file."""
-        if not self.judgments:
-            print(f"Loading judgments from {self.judgments_file}...")
-            with open(self.judgments_file, "r", encoding="utf-8") as f:
-                self.judgments = json.load(f)
-            print(f"Loaded {len(self.judgments)} judgments")
-
-    def get_paragraph_with_context(self, celex: str, para_num: int) -> str:
-        """Get paragraph text with preceding and following paragraphs."""
-        if celex not in self.judgments:
-            return ""
-
-        paragraphs = self.judgments[celex].get("paragraphs", {})
-        if not paragraphs:
-            return ""
-
-        para_str = str(para_num)
-        if para_str not in paragraphs:
-            return ""
-
-        current_text = paragraphs[para_str]
-        para_nums = sorted([int(k) for k in paragraphs.keys()])
-        current_idx = para_nums.index(para_num)
-
-        prev_text = ""
-        if current_idx > 0:
-            prev_num = para_nums[current_idx - 1]
-            prev_text = paragraphs.get(str(prev_num), "")
-
-        next_text = ""
-        if current_idx < len(para_nums) - 1:
-            next_num = para_nums[current_idx + 1]
-            next_text = paragraphs.get(str(next_num), "")
-
-        parts = []
-        if prev_text:
-            parts.append(prev_text)
-        parts.append(current_text)
-        if next_text:
-            parts.append(next_text)
-
-        return "<SEP>".join(parts)
 
     def load_and_split_data(
         self, paragraph_file: str, cutoff_year: int
@@ -106,32 +58,22 @@ class DenseRetrieverTrainer:
         self, val_df: pd.DataFrame, train_df: pd.DataFrame
     ) -> InformationRetrievalEvaluator:
         """Create an Information Retrieval evaluator for validation."""
-        self.load_judgments()
         queries = {}
         documents = {}
         relevant_docs: dict[str, set[str]] = {}
 
         for _, row in train_df.iterrows():
-            celex_from = str(row["CELEX_FROM"])
-            number_from = int(row["NUMBER_FROM"])
-            celex_to = str(row["CELEX_TO"])
-            number_to = int(row["NUMBER_TO"])
+            text_from = str(row["TEXT_FROM"])
+            text_to = str(row["TEXT_TO"])
             from_id = str(row["FROM_ID"])
             to_id = str(row["TO_ID"])
 
-            text_from = self.get_paragraph_with_context(celex_from, number_from)
-            text_to = self.get_paragraph_with_context(celex_to, number_to)
-
-            if text_from:
-                documents[from_id] = text_from
-            if text_to:
-                documents[to_id] = text_to
+            documents[from_id] = text_from
+            documents[to_id] = text_to
 
         for _, row in val_df.iterrows():
-            celex_from = str(row["CELEX_FROM"])
-            number_from = int(row["NUMBER_FROM"])
-            celex_to = str(row["CELEX_TO"])
-            number_to = int(row["NUMBER_TO"])
+            text_from = str(row["TEXT_FROM"])
+            text_to = str(row["TEXT_TO"])
             from_id = str(row["FROM_ID"])
             to_id = str(row["TO_ID"])
 
@@ -139,10 +81,8 @@ class DenseRetrieverTrainer:
                 continue
 
             if from_id not in queries:
-                text_from = self.get_paragraph_with_context(celex_from, number_from)
-                if text_from:
-                    queries[from_id] = text_from
-                    relevant_docs[from_id] = set()
+                queries[from_id] = text_from
+                relevant_docs[from_id] = set()
 
             relevant_docs[from_id].add(to_id)
 
@@ -162,7 +102,6 @@ class DenseRetrieverTrainer:
         self, paragraph_file: str, cutoff_year: int
     ) -> tuple[Dataset, pd.DataFrame, pd.DataFrame]:
         """Get data for sentence pair training."""
-        self.load_judgments()
         train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_year)
 
         train_data = []
@@ -171,22 +110,16 @@ class DenseRetrieverTrainer:
             total=len(train_df),
             desc="Creating training dataset",
         ):
-            celex_from = str(row["CELEX_FROM"])
-            number_from = int(row["NUMBER_FROM"])
-            celex_to = str(row["CELEX_TO"])
-            number_to = int(row["NUMBER_TO"])
-
-            text_from = self.get_paragraph_with_context(celex_from, number_from)
-            text_to = self.get_paragraph_with_context(celex_to, number_to)
-
-            if text_from and text_to:
-                train_data.append({"sentence1": text_from, "sentence2": text_to})
+            text_from = str(row["TEXT_FROM"])
+            text_to = str(row["TEXT_TO"])
+            train_data.append({"sentence1": text_from, "sentence2": text_to})
 
         train_dataset = Dataset.from_list(train_data)
         return train_dataset, val_df, train_df
 
     def train(self, paragraph_file: str, cutoff_year: int) -> SentenceTransformer:
         """Train a sentence embedding model using SIMCSE with MultipleNegativesRankingLoss."""
+
         train_dataset, val_df, train_df = self.get_simcse_data(
             paragraph_file, cutoff_year
         )
