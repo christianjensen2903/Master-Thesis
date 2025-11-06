@@ -14,32 +14,30 @@ from sentence_transformers import SentenceTransformer  # type: ignore
 from validation_utils import split_data_by_date
 
 
-def info_nce_loss(anchor, positive, negatives, temperature=0.07):
+def info_nce_loss(anchor, positive, temperature=0.07):
     """
-    anchor: [batch_size, dim]
-    positive: [batch_size, dim]
-    negatives: [batch_size, num_negatives, dim]
+    In-batch negative contrastive loss.
+
+    anchor: [batch_size, dim] - query embeddings
+    positive: [batch_size, dim] - positive document embeddings
+
+    For each anchor_i, positive_i is the target, and all other positives
+    in the batch are used as negatives.
     """
     # Normalize embeddings
     anchor = F.normalize(anchor, dim=-1)
     positive = F.normalize(positive, dim=-1)
-    negatives = F.normalize(negatives, dim=-1)
 
-    # Positive similarity
-    pos_sim = torch.sum(anchor * positive, dim=-1) / temperature  # [batch_size]
+    # Compute similarity matrix: [batch_size, batch_size]
+    # sim_matrix[i, j] = similarity between anchor_i and positive_j
+    sim_matrix = torch.mm(anchor, positive.t()) / temperature
 
-    # Negative similarities
-    neg_sim = (
-        torch.bmm(negatives, anchor.unsqueeze(-1)).squeeze(-1) / temperature
-    )  # [batch_size, num_negatives]
+    # Labels: for each anchor_i, the positive is at position i (diagonal)
+    labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
 
-    # InfoNCE loss
-    logits = torch.cat(
-        [pos_sim.unsqueeze(1), neg_sim], dim=1
-    )  # [batch_size, 1 + num_negatives]
-    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+    # Cross entropy loss treats each row as logits where correct class is on diagonal
+    loss = F.cross_entropy(sim_matrix, labels)
 
-    loss = F.cross_entropy(logits, labels)
     return loss
 
 
@@ -56,7 +54,6 @@ class GNNTrainer:
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
         embeddings_cache_dir: str | None = None,
-        num_negatives: int = 5,
         num_hops: int = -1,
     ):
         self.text_encoder_name = text_encoder_name
@@ -69,7 +66,6 @@ class GNNTrainer:
         self.weight_decay = weight_decay
         self.temperature = temperature
         self.embeddings_cache_dir = embeddings_cache_dir
-        self.num_negatives = num_negatives
         self.num_hops = num_hops
 
         if torch.cuda.is_available():
@@ -251,18 +247,8 @@ class GNNTrainer:
 
             positive_emb = embeddings[positive_indices]
 
-            # Sample negative pairs (random nodes from the batch)
-            num_nodes_in_batch = embeddings.shape[0]
-            negative_indices = torch.randint(
-                0,
-                num_nodes_in_batch,
-                (batch_size, self.num_negatives),
-                device=self.device,
-            )
-            negative_emb = embeddings[negative_indices]
-
-            # Compute loss
-            loss = info_nce_loss(anchor_emb, positive_emb, negative_emb)
+            # Compute loss with in-batch negatives
+            loss = info_nce_loss(anchor_emb, positive_emb, self.temperature)
 
             optimizer.zero_grad()
             loss.backward()

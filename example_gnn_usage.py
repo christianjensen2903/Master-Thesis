@@ -81,13 +81,13 @@ def train_example() -> None:
         output_path="checkpoints/gnn",
         batch_size=1024,
         epochs=400,
-        eval_every_n_epochs=25,
+        eval_every_n_epochs=20,
         learning_rate=3e-4,
         weight_decay=1e-2,
         temperature=0.05,
         validation_split=0.1,
         embeddings_cache_dir="artifacts/embeddings_cache",
-        num_negatives=10,
+        num_hops=3,
     )
 
     # Train on paragraph pairs (pass model to train method)
