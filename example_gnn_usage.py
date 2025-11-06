@@ -57,8 +57,8 @@ class CitationGNN(nn.Module):
 
     def encode_query(self, x):
         """Process queries (not in graph) through projection."""
-        return x
-        # return self.query_proj(x)
+        # return x
+        return self.query_proj(x)
 
 
 def train_example() -> None:
@@ -80,12 +80,12 @@ def train_example() -> None:
     trainer = GNNTrainer(
         text_encoder_name=encoding_model,
         output_path="checkpoints/gnn",
-        batch_size=1024,
+        batch_size=2**10,
         epochs=400,
         eval_every_n_epochs=20,
-        learning_rate=3e-4,
-        weight_decay=1e-2,
-        temperature=0.05,
+        learning_rate=5e-5,
+        weight_decay=1e-4,
+        temperature=0.07,
         validation_split=0.1,
         embeddings_cache_dir="artifacts/embeddings_cache",
         num_hops=3,

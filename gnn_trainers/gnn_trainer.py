@@ -206,7 +206,7 @@ class GNNTrainer:
             # Get embeddings for nodes in this batch
             embeddings = model(x, edge_index)
 
-            anchor_emb = x[:batch_size]
+            anchor_emb = model.encode_query(x[:batch_size])
 
             # Get positive samples from edges
             src, dst = edge_index
