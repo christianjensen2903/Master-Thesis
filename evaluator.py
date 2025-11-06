@@ -75,9 +75,6 @@ class Evaluator:
         else:
             self._load_all_paragraphs_mode()
 
-        # Prepare temporal index
-        self._prepare_temporal_index()
-
     def _load_citation_pairs_mode(self) -> None:
         """Load data in citation pairs mode (using par-to-par CSV)"""
         self.df, self.metadata = load_citation_data(self.csv_path, self.metadata_path)
@@ -221,12 +218,6 @@ class Evaluator:
         result: dict[int, list[int]] = {k: sorted(v) for k, v in cited_by_pid.items()}
         return result
 
-    def _prepare_temporal_index(self) -> None:
-        """Pre-sort paragraph IDs by date for temporal filtering."""
-        assert self.paragraph_dates is not None
-        self.sort_idx = np.argsort(self.paragraph_dates)
-        self.sorted_dates = self.paragraph_dates[self.sort_idx]
-
     def evaluate_map(self) -> float:
         assert self.embeddings is not None
         assert self.pid_to_text is not None
@@ -363,8 +354,6 @@ class Evaluator:
         if self.embeddings is None:
             print("\nGenerating embeddings from retriever...")
             train_mask = self.paragraph_set == "train"
-            # Fit on training data, transform on all data
-            self.retriever.fit(self.pid_to_text, mask=train_mask)
             self.embeddings = self.retriever.transform(self.pid_to_text)
             print(f"Embeddings shape: {self.embeddings.shape}")
         else:
@@ -406,7 +395,7 @@ if __name__ == "__main__":
 
     evaluator = Evaluator(
         retriever=retriever,
-        mode="all_paragraphs",
+        # mode="all_paragraphs",
         csv_path="data/par-to-par-cleaned.csv",
         metadata_path="data/par-to-par.json",
         judgments_path="data/judgments_cleaned.json",
