@@ -17,5 +17,6 @@ Follow the following rules:
 - Don't do safe importing with try except. Always just assume libraries is installed
 - Use relative paths instead of absolute paths
 - Code as simple as possible. If less verbose would suffice do that. Simple code as more maintainable
+- The code don't have to be backwards compatibible
 
 Remember to always use the virtual env (.venv)

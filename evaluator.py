@@ -230,125 +230,105 @@ class Evaluator:
         self.sort_idx = np.argsort(self.paragraph_dates)
         self.sorted_dates = self.paragraph_dates[self.sort_idx]
 
-    def evaluate_map(self) -> float:
+    def evaluate_map_and_recall(
+        self, k_values: list[int] = [5, 10, 50, 100]
+    ) -> tuple[float, dict[int, float]]:
+        """Combined MAP and Recall evaluation in a single pass for speed."""
         assert self.embeddings is not None
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
         assert self.cited_by_pid is not None
+        assert self.paragraph_dates is not None
+        assert self.sorted_dates is not None
+        assert self.sort_idx is not None
 
+        # Precompute test source PIDs using numpy for speed
+        test_mask = self.paragraph_set == "test"
+        test_pids = np.where(test_mask)[0]
+
+        # Filter to only those with citations
         test_source_pids = [
-            pid
-            for pid in range(len(self.pid_to_text))
-            if self.paragraph_set[pid] == "test"
-            and len(self.cited_by_pid.get(pid, [])) > 0
+            pid for pid in test_pids if len(self.cited_by_pid.get(int(pid), [])) > 0
         ]
 
         avg_precs = []
+        recall_at_k: dict[int, list[float]] = {k: [] for k in k_values}
+        max_k = max(k_values)
 
-        desc = f"Evaluating MAP@{self.top_k}" if self.top_k else "Evaluating MAP"
+        desc = (
+            f"Evaluating MAP@{self.top_k} + Recall"
+            if self.top_k
+            else "Evaluating MAP + Recall"
+        )
 
         for src_pid in tqdm(test_source_pids, desc=desc):  # type: ignore
-            assert self.paragraph_dates is not None
-            assert self.sorted_dates is not None
-            assert self.sort_idx is not None
-
             src_date = self.paragraph_dates[src_pid]
 
             # Get all paragraphs strictly older than source
             cutoff = int(np.searchsorted(self.sorted_dates, src_date, side="left"))
-            cand_pids = self.sort_idx[:cutoff]
-
-            if len(cand_pids) == 0:
+            if cutoff == 0:
                 continue
 
+            cand_pids = self.sort_idx[:cutoff]
+
             # Ground truth: cited paragraphs that are also older
-            relevant = set(self.cited_by_pid[src_pid]).intersection(set(cand_pids))
-            num_rel = len(relevant)
+            # Use numpy operations for faster intersection
+            relevant_list = self.cited_by_pid[int(src_pid)]
+            relevant_array = np.array(relevant_list, dtype=np.int64)
+
+            # Fast intersection using numpy
+            relevant_mask = np.isin(relevant_array, cand_pids)
+            relevant_pids = relevant_array[relevant_mask]
+            num_rel = len(relevant_pids)
+
             if num_rel == 0:
                 continue
 
-            # Retrieve and rank candidates (with optional top_k limit)
+            # Retrieve and rank candidates once
             ranked_pids = self.retriever.retrieve(
-                src_pid, self.embeddings, cand_pids, top_k=self.top_k
+                int(src_pid), self.embeddings, cand_pids, top_k=self.top_k
             )
 
-            # Compute average precision (only up to top_k if specified)
-            good = 0
-            precisions = []
+            if len(ranked_pids) == 0:
+                continue
+
+            # Compute which positions have relevant documents using vectorized operations
             max_rank = (
                 len(ranked_pids)
                 if self.top_k is None
                 else min(len(ranked_pids), self.top_k)
             )
+            ranked_slice = ranked_pids[:max_rank]
 
-            for rank_pos, pid_candidate in enumerate(ranked_pids[:max_rank], start=1):
-                if pid_candidate in relevant:
-                    good += 1
-                    precisions.append(good / rank_pos)
-                    if good == num_rel:
-                        break
+            # Create boolean mask for relevant documents
+            is_relevant = np.isin(ranked_slice, relevant_pids)
 
-            ap = float(np.sum(precisions) / num_rel) if precisions else 0.0
+            # Compute MAP
+            if np.any(is_relevant):
+                positions = np.where(is_relevant)[0] + 1  # 1-indexed positions
+                cumsum = np.cumsum(is_relevant)
+                precisions = cumsum[is_relevant] / positions
+                ap = float(np.sum(precisions) / num_rel)
+            else:
+                ap = 0.0
             avg_precs.append(ap)
 
-        self.map_score = float(np.mean(avg_precs)) if avg_precs else 0.0
-        return self.map_score
-
-    def evaluate_recall(
-        self, k_values: list[int] = [5, 10, 50, 100]
-    ) -> dict[int, float]:
-        assert self.embeddings is not None
-        assert self.pid_to_text is not None
-        assert self.paragraph_set is not None
-        assert self.cited_by_pid is not None
-
-        test_source_pids = [
-            pid
-            for pid in range(len(self.pid_to_text))
-            if self.paragraph_set[pid] == "test"
-            and len(self.cited_by_pid.get(pid, [])) > 0
-        ]
-
-        recall_at_k: dict[int, list[float]] = {k: [] for k in k_values}
-
-        desc = "Evaluating Recall"
-        for src_pid in tqdm(test_source_pids, desc=desc):  # type: ignore
-            assert self.paragraph_dates is not None
-            assert self.sorted_dates is not None
-            assert self.sort_idx is not None
-
-            src_date = self.paragraph_dates[src_pid]
-
-            # Get all paragraphs strictly older than source
-            cutoff = int(np.searchsorted(self.sorted_dates, src_date, side="left"))
-            cand_pids = self.sort_idx[:cutoff]
-
-            if len(cand_pids) == 0:
-                continue
-
-            # Ground truth: cited paragraphs that are also older
-            relevant = set(self.cited_by_pid[src_pid]).intersection(set(cand_pids))
-            num_rel = len(relevant)
-            if num_rel == 0:
-                continue
-
-            # Retrieve and rank candidates (with optional top_k limit)
-            ranked_pids = self.retriever.retrieve(
-                src_pid, self.embeddings, cand_pids, top_k=self.top_k
-            )
-
-            # Compute recall at each k
+            # Compute Recall@k for all k values
             for k in k_values:
-                top_k_pids = ranked_pids[:k]
-                num_retrieved_relevant = len(set(top_k_pids).intersection(relevant))
-                recall = num_retrieved_relevant / num_rel if num_rel > 0 else 0.0
+                if len(ranked_pids) >= k:
+                    top_k_relevant = np.sum(is_relevant[:k])
+                    recall = float(top_k_relevant / num_rel)
+                else:
+                    # If we have fewer results than k, use all results
+                    recall = float(np.sum(is_relevant) / num_rel)
                 recall_at_k[k].append(recall)
 
+        self.map_score = float(np.mean(avg_precs)) if avg_precs else 0.0
         self.recall_scores = {
             k: float(np.mean(recalls)) if recalls else 0.0
             for k, recalls in recall_at_k.items()
         }
-        return self.recall_scores
+        return self.map_score, self.recall_scores
 
     def load_embeddings(self, path: str | None = None) -> NDArray | None:
         """Load embeddings from disk using numpy's load format."""
@@ -435,13 +415,10 @@ class Evaluator:
             print(f"Citation pairs: {len(self.df)}")
 
         metric_name = f"MAP@{self.top_k}" if self.top_k else "MAP"
-        print(f"\nComputing {metric_name}...")
-        score = self.evaluate_map()
+        print(f"\nComputing {metric_name} and Recall@k...")
+        score, recall_scores = self.evaluate_map_and_recall([5, 10, 100])
 
         print(f"\n{metric_name}: {score:.3f}")
-
-        print("\nComputing Recall@k...")
-        recall_scores = self.evaluate_recall([5, 10, 100])
         for k, recall in sorted(recall_scores.items()):
             print(f"Recall@{k}: {recall:.3f}")
 
