@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
+from numba import njit, prange  # type: ignore
 
 from data_loader import (
     load_citation_data,
@@ -20,6 +21,92 @@ from retrievers.base_retriever import BaseRetriever
 
 # Type alias for evaluator modes
 EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
+
+
+@njit
+def compute_ap_fast(
+    ranked_pids: NDArray, relevant_pids: NDArray, max_rank: int
+) -> float:
+    """Numba-optimized Average Precision calculation."""
+    num_rel = len(relevant_pids)
+    if num_rel == 0:
+        return 0.0
+
+    precision_sum = 0.0
+    num_found = 0
+
+    # Use simple loop - numba will optimize this
+    for i in range(min(max_rank, len(ranked_pids))):
+        # Check if ranked_pids[i] is in relevant_pids
+        is_relevant = False
+        for j in range(len(relevant_pids)):
+            if ranked_pids[i] == relevant_pids[j]:
+                is_relevant = True
+                break
+
+        if is_relevant:
+            num_found += 1
+            precision_sum += num_found / (i + 1)
+
+    return precision_sum / num_rel
+
+
+@njit
+def compute_recall_at_k_fast(
+    ranked_pids: NDArray, relevant_pids: NDArray, k: int
+) -> float:
+    """Numba-optimized Recall@k calculation."""
+    num_rel = len(relevant_pids)
+    if num_rel == 0:
+        return 0.0
+
+    num_found = 0
+
+    for i in range(min(k, len(ranked_pids))):
+        # Check if ranked_pids[i] is in relevant_pids
+        for j in range(len(relevant_pids)):
+            if ranked_pids[i] == relevant_pids[j]:
+                num_found += 1
+                break
+
+    return num_found / num_rel
+
+
+@njit(parallel=True)
+def compute_metrics_batch(
+    ranked_pids_list: list[NDArray],
+    relevant_pids_list: list[NDArray],
+    max_ranks: NDArray,
+    k_values: NDArray,
+) -> tuple[NDArray, NDArray]:
+    """
+    Compute MAP and Recall@k for a batch of queries in parallel.
+
+    Returns:
+        avg_precs: Array of average precision scores
+        recall_matrix: Shape (n_queries, n_k_values) of recall scores
+    """
+    n_queries = len(ranked_pids_list)
+    n_k = len(k_values)
+
+    avg_precs = np.zeros(n_queries, dtype=np.float64)
+    recall_matrix = np.zeros((n_queries, n_k), dtype=np.float64)
+
+    for idx in prange(n_queries):
+        ranked = ranked_pids_list[idx]
+        relevant = relevant_pids_list[idx]
+        max_rank = max_ranks[idx]
+
+        # Compute AP
+        avg_precs[idx] = compute_ap_fast(ranked, relevant, max_rank)
+
+        # Compute Recall@k for all k values
+        for k_idx in range(n_k):
+            recall_matrix[idx, k_idx] = compute_recall_at_k_fast(
+                ranked, relevant, k_values[k_idx]
+            )
+
+    return avg_precs, recall_matrix
 
 
 class Evaluator:
@@ -233,7 +320,7 @@ class Evaluator:
     def evaluate_map_and_recall(
         self, k_values: list[int] = [5, 10, 50, 100]
     ) -> tuple[float, dict[int, float]]:
-        """Combined MAP and Recall evaluation in a single pass for speed."""
+        """Combined MAP and Recall evaluation using numba for speed."""
         assert self.embeddings is not None
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
@@ -251,16 +338,18 @@ class Evaluator:
             pid for pid in test_pids if len(self.cited_by_pid.get(int(pid), [])) > 0
         ]
 
-        avg_precs = []
-        recall_at_k: dict[int, list[float]] = {k: [] for k in k_values}
-        max_k = max(k_values)
+        # Prepare batch data for numba processing
+        ranked_pids_list: list[NDArray] = []
+        relevant_pids_list: list[NDArray] = []
+        max_ranks: list[int] = []
 
         desc = (
-            f"Evaluating MAP@{self.top_k} + Recall"
+            f"Retrieving for MAP@{self.top_k} + Recall"
             if self.top_k
-            else "Evaluating MAP + Recall"
+            else "Retrieving for MAP + Recall"
         )
 
+        # First pass: retrieve and collect data
         for src_pid in tqdm(test_source_pids, desc=desc):  # type: ignore
             src_date = self.paragraph_dates[src_pid]
 
@@ -272,7 +361,6 @@ class Evaluator:
             cand_pids = self.sort_idx[:cutoff]
 
             # Ground truth: cited paragraphs that are also older
-            # Use numpy operations for faster intersection
             relevant_list = self.cited_by_pid[int(src_pid)]
             relevant_array = np.array(relevant_list, dtype=np.int64)
 
@@ -292,41 +380,35 @@ class Evaluator:
             if len(ranked_pids) == 0:
                 continue
 
-            # Compute which positions have relevant documents using vectorized operations
+            # Compute max rank
             max_rank = (
                 len(ranked_pids)
                 if self.top_k is None
                 else min(len(ranked_pids), self.top_k)
             )
-            ranked_slice = ranked_pids[:max_rank]
 
-            # Create boolean mask for relevant documents
-            is_relevant = np.isin(ranked_slice, relevant_pids)
+            # Store for batch processing
+            ranked_pids_list.append(ranked_pids.astype(np.int64))
+            relevant_pids_list.append(relevant_pids)
+            max_ranks.append(max_rank)
 
-            # Compute MAP
-            if np.any(is_relevant):
-                positions = np.where(is_relevant)[0] + 1  # 1-indexed positions
-                cumsum = np.cumsum(is_relevant)
-                precisions = cumsum[is_relevant] / positions
-                ap = float(np.sum(precisions) / num_rel)
-            else:
-                ap = 0.0
-            avg_precs.append(ap)
+        if not ranked_pids_list:
+            self.map_score = 0.0
+            self.recall_scores = {k: 0.0 for k in k_values}
+            return self.map_score, self.recall_scores
 
-            # Compute Recall@k for all k values
-            for k in k_values:
-                if len(ranked_pids) >= k:
-                    top_k_relevant = np.sum(is_relevant[:k])
-                    recall = float(top_k_relevant / num_rel)
-                else:
-                    # If we have fewer results than k, use all results
-                    recall = float(np.sum(is_relevant) / num_rel)
-                recall_at_k[k].append(recall)
+        # Second pass: compute metrics in parallel using numba
+        print("Computing metrics with numba...")
+        k_values_array = np.array(k_values, dtype=np.int64)
+        max_ranks_array = np.array(max_ranks, dtype=np.int64)
 
-        self.map_score = float(np.mean(avg_precs)) if avg_precs else 0.0
+        avg_precs, recall_matrix = compute_metrics_batch(
+            ranked_pids_list, relevant_pids_list, max_ranks_array, k_values_array
+        )
+
+        self.map_score = float(np.mean(avg_precs))
         self.recall_scores = {
-            k: float(np.mean(recalls)) if recalls else 0.0
-            for k, recalls in recall_at_k.items()
+            k: float(np.mean(recall_matrix[:, idx])) for idx, k in enumerate(k_values)
         }
         return self.map_score, self.recall_scores
 
