@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.data import Data  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from .base_retriever import BaseRetriever
@@ -56,6 +57,9 @@ class GNNRetriever(BaseRetriever):
         self._is_fitted = False
         self.graph_data: Data | None = None
         self.text_to_node_id: dict[str, int] = {}
+        self.idx_to_text: dict[int, str] = {}
+        self.doc_embeddings: np.ndarray | None = None
+        self.query_embeddings_cache: dict[str, np.ndarray] = {}
 
     def load_model(self, model_path: str) -> None:
         checkpoint = torch.load(model_path, map_location=self.device)
@@ -99,47 +103,16 @@ class GNNRetriever(BaseRetriever):
                 convert_to_numpy=True,
             )
 
-        x = torch.tensor(text_embeddings, dtype=torch.float32)
-
-        # Build edge index from citation graph
+        x = torch.tensor(text_embeddings, dtype=torch.float32)  # type: ignore[call-overload]
+        edge_list = []
         if citation_graph is not None:
-            edge_list = []
             for src, targets in citation_graph.items():
                 for tgt in targets:
-                    if src < len(texts) and tgt < len(texts):
-                        edge_list.append([src, tgt])
-                        # Add reverse edge for undirected graph
-                        edge_list.append([tgt, src])
+                    edge_list.append([tgt, src])
 
-            if edge_list:
-                edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-            else:
-                # Empty graph - no edges
-                edge_index = torch.empty((2, 0), dtype=torch.long)
-        else:
-            # No citation graph provided - fully connected within batches
-            # or use k-NN based on text similarity
-            edge_index = self._build_knn_graph(text_embeddings, k=10)
+        edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()  # type: ignore[call-overload]
 
         return Data(x=x, edge_index=edge_index)
-
-    def _build_knn_graph(self, embeddings: np.ndarray, k: int = 10) -> torch.Tensor:
-        from sklearn.neighbors import NearestNeighbors  # type: ignore
-
-        # Build k-NN graph based on cosine similarity
-        knn = NearestNeighbors(n_neighbors=min(k + 1, len(embeddings)), metric="cosine")
-        knn.fit(embeddings)
-        distances, indices = knn.kneighbors(embeddings)
-
-        edge_list = []
-        for i, neighbors in enumerate(indices):
-            for j in neighbors[1:]:  # Skip self
-                edge_list.append([i, j])
-
-        if edge_list:
-            return torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-        else:
-            return torch.empty((2, 0), dtype=torch.long)
 
     def fit(
         self,
@@ -165,36 +138,67 @@ class GNNRetriever(BaseRetriever):
         )
         self.text_to_node_id = {text: i for i, text in enumerate(texts)}
         self.paragraph_dates = paragraph_dates
+
+        # Pre-compute document embeddings using full GNN
+        self.gnn_model.eval()
+        with torch.no_grad():
+            x = self.graph_data.x.to(self.device)
+            edge_index = self.graph_data.edge_index.to(self.device)
+            doc_embeddings = self.gnn_model(x, edge_index)
+
+            if self.normalize_embeddings:
+                doc_embeddings = F.normalize(doc_embeddings, p=2, dim=1)
+
+            self.doc_embeddings = doc_embeddings.cpu().numpy()
+
         self._is_fitted = True
 
     def transform(self, texts: np.ndarray) -> np.ndarray:
-        if not self._is_fitted or self.graph_data is None:
+        if not self._is_fitted or self.doc_embeddings is None:
             raise ValueError("Model not fitted. Call fit() first.")
 
-        self.gnn_model.eval()
+        # Return GNN document embeddings for all texts in the graph
+        result = np.zeros((len(texts), self.doc_embeddings.shape[1]), dtype=np.float32)
 
-        with torch.no_grad():
-            # Move data to device
-            x = self.graph_data.x.to(self.device)
-            edge_index = self.graph_data.edge_index.to(self.device)
-
-            # Forward pass through GNN
-            embeddings = self.gnn_model(x, edge_index)
-
-            # Normalize embeddings
-            if self.normalize_embeddings:
-                embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-
-            embeddings = embeddings.cpu().numpy()
-
-        # Map requested texts to their embeddings
-        result = np.zeros((len(texts), embeddings.shape[1]), dtype=np.float32)
+        # Update idx_to_text mapping for retrieve() lookups
         for i, text in enumerate(texts):
+            self.idx_to_text[i] = text
             node_id = self.text_to_node_id.get(text)
-            if node_id is not None and node_id < len(embeddings):
-                result[i] = embeddings[node_id]
+            if node_id is not None and node_id < len(self.doc_embeddings):
+                result[i] = self.doc_embeddings[node_id]
 
         return result
+
+    def _get_query_embedding(self, text: str) -> np.ndarray:
+        """Get query embedding for a text, using cache if available."""
+        if text in self.query_embeddings_cache:
+            return self.query_embeddings_cache[text]
+
+        # Compute query embedding
+        self.gnn_model.eval()
+        with torch.no_grad():
+            # Get text embedding
+            text_embedding = self.text_encoder.encode(
+                [text],
+                batch_size=1,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+
+            # Project through query encoder
+            query_tensor = torch.tensor(  # type: ignore[call-overload]
+                text_embedding, dtype=torch.float32, device=self.device
+            )
+            query_embedding = self.gnn_model.encode_query(query_tensor)  # type: ignore
+
+            if self.normalize_embeddings:
+                query_embedding = F.normalize(query_embedding, p=2, dim=1)
+
+            query_embedding = query_embedding.cpu().numpy()[0]
+
+        # Cache for future use
+        self.query_embeddings_cache[text] = query_embedding
+        return query_embedding
 
     def retrieve(
         self,
@@ -203,7 +207,15 @@ class GNNRetriever(BaseRetriever):
         candidate_indices: np.ndarray,
         top_k: int | None = None,
     ) -> np.ndarray:
-        query_vec = embeddings[query_idx]
+        # Look up query text and get query embedding
+        query_text = self.idx_to_text.get(query_idx)
+        if query_text is not None:
+            query_vec = self._get_query_embedding(query_text)
+        else:
+            # Fallback to document embedding if text not found
+            query_vec = embeddings[query_idx]
+
+        # Get candidate document embeddings
         candidate_vecs = embeddings[candidate_indices]
 
         # Cosine similarity (embeddings should be normalized)

@@ -65,7 +65,7 @@ def train_example() -> None:
     in_channels = text_encoder.get_sentence_embedding_dimension()
 
     model = CitationGNN(
-        in_channels, hidden_dim=512, output_dim=in_channels, num_layers=3
+        in_channels, hidden_dim=in_channels, output_dim=in_channels, num_layers=2
     )
 
     trainer = GNNTrainer(
@@ -79,7 +79,7 @@ def train_example() -> None:
         temperature=0.07,
         validation_split=0.1,
         embeddings_cache_dir="artifacts/embeddings_cache",
-        num_hops=3,
+        num_hops=2,
     )
 
     # Train on paragraph pairs (pass model to train method)
