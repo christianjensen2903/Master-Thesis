@@ -107,10 +107,9 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
         if self.max_seq_length is not None:
             temp_model.max_seq_length = self.max_seq_length
 
-        # Compute embeddings for all candidates (with passage prefix)
-        candidate_texts_prefixed = [f"passage: {text}" for text in candidate_texts]
+        # Compute embeddings for all candidates
         candidate_embs = temp_model.encode(
-            candidate_texts_prefixed,
+            candidate_texts,
             batch_size=32,
             show_progress_bar=True,
             convert_to_numpy=True,
@@ -125,10 +124,8 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
             text_from = str(row["TEXT_FROM"])
             text_to = str(row["TEXT_TO"])
 
-            # Compute anchor embedding (with query prefix)
-            anchor_emb = temp_model.encode(
-                [f"query: {text_from}"], convert_to_numpy=True
-            )[0]
+            # Compute anchor embedding
+            anchor_emb = temp_model.encode([text_from], convert_to_numpy=True)[0]
 
             # Find positive index
             positive_idx = None
@@ -141,8 +138,8 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
                 # Fallback: use positive pair only
                 train_data.append(
                     {
-                        "sentence1": f"query: {text_from}",
-                        "sentence2": f"passage: {text_to}",
+                        "sentence1": text_from,
+                        "sentence2": text_to,
                     }
                 )
                 continue
@@ -157,17 +154,15 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
             )
 
             # Add positive pair
-            train_data.append(
-                {"sentence1": f"query: {text_from}", "sentence2": f"passage: {text_to}"}
-            )
+            train_data.append({"sentence1": text_from, "sentence2": text_to})
 
             # Add semi-hard negative pairs
             for neg_idx in semi_hard_indices:
                 neg_text = candidate_texts[neg_idx]
                 train_data.append(
                     {
-                        "sentence1": f"query: {text_from}",
-                        "sentence2": f"passage: {neg_text}",
+                        "sentence1": text_from,
+                        "sentence2": neg_text,
                     }
                 )
 

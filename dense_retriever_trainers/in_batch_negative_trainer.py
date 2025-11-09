@@ -42,9 +42,7 @@ class InBatchNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
         ):
             text_from = str(row["TEXT_FROM"])
             text_to = str(row["TEXT_TO"])
-            train_data.append(
-                {"sentence1": f"query: {text_from}", "sentence2": f"passage: {text_to}"}
-            )
+            train_data.append({"sentence1": text_from, "sentence2": text_to})
 
         train_dataset = Dataset.from_list(train_data)
         return train_dataset, val_df, train_df

@@ -62,8 +62,8 @@ class BaseDenseRetrieverTrainer(ABC):
             from_id = str(row["FROM_ID"])
             to_id = str(row["TO_ID"])
 
-            documents[from_id] = f"passage: {text_from}"
-            documents[to_id] = f"passage: {text_to}"
+            documents[from_id] = text_from
+            documents[to_id] = text_to
 
         for _, row in val_df.iterrows():
             text_from = str(row["TEXT_FROM"])
@@ -75,7 +75,7 @@ class BaseDenseRetrieverTrainer(ABC):
                 continue
 
             if from_id not in queries:
-                queries[from_id] = f"query: {text_from}"
+                queries[from_id] = text_from
                 relevant_docs[from_id] = set()
 
             relevant_docs[from_id].add(to_id)

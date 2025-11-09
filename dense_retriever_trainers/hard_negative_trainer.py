@@ -109,8 +109,8 @@ class HardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
                 # Fallback: use positive pair only
                 train_data.append(
                     {
-                        "sentence1": f"query: {text_from}",
-                        "sentence2": f"passage: {text_to}",
+                        "sentence1": text_from,
+                        "sentence2": text_to,
                     }
                 )
                 continue
@@ -121,17 +121,15 @@ class HardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
             )
 
             # Add positive pair
-            train_data.append(
-                {"sentence1": f"query: {text_from}", "sentence2": f"passage: {text_to}"}
-            )
+            train_data.append({"sentence1": text_from, "sentence2": text_to})
 
             # Add hard negative pairs
             for neg_idx in hard_negative_indices:
                 neg_text = candidate_texts[neg_idx]
                 train_data.append(
                     {
-                        "sentence1": f"query: {text_from}",
-                        "sentence2": f"passage: {neg_text}",
+                        "sentence1": text_from,
+                        "sentence2": neg_text,
                     }
                 )
 
