@@ -214,7 +214,7 @@ class DenseRetrieverTrainer:
                 tokenized_query = bm25s.tokenize(query_text, show_progress=False)
                 docs, _ = retriever.retrieve(
                     tokenized_query,
-                    k=self.num_negatives + len(candidate_ids),
+                    k=self.num_negatives + 20,
                     show_progress=False,
                 )
                 ranked_indices = np.array(docs[0])
