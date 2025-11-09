@@ -51,7 +51,7 @@ class HardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
     ) -> list[int]:
         """Select random hard negatives from the specified rank range."""
         # ranked_indices contains candidate indices sorted by similarity (highest first)
-        # Find where positive appears in ranked list and exclude it
+        # Exclude the positive from ranked list
         valid_ranked = ranked_indices[ranked_indices != positive_idx]
 
         # Get rank range (0-indexed positions in ranked list)
@@ -63,6 +63,12 @@ class HardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
             candidates = valid_ranked.tolist()
         else:
             candidates = valid_ranked[min_rank:max_rank].tolist()
+
+        if len(candidates) == 0:
+            return []
+
+        # Ensure positive is not in candidates (defensive check)
+        candidates = [idx for idx in candidates if idx != positive_idx]
 
         if len(candidates) == 0:
             return []
@@ -123,8 +129,10 @@ class HardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
             # Add positive pair
             train_data.append({"sentence1": text_from, "sentence2": text_to})
 
-            # Add hard negative pairs
+            # Add hard negative pairs (ensure positive is not included)
             for neg_idx in hard_negative_indices:
+                if neg_idx == positive_idx:
+                    continue
                 neg_text = candidate_texts[neg_idx]
                 train_data.append(
                     {

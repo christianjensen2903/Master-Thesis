@@ -156,8 +156,10 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
             # Add positive pair
             train_data.append({"sentence1": text_from, "sentence2": text_to})
 
-            # Add semi-hard negative pairs
+            # Add semi-hard negative pairs (ensure positive is not included)
             for neg_idx in semi_hard_indices:
+                if neg_idx == positive_idx:
+                    continue
                 neg_text = candidate_texts[neg_idx]
                 train_data.append(
                     {
