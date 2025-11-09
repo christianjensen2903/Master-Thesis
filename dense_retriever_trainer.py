@@ -202,7 +202,7 @@ class DenseRetrieverTrainer:
             candidate_ids = list(corpus.keys())
 
             print("Fitting BM25 on training data...")
-            tokenized_corpus = [bm25s.tokenize(text) for text in candidate_texts]
+            tokenized_corpus = bm25s.tokenize(candidate_texts)
             retriever = bm25s.BM25(corpus=candidate_texts)
             retriever.index(tokenized_corpus)
 
@@ -211,8 +211,12 @@ class DenseRetrieverTrainer:
                 desc="Creating training dataset with hard negatives",
             ):
                 # Rank all candidates using BM25
-                tokenized_query = bm25s.tokenize(query_text)
-                docs, _ = retriever.retrieve(tokenized_query, k=len(candidate_texts))
+                tokenized_query = bm25s.tokenize(query_text, show_progress=False)
+                docs, _ = retriever.retrieve(
+                    tokenized_query,
+                    k=self.num_negatives + candidate_ids,
+                    show_progress=False,
+                )
                 ranked_indices = np.array(docs[0])
 
                 # Find positive index in candidate list
