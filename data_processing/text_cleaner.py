@@ -198,17 +198,6 @@ class TextCleaner:
         # Protect specific contexts where dates should be preserved
         protected = []
 
-        # Protect "Rules of Procedure of the General Court of DATE (OJ YEAR ...)"
-        # rules_pattern = (
-        #     r"Rules of Procedure of the General Court of [^(]*\(OJ\s+\d{4}[^)]+\)"
-        # )
-
-        # def protect_rules(m):
-        #     protected.append(m.group(0))
-        #     return f"__PROTECTED_{len(protected)-1}__"
-
-        # text = re.sub(rules_pattern, protect_rules, text, flags=re.IGNORECASE)
-
         # Protect standalone OJ references like "(OJ 2015 L 105, p. 1)"
         oj_pattern = r"\(OJ\s+\d{4}[^)]+\)"
 
@@ -310,43 +299,21 @@ class TextCleaner:
         text = re.sub(r"<CASE>\s+<CASE>", "<CASE>", text)
         return text.strip()
 
-    def mask_quoted_text(self, text: str, reference_text: str | None = None) -> str:
-        """Mask quoted text that appears in both the current text and reference text."""
-        if not isinstance(text, str):
-            return text
-
-        if reference_text is None:
-            return text
-
-        # Find all quoted spans in text
-        quotes = re.findall(r'"[^"]*"', text)
-        for q in quotes:
-            if q in reference_text:
-                # Replace the quoted text but preserve the quotes
-                text = text.replace(q, '"<QUOTED_TEXT>"')
-        return text
-
     def clean_text(
         self,
         text: str,
-        reference_text: str | None = None,
         remove_paragraph_numbers: bool = True,
         remove_citations: bool = True,
         remove_dates: bool = True,
-        mask_quotes: bool = True,
-        min_length: int = 0,
     ) -> str:
         """
         Clean text using all available cleaning methods.
 
         Args:
             text: The text to clean
-            reference_text: Optional reference text for quote masking
             remove_paragraph_numbers: Whether to remove paragraph numbers
             remove_citations: Whether to remove legal citations
             remove_dates: Whether to remove dates
-            mask_quotes: Whether to mask quoted text
-            min_length: Minimum length for text to be kept (0 = no minimum)
 
         Returns:
             Cleaned text
@@ -358,9 +325,6 @@ class TextCleaner:
         # Apply cleaning steps in order
         if remove_paragraph_numbers:
             text = self.remove_paragraph_numbers(text)
-
-        if mask_quotes and reference_text:
-            text = self.mask_quoted_text(text, reference_text)
 
         if remove_citations:
             text = self.remove_citations(text)
@@ -376,31 +340,7 @@ class TextCleaner:
         # Fix false positives
         text = self.fix_false_positives(text)
 
-        # Remove very short texts
-        if min_length > 0 and len(text.strip()) < min_length:
-            return ""
-
         return text.strip()
-
-    def clean_pair(self, text_from: str, text_to: str, **kwargs) -> tuple[str, str]:
-        """
-        Clean a pair of texts, applying quote masking between them.
-
-        Args:
-            text_from: First text
-            text_to: Second text
-            **kwargs: Additional arguments passed to clean_text
-
-        Returns:
-            Tuple of (cleaned_text_from, cleaned_text_to)
-        """
-        # Clean text_from with text_to as reference for quote masking
-        cleaned_from = self.clean_text(text_from, reference_text=text_to, **kwargs)
-
-        # Clean text_to with text_from as reference for quote masking
-        cleaned_to = self.clean_text(text_to, reference_text=text_from, **kwargs)
-
-        return cleaned_from, cleaned_to
 
 
 # Example usage

@@ -1,4 +1,3 @@
-import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
 from datasets import Dataset  # type: ignore
 from sentence_transformers import (
@@ -18,40 +17,46 @@ class InBatchNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
         self,
         model_name: str,
         training_args: SentenceTransformerTrainingArguments,
-        validation_split: float = 0.1,
         use_wandb: bool = True,
         max_seq_length: int | None = None,
         loss_scale: float = 20.0,
     ):
-        super().__init__(
-            model_name, training_args, validation_split, use_wandb, max_seq_length
-        )
+        super().__init__(model_name, training_args, use_wandb, max_seq_length)
         self.loss_scale = loss_scale
 
-    def get_simcse_data(
-        self, paragraph_file: str, cutoff_year: int
-    ) -> tuple[Dataset, pd.DataFrame, pd.DataFrame]:
+    def get_training_data(
+        self,
+        judgments_path: str,
+        queries_path: str,
+        qrel_path: str,
+        cutoff_year: int,
+    ) -> tuple[Dataset, dict[str, str], dict[str, str], dict[str, set[str]]]:
         """Get data for sentence pair training."""
-        train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_year)
+        train_pairs, corpus, queries, relevant_docs = self.load_and_split_data(
+            judgments_path, queries_path, qrel_path, cutoff_year
+        )
 
         train_data = []
-        for _, row in tqdm(
-            train_df.iterrows(),
-            total=len(train_df),
+        for query_id, query_text, doc_id, doc_text in tqdm(
+            train_pairs,
             desc="Creating training dataset",
         ):
-            text_from = str(row["TEXT_FROM"])
-            text_to = str(row["TEXT_TO"])
-            train_data.append({"sentence1": text_from, "sentence2": text_to})
+            train_data.append({"sentence1": query_text, "sentence2": doc_text})
 
         train_dataset = Dataset.from_list(train_data)
-        return train_dataset, val_df, train_df
+        return train_dataset, corpus, queries, relevant_docs
 
-    def train(self, paragraph_file: str, cutoff_year: int) -> SentenceTransformer:
+    def train(
+        self,
+        judgments_path: str,
+        queries_path: str,
+        qrel_path: str,
+        cutoff_year: int,
+    ) -> SentenceTransformer:
         """Train a sentence embedding model using SIMCSE with MultipleNegativesRankingLoss."""
 
-        train_dataset, val_df, train_df = self.get_simcse_data(
-            paragraph_file, cutoff_year
+        train_dataset, corpus, queries, relevant_docs = self.get_training_data(
+            judgments_path, queries_path, qrel_path, cutoff_year
         )
 
         model = SentenceTransformer(self.model_name)
@@ -61,7 +66,7 @@ class InBatchNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
         train_loss = losses.MultipleNegativesRankingLoss(
             model=model, scale=self.loss_scale
         )
-        evaluator = self.create_ir_evaluator(val_df, train_df)
+        evaluator = self.create_ir_evaluator(corpus, queries, relevant_docs)
 
         print(f"\nTraining {self.model_name} with MultipleNegativesRankingLoss...")
         print(f"Total training examples: {len(train_dataset)}")
@@ -110,4 +115,9 @@ if __name__ == "__main__":
             batch_sampler=BatchSamplers.NO_DUPLICATES,
         ),
     )
-    trainer.train(paragraph_file="data/par-to-par-cleaned.csv", cutoff_year=2018)
+    trainer.train(
+        judgments_path="data/judgments_cleaned.json",
+        queries_path="data/evaluation/queries.tsv",
+        qrel_path="data/evaluation/qrel.txt",
+        cutoff_year=2018,
+    )

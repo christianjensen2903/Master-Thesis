@@ -35,16 +35,15 @@ class TfidfRetriever(BaseRetriever):
 
     def retrieve(
         self,
-        query_idx: int,
+        query_embedding: np.ndarray,
         embeddings: csr_matrix,
         candidate_indices: np.ndarray,
         top_k: int | None = None,
     ) -> np.ndarray:
-        query_vec = embeddings[query_idx]
         candidate_vecs = embeddings[candidate_indices]
 
         # Cosine similarity via dot product (vectors are l2-normalized)
-        similarities = candidate_vecs.dot(query_vec.T).toarray().ravel()
+        similarities = candidate_vecs.dot(query_embedding.T).toarray().ravel()
 
         # Use efficient top-k selection if requested
         if top_k is not None and top_k < len(similarities):

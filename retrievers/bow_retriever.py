@@ -44,18 +44,17 @@ class BOWRetriever(BaseRetriever):
 
     def retrieve(
         self,
-        query_idx: int,
+        query_embedding: np.ndarray,
         embeddings: csr_matrix,
         candidate_indices: np.ndarray,
         top_k: int | None = None,
     ) -> np.ndarray:
-        query_vec = embeddings[query_idx]
         candidate_vecs = embeddings[candidate_indices]
 
         # Compute Jaccard similarity at word level
-        intersection = candidate_vecs.dot(query_vec.T).toarray().ravel()
+        intersection = candidate_vecs.dot(query_embedding.T).toarray().ravel()
 
-        query_sum = query_vec.sum()
+        query_sum = query_embedding.sum()
         candidate_sums = np.array(candidate_vecs.sum(axis=1)).ravel()
 
         union = query_sum + candidate_sums - intersection

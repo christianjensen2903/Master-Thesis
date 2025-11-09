@@ -189,8 +189,9 @@ def find_low_ranked_metadata_matches(
             continue
 
         # Retrieve and rank
+        query_embedding = embeddings[src_pid]
         ranked_pids = retriever.retrieve(
-            int(src_pid), embeddings, cand_pids, top_k=top_k
+            query_embedding, embeddings, cand_pids, top_k=top_k
         )
 
         # Find ranks of relevant paragraphs

@@ -1,12 +1,13 @@
 import os
-import pandas as pd  # type: ignore
+import json
 from abc import ABC, abstractmethod
+from datetime import datetime as dt
+
 from sentence_transformers import (
     SentenceTransformer,
     SentenceTransformerTrainingArguments,
 )
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
-from validation_utils import split_data_by_date
 
 
 class BaseDenseRetrieverTrainer(ABC):
@@ -16,13 +17,11 @@ class BaseDenseRetrieverTrainer(ABC):
         self,
         model_name: str,
         training_args: SentenceTransformerTrainingArguments,
-        validation_split: float = 0.1,
         use_wandb: bool = True,
         max_seq_length: int | None = None,
     ):
         self.model_name = model_name
         self.training_args = training_args
-        self.validation_split = validation_split
         self.use_wandb = use_wandb
         self.max_seq_length = max_seq_length
 
@@ -34,55 +33,117 @@ class BaseDenseRetrieverTrainer(ABC):
             os.makedirs("output/model", exist_ok=True)
 
     def load_and_split_data(
-        self, paragraph_file: str, cutoff_year: int
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Load data and split into train/validation sets."""
-        df = pd.read_csv(paragraph_file)
-        df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
-        df["DATE_TO"] = pd.to_datetime(df["DATE_TO"])
+        self,
+        judgments_path: str,
+        queries_path: str,
+        qrel_path: str,
+        cutoff_year: int,
+    ) -> tuple[
+        list[tuple[str, str, str, str]],
+        dict[str, str],
+        dict[str, str],
+        dict[str, set[str]],
+    ]:
+        """Load data from judgments, queries, and qrel files and split by date."""
+        print("Loading judgments...")
+        with open(judgments_path) as f:
+            judgments = json.load(f)
 
-        df["FROM_ID"] = (
-            df["CELEX_FROM"].astype(str) + "::" + df["NUMBER_FROM"].astype(str)
-        )
-        df["TO_ID"] = df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
+        # Build paragraph index: (celex, number) -> text and date
+        paragraph_data: dict[tuple[str, int], tuple[str, dt]] = {}
 
-        return split_data_by_date(df, cutoff_year)
+        for celex, judgment in judgments.items():
+            meta = judgment.get("meta", {}).get("meta", {})
+            date_str = meta.get("date")
 
-    def create_ir_evaluator(
-        self, val_df: pd.DataFrame, train_df: pd.DataFrame
-    ) -> InformationRetrievalEvaluator:
-        """Create an Information Retrieval evaluator for validation."""
-        queries = {}
-        documents = {}
-        relevant_docs: dict[str, set[str]] = {}
-
-        for _, row in train_df.iterrows():
-            text_from = str(row["TEXT_FROM"])
-            text_to = str(row["TEXT_TO"])
-            from_id = str(row["FROM_ID"])
-            to_id = str(row["TO_ID"])
-
-            documents[from_id] = text_from
-            documents[to_id] = text_to
-
-        for _, row in val_df.iterrows():
-            text_from = str(row["TEXT_FROM"])
-            text_to = str(row["TEXT_TO"])
-            from_id = str(row["FROM_ID"])
-            to_id = str(row["TO_ID"])
-
-            if to_id not in documents:
+            try:
+                date = dt.strptime(date_str, "%Y-%m-%d")
+            except:
                 continue
 
-            if from_id not in queries:
-                queries[from_id] = text_from
-                relevant_docs[from_id] = set()
+            for par_num, text in judgment["paragraphs"].items():
+                key = (celex, int(par_num))
+                paragraph_data[key] = (text, date)
 
-            relevant_docs[from_id].add(to_id)
+        print(f"Loaded {len(paragraph_data)} paragraphs from judgments")
 
+        # Load qrel to get citation pairs
+        print("Loading qrel...")
+        citation_pairs: list[tuple[tuple[str, int], tuple[str, int]]] = []
+
+        with open(qrel_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                query_id = parts[0]
+                doc_id = parts[2]
+
+                # Parse celex_paragraph_number format
+                celex_q, par_num_q = query_id.rsplit("_", 1)
+                celex_d, par_num_d = doc_id.rsplit("_", 1)
+
+                query_key = (celex_q, int(par_num_q))
+                doc_key = (celex_d, int(par_num_d))
+
+                # Only include if both exist
+                if query_key in paragraph_data and doc_key in paragraph_data:
+                    citation_pairs.append((query_key, doc_key))
+
+        print(f"Loaded {len(citation_pairs)} citation pairs from qrel")
+
+        # Split into train and validation based on query date
+        train_pairs: list[tuple[str, str, str, str]] = []
+        val_pairs: list[tuple[str, str, str, str]] = []
+
+        cutoff_date = dt(cutoff_year, 1, 1)
+
+        for query_key, doc_key in citation_pairs:
+            query_text, query_date = paragraph_data[query_key]
+            doc_text, _ = paragraph_data[doc_key]
+
+            # Create IDs in format celex::paragraph_number
+            query_id_str = f"{query_key[0]}::{query_key[1]}"
+            doc_id_str = f"{doc_key[0]}::{doc_key[1]}"
+
+            if query_date < cutoff_date:
+                train_pairs.append((query_id_str, query_text, doc_id_str, doc_text))
+            else:
+                val_pairs.append((query_id_str, query_text, doc_id_str, doc_text))
+
+        print(f"\n📅 Temporal Split:")
+        print(f"  Train: before {cutoff_date.date()} ({len(train_pairs)} citations)")
+        print(f"  Val: after {cutoff_date.date()} ({len(val_pairs)} citations)")
+
+        # Build evaluator structures
+        train_corpus: dict[str, str] = {}
+        val_queries: dict[str, str] = {}
+        val_relevant: dict[str, set[str]] = {}
+
+        # Add all train documents to corpus
+        for qid, qtext, did, dtext in train_pairs:
+            train_corpus[qid] = qtext
+            train_corpus[did] = dtext
+
+        # Build validation queries and relevant docs
+        for qid, qtext, did, dtext in val_pairs:
+            # Only include if document exists in train corpus
+            if did in train_corpus:
+                if qid not in val_queries:
+                    val_queries[qid] = qtext
+                    val_relevant[qid] = set()
+                val_relevant[qid].add(did)
+
+        return train_pairs, train_corpus, val_queries, val_relevant
+
+    def create_ir_evaluator(
+        self,
+        corpus: dict[str, str],
+        queries: dict[str, str],
+        relevant_docs: dict[str, set[str]],
+    ) -> InformationRetrievalEvaluator:
+        """Create an Information Retrieval evaluator for validation."""
         evaluator = InformationRetrievalEvaluator(
             queries=queries,
-            corpus=documents,
+            corpus=corpus,
             relevant_docs=relevant_docs,
             name="validation_ir",
             show_progress_bar=True,
@@ -93,6 +154,12 @@ class BaseDenseRetrieverTrainer(ABC):
         return evaluator
 
     @abstractmethod
-    def train(self, paragraph_file: str, cutoff_year: int) -> SentenceTransformer:
+    def train(
+        self,
+        judgments_path: str,
+        queries_path: str,
+        qrel_path: str,
+        cutoff_year: int,
+    ) -> SentenceTransformer:
         """Train the model. Must be implemented by subclasses."""
         pass

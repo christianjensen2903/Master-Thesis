@@ -200,26 +200,30 @@ class GNNRetriever(BaseRetriever):
         self.query_embeddings_cache[text] = query_embedding
         return query_embedding
 
+    def transform_queries(self, query_texts: np.ndarray) -> np.ndarray:
+        """Transform query texts into query embeddings using GNN query encoder."""
+        if not self._is_fitted:
+            raise ValueError("Model not fitted. Call fit() first.")
+
+        query_embeddings = []
+        for text in query_texts:
+            query_emb = self._get_query_embedding(text)
+            query_embeddings.append(query_emb)
+
+        return np.array(query_embeddings)
+
     def retrieve(
         self,
-        query_idx: int,
+        query_embedding: np.ndarray,
         embeddings: np.ndarray,
         candidate_indices: np.ndarray,
         top_k: int | None = None,
     ) -> np.ndarray:
-        # Look up query text and get query embedding
-        query_text = self.idx_to_text.get(query_idx)
-        if query_text is not None:
-            query_vec = self._get_query_embedding(query_text)
-        else:
-            # Fallback to document embedding if text not found
-            query_vec = embeddings[query_idx]
-
         # Get candidate document embeddings
         candidate_vecs = embeddings[candidate_indices]
 
         # Cosine similarity (embeddings should be normalized)
-        similarities = candidate_vecs @ query_vec
+        similarities = candidate_vecs @ query_embedding
 
         # Use efficient top-k selection if requested
         if top_k is not None and top_k < len(similarities):

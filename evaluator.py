@@ -1,22 +1,15 @@
 import json
 import os
-import re
+import csv
 from datetime import datetime as dt
 from collections import defaultdict
-from typing import Literal, cast
+from typing import Literal, Any
 
 import numpy as np
 from numpy.typing import NDArray
-import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
 from numba import njit, prange  # type: ignore
 
-from data_loader import (
-    load_citation_data,
-    split_train_test,
-    build_paragraph_index,
-    build_citation_graph,
-)
 from retrievers.base_retriever import BaseRetriever
 
 # Type alias for evaluator modes
@@ -115,9 +108,9 @@ class Evaluator:
         retriever: BaseRetriever,
         embeddings: NDArray | None = None,
         mode: EvaluatorMode = "citation_pairs",
-        csv_path: str = "data/par-to-par-cleaned.csv",
-        metadata_path: str = "data/par-to-par.json",
         judgments_path: str = "data/judgments_cleaned.json",
+        queries_path: str = "data/evaluation/queries.tsv",
+        qrel_path: str = "data/evaluation/qrel.txt",
         train_cutoff_year: int = 2018,
         top_k: int | None = None,
         save_embeddings_path: str | None = None,
@@ -125,9 +118,9 @@ class Evaluator:
         self.retriever = retriever
         self.embeddings = embeddings
         self.mode: EvaluatorMode = mode
-        self.csv_path = csv_path
-        self.metadata_path = metadata_path
         self.judgments_path = judgments_path
+        self.queries_path = queries_path
+        self.qrel_path = qrel_path
         self.train_cutoff_year = train_cutoff_year
         self.top_k = top_k
         self.save_embeddings_path = save_embeddings_path
@@ -139,11 +132,6 @@ class Evaluator:
             )
 
         # Data structures (populated by load_and_prepare)
-        self.df: pd.DataFrame | None = None
-        self.metadata: dict | None = None
-        self.train_meta: list[dict] | None = None
-        self.test_meta: list[dict] | None = None
-
         self.pid_to_text: NDArray[np.object_] | None = None
         self.celex_number_to_pid: dict[tuple[str, int], int] | None = None
         self.paragraph_dates: NDArray | None = None
@@ -151,7 +139,10 @@ class Evaluator:
         self.paragraph_number: NDArray[np.object_] | None = None
         self.paragraph_set: NDArray[np.object_] | None = None
 
-        self.cited_by_pid: dict[int, list[int]] | None = None
+        self.query_pids: list[int] | None = None
+        self.query_texts: NDArray[np.object_] | None = None
+        self.query_embeddings: NDArray | None = None
+        self.qrel: dict[int, list[int]] | None = None
 
         self.sort_idx: NDArray | None = None
         self.sorted_dates: NDArray | None = None
@@ -160,72 +151,28 @@ class Evaluator:
         self.recall_scores: dict[int, float] | None = None
 
     def load_and_prepare(self) -> None:
+        """Load all data and prepare for evaluation."""
+        # Load all paragraphs from judgments.json
+        self._load_paragraphs()
+
+        # Load queries and qrel
+        self._load_queries_and_qrel()
+
+        # Filter paragraphs for citation_pairs mode
         if self.mode == "citation_pairs":
-            self._load_citation_pairs_mode()
-        else:
-            self._load_all_paragraphs_mode()
+            self._filter_to_citation_paragraphs()
 
         # Prepare temporal index
         self._prepare_temporal_index()
 
-    def _load_citation_pairs_mode(self) -> None:
-        """Load data in citation pairs mode (using par-to-par CSV)"""
-        self.df, self.metadata = load_citation_data(self.csv_path, self.metadata_path)
-        self.train_meta, self.test_meta = split_train_test(
-            self.metadata, self.train_cutoff_year
-        )
-
-        (
-            self.pid_to_text,
-            self.celex_number_to_pid,
-            self.paragraph_dates,
-            self.paragraph_celex,
-            self.paragraph_number,
-            self.paragraph_set,
-        ) = build_paragraph_index(self.df, self.train_meta, self.test_meta)
-
-        # Build citation graph
-        self.cited_by_pid = build_citation_graph(self.df, self.celex_number_to_pid)
-
-    def _load_all_paragraphs_mode(self) -> None:
-        """
-        Load data in all paragraphs mode (using judgments_cleaned.json + par-to-par for citations)
-
-        This mode:
-        - Loads ALL paragraphs from judgments_cleaned.json as candidates
-        - Uses par-to-par-cleaned.csv for ground truth citations
-        - Allows evaluation against all possible paragraphs, not just those in par-to-par
-        """
+    def _load_paragraphs(self) -> None:
+        """Load all paragraphs from judgments.json."""
         print("Loading judgments...")
         with open(self.judgments_path) as f:
             judgments = json.load(f)
 
-        # Build paragraph index from all judgments
         paragraphs = []
-        for judgment in tqdm(judgments, desc="Processing judgments"):
-            # Extract CELEX ID from file path
-            files = judgment.get("meta", {}).get("files", {})
-            if not files:
-                continue
-
-            # Get first available file path
-            first_lang = list(files.values())[0] if files else None
-            if not first_lang:
-                continue
-
-            file_path = (
-                first_lang.get("judgment", "") if isinstance(first_lang, dict) else ""
-            )
-            if not file_path:
-                continue
-
-            # Extract CELEX ID from path (e.g., "61954CJ0001")
-            # Path format: F:\ECJ\new_files\61954CJ0001\FR\judgment.html
-            match = re.search(r"(\d+[A-Z]+\d+)", file_path)
-            if not match:
-                continue
-            celex = match.group(1)
-
+        for celex, judgment in tqdm(judgments.items(), desc="Processing judgments"):
             # Get date from meta
             meta = judgment.get("meta", {}).get("meta", {})
             date_str = meta.get("date")
@@ -266,56 +213,141 @@ class Evaluator:
         )
         self.paragraph_set = np.array([p["set_type"] for p in paragraphs], dtype=object)
 
-        # Load citation pairs from par-to-par for ground truth
-        print("Loading citation pairs for ground truth...")
-        self.df = pd.read_csv(self.csv_path).dropna()
+    def _load_queries_and_qrel(self) -> None:
+        """Load queries and qrel files."""
+        assert self.celex_number_to_pid is not None
 
-        # Build citation graph from par-to-par (only for paragraphs that exist in our index)
-        self.cited_by_pid = self._build_citation_graph_safe(
-            self.df, self.celex_number_to_pid
+        print("Loading queries...")
+        query_data = []
+        with open(self.queries_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter="\t")
+            next(reader)  # Skip header
+            for celex, par_num, query_text in reader:
+                key = (celex, int(par_num))
+                if key in self.celex_number_to_pid:
+                    query_data.append((self.celex_number_to_pid[key], query_text))
+
+        self.query_pids = [pid for pid, _ in query_data]
+        self.query_texts = np.array([text for _, text in query_data], dtype=object)
+
+        print("Loading qrel...")
+        self.qrel = defaultdict(list)
+        with open(self.qrel_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                query_id = parts[0]
+                doc_id = parts[2]
+
+                # Parse celex_paragraph_number format
+                celex_q, par_num_q = query_id.rsplit("_", 1)
+                celex_d, par_num_d = doc_id.rsplit("_", 1)
+
+                query_key = (celex_q, int(par_num_q))
+                doc_key = (celex_d, int(par_num_d))
+
+                if (
+                    query_key in self.celex_number_to_pid
+                    and doc_key in self.celex_number_to_pid
+                ):
+                    query_pid = self.celex_number_to_pid[query_key]
+                    doc_pid = self.celex_number_to_pid[doc_key]
+                    self.qrel[query_pid].append(doc_pid)
+
+        print(
+            f"Loaded {len(self.query_pids)} queries with {sum(len(v) for v in self.qrel.values())} qrel entries"
         )
 
-    def _build_citation_graph_safe(
-        self, df: pd.DataFrame, celex_number_to_pid: dict[tuple[str, int], int]
-    ) -> dict[int, list[int]]:
-        """
-        Build citation graph using (celex, number) keys, skipping paragraphs that don't exist in the index.
-        """
-        cited_by_pid = defaultdict(set)
-        skipped = 0
+    def _filter_to_citation_paragraphs(self) -> None:
+        """Filter paragraphs to only those involved in citations for citation_pairs mode."""
+        assert self.qrel is not None
+        assert self.pid_to_text is not None
+        assert self.celex_number_to_pid is not None
+        assert self.paragraph_dates is not None
+        assert self.paragraph_celex is not None
+        assert self.paragraph_number is not None
+        assert self.paragraph_set is not None
+        assert self.query_pids is not None
+        assert self.query_texts is not None
 
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Building citations"):
-            celex_from = row["CELEX_FROM"]
-            number_from = row["NUMBER_FROM"]
-            celex_to = row["CELEX_TO"]
-            number_to = row["NUMBER_TO"]
+        print("Filtering to citation-involved paragraphs...")
 
-            src_key = (str(celex_from), int(number_from))
-            tgt_key = (str(celex_to), int(number_to))
+        # Collect all paragraphs involved in any citation
+        citation_involved_pids: set[int] = set()
+        for query_pid, cited_pids in self.qrel.items():
+            citation_involved_pids.add(query_pid)
+            citation_involved_pids.update(cited_pids)
 
-            # Skip if either key not in our index
-            if src_key not in celex_number_to_pid or tgt_key not in celex_number_to_pid:
-                skipped += 1
-                continue
+        # Create sorted list of citation-involved pids
+        old_pids = sorted(citation_involved_pids)
 
-            src_pid = celex_number_to_pid[src_key]
-            tgt_pid = celex_number_to_pid[tgt_key]
-            cited_by_pid[src_pid].add(tgt_pid)
+        # Create mapping from old pid to new pid
+        old_to_new_pid = {old_pid: new_pid for new_pid, old_pid in enumerate(old_pids)}
 
-        if skipped > 0:
-            print(
-                f"Skipped {skipped}/{len(df)} citation pairs (paragraphs not in index)"
-            )
+        # Filter all arrays to only citation-involved paragraphs
+        self.pid_to_text = self.pid_to_text[old_pids]
+        self.paragraph_dates = self.paragraph_dates[old_pids]
+        self.paragraph_celex = self.paragraph_celex[old_pids]
+        self.paragraph_number = self.paragraph_number[old_pids]
+        self.paragraph_set = self.paragraph_set[old_pids]
 
-        # Make deterministic and convert to dict
-        result: dict[int, list[int]] = {k: sorted(v) for k, v in cited_by_pid.items()}
-        return result
+        # Update celex_number_to_pid mapping
+        new_celex_number_to_pid = {}
+        for (celex, number), old_pid in self.celex_number_to_pid.items():
+            if old_pid in old_to_new_pid:
+                new_celex_number_to_pid[(celex, number)] = old_to_new_pid[old_pid]
+        self.celex_number_to_pid = new_celex_number_to_pid
+
+        # Update query_pids and query_texts
+        new_query_pids = []
+        new_query_texts = []
+        old_query_texts = self.query_texts
+        for idx, old_pid in enumerate(self.query_pids):
+            if old_pid in old_to_new_pid:
+                new_query_pids.append(old_to_new_pid[old_pid])
+                new_query_texts.append(old_query_texts[idx])
+        self.query_pids = new_query_pids
+        self.query_texts = np.array(new_query_texts, dtype=object)
+
+        # Update qrel
+        new_qrel: dict[int, list[int]] = {}
+        for old_query_pid, old_cited_pids in self.qrel.items():
+            if old_query_pid in old_to_new_pid:
+                new_query_pid = old_to_new_pid[old_query_pid]
+                new_cited_pids = [
+                    old_to_new_pid[old_cited_pid]
+                    for old_cited_pid in old_cited_pids
+                    if old_cited_pid in old_to_new_pid
+                ]
+                if new_cited_pids:
+                    new_qrel[new_query_pid] = new_cited_pids
+        self.qrel = new_qrel
+
+        print(
+            f"Filtered from {len(citation_involved_pids)} to {len(old_pids)} citation-involved paragraphs"
+        )
 
     def _prepare_temporal_index(self) -> None:
         """Pre-sort paragraph IDs by date for temporal filtering."""
         assert self.paragraph_dates is not None
         self.sort_idx = np.argsort(self.paragraph_dates)
         self.sorted_dates = self.paragraph_dates[self.sort_idx]
+
+    def _embed_queries(self) -> None:
+        """Embed query texts using the retriever."""
+        assert self.query_texts is not None
+        query_texts = self.query_texts
+
+        print("Embedding queries...")
+
+        # Check if retriever has a special method for queries (e.g., GNN)
+        if hasattr(self.retriever, "transform_queries"):
+            query_embeddings = self.retriever.transform_queries(query_texts)
+        else:
+            # Standard transform for all other retrievers
+            query_embeddings = self.retriever.transform(query_texts)
+
+        self.query_embeddings = query_embeddings
+        print(f"Query embeddings shape: {query_embeddings.shape}")
 
     def evaluate_map_and_recall(
         self, k_values: list[int] = [5, 10, 50, 100]
@@ -324,18 +356,21 @@ class Evaluator:
         assert self.embeddings is not None
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
-        assert self.cited_by_pid is not None
+        assert self.qrel is not None
+        assert self.query_pids is not None
+        assert self.query_embeddings is not None
         assert self.paragraph_dates is not None
         assert self.sorted_dates is not None
         assert self.sort_idx is not None
 
-        # Precompute test source PIDs using numpy for speed
-        test_mask = self.paragraph_set == "test"
-        test_pids = np.where(test_mask)[0]
+        # Create pid to query index mapping
+        pid_to_query_idx = {pid: idx for idx, pid in enumerate(self.query_pids)}
 
-        # Filter to only those with citations
-        test_source_pids = [
-            pid for pid in test_pids if len(self.cited_by_pid.get(int(pid), [])) > 0
+        # Filter queries to test set only
+        test_query_pids = [
+            pid
+            for pid in self.query_pids
+            if self.paragraph_set[pid] == "test" and pid in self.qrel
         ]
 
         # Prepare batch data for numba processing
@@ -350,18 +385,22 @@ class Evaluator:
         )
 
         # First pass: retrieve and collect data
-        for src_pid in tqdm(test_source_pids, desc=desc):  # type: ignore
-            src_date = self.paragraph_dates[src_pid]
+        for query_pid in tqdm(test_query_pids, desc=desc):
+            query_date = self.paragraph_dates[query_pid]
 
-            # Get all paragraphs strictly older than source
-            cutoff = int(np.searchsorted(self.sorted_dates, src_date, side="left"))
+            # Get all paragraphs strictly older than query
+            cutoff = int(np.searchsorted(self.sorted_dates, query_date, side="left"))
             if cutoff == 0:
                 continue
 
+            # Candidate set: all paragraphs before the query
             cand_pids = self.sort_idx[:cutoff]
 
-            # Ground truth: cited paragraphs that are also older
-            relevant_list = self.cited_by_pid[int(src_pid)]
+            if len(cand_pids) == 0:
+                continue
+
+            # Ground truth: relevant paragraphs that are also in candidate set
+            relevant_list = self.qrel[query_pid]
             relevant_array = np.array(relevant_list, dtype=np.int64)
 
             # Fast intersection using numpy
@@ -372,9 +411,13 @@ class Evaluator:
             if num_rel == 0:
                 continue
 
+            # Get query embedding
+            query_idx = pid_to_query_idx[query_pid]
+            query_embedding = self.query_embeddings[query_idx]
+
             # Retrieve and rank candidates once
             ranked_pids = self.retriever.retrieve(
-                int(src_pid), self.embeddings, cand_pids, top_k=self.top_k
+                query_embedding, self.embeddings, cand_pids, top_k=self.top_k
             )
 
             if len(ranked_pids) == 0:
@@ -451,10 +494,12 @@ class Evaluator:
 
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
+        assert self.query_pids is not None
 
         print(f"Unique paragraphs: {len(self.pid_to_text)}")
         print(f"Train paragraphs: {np.sum(self.paragraph_set == 'train')}")
         print(f"Test paragraphs: {np.sum(self.paragraph_set == 'test')}")
+        print(f"Total queries: {len(self.query_pids)}")
 
         # Try to load embeddings if not provided
         if self.embeddings is None and self.save_embeddings_path:
@@ -492,9 +537,8 @@ class Evaluator:
         if self.save_embeddings_path:
             self.save_embeddings()
 
-        if self.mode == "citation_pairs":
-            assert self.df is not None
-            print(f"Citation pairs: {len(self.df)}")
+        # Embed queries using cleaned query texts
+        self._embed_queries()
 
         metric_name = f"MAP@{self.top_k}" if self.top_k else "MAP"
         print(f"\nComputing {metric_name} and Recall@k...")
@@ -508,43 +552,49 @@ class Evaluator:
 
 
 if __name__ == "__main__":
-    from retrievers import DenseRetriever, GNNRetriever
+    from retrievers import DenseRetriever, GNNRetriever, TfidfRetriever
     from example_gnn_usage import CitationGNN
     import torch
     from sentence_transformers import SentenceTransformer
+
+    retriever = TfidfRetriever(
+        stop_words="english",
+        strip_accents="ascii",
+        norm="l2",
+    )
 
     # retriever = DenseRetriever(
     #     model_name="checkpoints/simcse_citation_model",
     #     max_seq_length=256,
     # )
 
-    encoding_model = "checkpoints/simcse_citation_model"
-    text_encoder = SentenceTransformer(encoding_model)
+    # encoding_model = "checkpoints/simcse_citation_model"
+    # text_encoder = SentenceTransformer(encoding_model)
 
-    in_channels = text_encoder.get_sentence_embedding_dimension()
+    # in_channels = text_encoder.get_sentence_embedding_dimension()
 
-    model = CitationGNN(
-        in_channels, hidden_dim=512, output_dim=in_channels, num_layers=3
-    )
+    # model = CitationGNN(
+    #     in_channels, hidden_dim=512, output_dim=in_channels, num_layers=3
+    # )
 
-    model.load_state_dict(torch.load("checkpoints/gnn/best_model.pt"))
+    # model.load_state_dict(torch.load("checkpoints/gnn/best_model.pt"))
 
-    retriever = GNNRetriever(
-        gnn_model=model,
-        # model_path="checkpoints/gnn/best_model.pt",
-        text_encoder_name=encoding_model,
-        batch_size=32,
-    )
+    # retriever = GNNRetriever(
+    #     gnn_model=model,
+    #     # model_path="checkpoints/gnn/best_model.pt",
+    #     text_encoder_name=encoding_model,
+    #     batch_size=32,
+    # )
 
     evaluator = Evaluator(
         retriever=retriever,
-        # mode="all_paragraphs",
-        csv_path="data/par-to-par-cleaned.csv",
-        metadata_path="data/par-to-par.json",
+        mode="all_paragraphs",
         judgments_path="data/judgments_cleaned.json",
+        queries_path="data/evaluation/queries_cleaned.tsv",
+        qrel_path="data/evaluation/qrel.txt",
         train_cutoff_year=2018,
         top_k=10000,
-        save_embeddings_path="artifacts/simcse_embeddings.npy",
+        # save_embeddings_path="artifacts/simcse_embeddings.npy",
     )
 
     score = evaluator.run()

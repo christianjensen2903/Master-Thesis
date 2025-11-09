@@ -39,7 +39,7 @@ class BGEM3Retriever(BaseRetriever):
 
     def retrieve(
         self,
-        query_idx: int,
+        query_embedding: np.ndarray,
         embeddings: np.ndarray,
         candidate_indices: np.ndarray,
         top_k: int | None = None,
@@ -52,7 +52,7 @@ class BGEM3Retriever(BaseRetriever):
         temp_index.add(candidate_embeddings)
 
         # Search
-        query_vec = embeddings[query_idx : query_idx + 1]
+        query_vec = query_embedding.reshape(1, -1)
         k = top_k if top_k is not None else len(candidate_indices)
 
         _, local_indices = temp_index.search(query_vec, k)

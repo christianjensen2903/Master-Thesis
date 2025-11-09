@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
 from datasets import Dataset  # type: ignore
 from sentence_transformers import (
@@ -8,7 +7,7 @@ from sentence_transformers import (
     losses,
 )
 from sentence_transformers.training_args import SentenceTransformerTrainingArguments
-from .base_trainer import BaseDenseRetrieverTrainer
+from dense_retriever_trainers.base_trainer import BaseDenseRetrieverTrainer
 
 
 class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
@@ -23,16 +22,13 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
         self,
         model_name: str,
         training_args: SentenceTransformerTrainingArguments,
-        validation_split: float = 0.1,
         use_wandb: bool = True,
         max_seq_length: int | None = None,
         loss_scale: float = 20.0,
         num_semi_hard_negatives: int = 1,
         margin: float = 0.2,
     ):
-        super().__init__(
-            model_name, training_args, validation_split, use_wandb, max_seq_length
-        )
+        super().__init__(model_name, training_args, use_wandb, max_seq_length)
         self.loss_scale = loss_scale
         self.num_semi_hard_negatives = num_semi_hard_negatives
         self.margin = margin
@@ -93,13 +89,20 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
         return selected.tolist()
 
     def get_training_data(
-        self, paragraph_file: str, cutoff_year: int
-    ) -> tuple[Dataset, pd.DataFrame, pd.DataFrame]:
+        self,
+        judgments_path: str,
+        queries_path: str,
+        qrel_path: str,
+        cutoff_year: int,
+    ) -> tuple[Dataset, dict[str, str], dict[str, str], dict[str, set[str]]]:
         """Get training data with semi-hard negatives."""
-        train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_year)
+        train_pairs, corpus, queries, relevant_docs = self.load_and_split_data(
+            judgments_path, queries_path, qrel_path, cutoff_year
+        )
 
-        # Get unique candidate texts (all TO texts)
-        candidate_texts = train_df["TEXT_TO"].astype(str).unique().tolist()
+        # Get candidate texts from corpus
+        candidate_texts = list(corpus.values())
+        candidate_ids = list(corpus.keys())
 
         # Initialize model for computing embeddings
         print("Computing embeddings for semi-hard negative mining...")
@@ -116,21 +119,17 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
         )
 
         train_data = []
-        for _, row in tqdm(
-            train_df.iterrows(),
-            total=len(train_df),
+        for query_id, query_text, doc_id, doc_text in tqdm(
+            train_pairs,
             desc="Creating training dataset with semi-hard negatives",
         ):
-            text_from = str(row["TEXT_FROM"])
-            text_to = str(row["TEXT_TO"])
-
             # Compute anchor embedding
-            anchor_emb = temp_model.encode([text_from], convert_to_numpy=True)[0]
+            anchor_emb = temp_model.encode([query_text], convert_to_numpy=True)[0]
 
             # Find positive index
             positive_idx = None
-            for i, candidate_text in enumerate(candidate_texts):
-                if candidate_text == text_to:
+            for i, cand_id in enumerate(candidate_ids):
+                if cand_id == doc_id:
                     positive_idx = i
                     break
 
@@ -138,8 +137,8 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
                 # Fallback: use positive pair only
                 train_data.append(
                     {
-                        "sentence1": text_from,
-                        "sentence2": text_to,
+                        "sentence1": query_text,
+                        "sentence2": doc_text,
                     }
                 )
                 continue
@@ -154,7 +153,7 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
             )
 
             # Add positive pair
-            train_data.append({"sentence1": text_from, "sentence2": text_to})
+            train_data.append({"sentence1": query_text, "sentence2": doc_text})
 
             # Add semi-hard negative pairs (ensure positive is not included)
             for neg_idx in semi_hard_indices:
@@ -163,18 +162,24 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
                 neg_text = candidate_texts[neg_idx]
                 train_data.append(
                     {
-                        "sentence1": text_from,
+                        "sentence1": query_text,
                         "sentence2": neg_text,
                     }
                 )
 
         train_dataset = Dataset.from_list(train_data)
-        return train_dataset, val_df, train_df
+        return train_dataset, corpus, queries, relevant_docs
 
-    def train(self, paragraph_file: str, cutoff_year: int) -> SentenceTransformer:
+    def train(
+        self,
+        judgments_path: str,
+        queries_path: str,
+        qrel_path: str,
+        cutoff_year: int,
+    ) -> SentenceTransformer:
         """Train with semi-hard negatives (FaceNet style)."""
-        train_dataset, val_df, train_df = self.get_training_data(
-            paragraph_file, cutoff_year
+        train_dataset, corpus, queries, relevant_docs = self.get_training_data(
+            judgments_path, queries_path, qrel_path, cutoff_year
         )
 
         model = SentenceTransformer(self.model_name)
@@ -184,7 +189,7 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
         train_loss = losses.MultipleNegativesRankingLoss(
             model=model, scale=self.loss_scale
         )
-        evaluator = self.create_ir_evaluator(val_df, train_df)
+        evaluator = self.create_ir_evaluator(corpus, queries, relevant_docs)
 
         print(
             f"\nTraining {self.model_name} with Semi-Hard Negatives (FaceNet style, margin={self.margin})..."
