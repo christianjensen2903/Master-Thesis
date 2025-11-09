@@ -1,6 +1,5 @@
 import os
 import json
-import random
 from datetime import datetime as dt
 
 import numpy as np
@@ -27,8 +26,6 @@ class DenseRetrieverTrainer:
         max_seq_length: int | None = None,
         loss_scale: float = 20.0,
         num_negatives: int = 1,
-        hard_negative_min_rank: int = 100,
-        hard_negative_max_rank: int = 300,
     ):
         self.model_name = model_name
         self.training_args = training_args
@@ -36,8 +33,6 @@ class DenseRetrieverTrainer:
         self.max_seq_length = max_seq_length
         self.loss_scale = loss_scale
         self.num_negatives = num_negatives
-        self.hard_negative_min_rank = hard_negative_min_rank
-        self.hard_negative_max_rank = hard_negative_max_rank
 
         if self.training_args is not None:
             output_dir_init = self.training_args.output_dir
@@ -49,7 +44,6 @@ class DenseRetrieverTrainer:
     def load_and_split_data(
         self,
         judgments_path: str,
-        queries_path: str,
         qrel_path: str,
         cutoff_year: int,
     ) -> tuple[
@@ -174,44 +168,27 @@ class DenseRetrieverTrainer:
     def _select_hard_negatives(
         self, ranked_indices: np.ndarray, positive_idx: int
     ) -> list[int]:
-        """Select random hard negatives from the specified rank range."""
+        """Select top hard negatives from ranked candidates."""
         # ranked_indices contains candidate indices sorted by similarity (highest first)
         # Exclude the positive from ranked list
-        valid_ranked = ranked_indices[ranked_indices != positive_idx]
-
-        # Get rank range (0-indexed positions in ranked list)
-        min_rank = min(self.hard_negative_min_rank, len(valid_ranked))
-        max_rank = min(self.hard_negative_max_rank, len(valid_ranked))
-
-        if min_rank >= max_rank:
-            # Fallback: use all available candidates after positive
-            candidates = valid_ranked.tolist()
-        else:
-            candidates = valid_ranked[min_rank:max_rank].tolist()
+        candidates = ranked_indices[ranked_indices != positive_idx]
 
         if len(candidates) == 0:
             return []
 
-        # Ensure positive is not in candidates (defensive check)
-        candidates = [idx for idx in candidates if idx != positive_idx]
-
-        if len(candidates) == 0:
-            return []
-
-        # Sample random negatives
+        # Select top negatives (already sorted by similarity)
         num_samples = min(self.num_negatives, len(candidates))
-        return random.sample(candidates, num_samples)
+        return candidates[:num_samples].tolist()
 
     def get_training_data(
         self,
         judgments_path: str,
-        queries_path: str,
         qrel_path: str,
         cutoff_year: int,
     ) -> tuple[Dataset, dict[str, str], dict[str, str], dict[str, set[str]]]:
         """Get training data with optional BM25-based hard negatives."""
         train_pairs, corpus, queries, relevant_docs = self.load_and_split_data(
-            judgments_path, queries_path, qrel_path, cutoff_year
+            judgments_path, qrel_path, cutoff_year
         )
 
         train_data = []
@@ -296,7 +273,7 @@ class DenseRetrieverTrainer:
     ) -> SentenceTransformer:
         """Train the dense retriever model."""
         train_dataset, corpus, queries, relevant_docs = self.get_training_data(
-            judgments_path, queries_path, qrel_path, cutoff_year
+            judgments_path, qrel_path, cutoff_year
         )
 
         model = SentenceTransformer(self.model_name)
@@ -312,7 +289,7 @@ class DenseRetrieverTrainer:
             print(f"\nTraining {self.model_name} with MultipleNegativesRankingLoss...")
         else:
             print(
-                f"\nTraining {self.model_name} with Hard Negatives (BM25 ranks {self.hard_negative_min_rank}-{self.hard_negative_max_rank})..."
+                f"\nTraining {self.model_name} with Hard Negatives (top {self.num_negatives} from BM25)..."
             )
         print(f"Total training examples: {len(train_dataset)}")
 
