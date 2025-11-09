@@ -204,7 +204,7 @@ class DenseRetrieverTrainer:
 
             print("Fitting BM25 on training data...")
             tokenized_corpus = bm25s.tokenize(candidate_texts)
-            retriever = bm25s.BM25(corpus=candidate_texts)
+            retriever = bm25s.BM25()
             retriever.index(tokenized_corpus)
 
             # Create mapping from document ID to index for efficient lookup
