@@ -5,7 +5,7 @@ from datetime import datetime as dt
 import numpy as np
 from tqdm import tqdm  # type: ignore
 from datasets import Dataset  # type: ignore
-from rank_bm25 import BM25Okapi  # type: ignore
+import bm25s  # type: ignore
 from sentence_transformers import (
     SentenceTransformer,
     SentenceTransformerTrainer,
@@ -161,10 +161,6 @@ class DenseRetrieverTrainer:
 
         return evaluator
 
-    def _tokenize(self, text: str) -> list[str]:
-        """Simple tokenization for BM25."""
-        return text.lower().split()
-
     def _select_hard_negatives(
         self, ranked_indices: np.ndarray, positive_idx: int
     ) -> list[int]:
@@ -195,7 +191,7 @@ class DenseRetrieverTrainer:
 
         if self.num_negatives == 0:
             # Simple pair format when no negatives are used
-            for query_id, query_text, doc_id, doc_text in tqdm(
+            for _, query_text, _, doc_text in tqdm(
                 train_pairs,
                 desc="Creating training dataset",
             ):
@@ -206,17 +202,18 @@ class DenseRetrieverTrainer:
             candidate_ids = list(corpus.keys())
 
             print("Fitting BM25 on training data...")
-            tokenized_corpus = [self._tokenize(text) for text in candidate_texts]
-            bm25 = BM25Okapi(tokenized_corpus)
+            tokenized_corpus = [bm25s.tokenize(text) for text in candidate_texts]
+            retriever = bm25s.BM25(corpus=candidate_texts)
+            retriever.index(tokenized_corpus)
 
-            for query_id, query_text, doc_id, doc_text in tqdm(
+            for _, query_text, doc_id, doc_text in tqdm(
                 train_pairs,
                 desc="Creating training dataset with hard negatives",
             ):
                 # Rank all candidates using BM25
-                tokenized_query = self._tokenize(query_text)
-                scores = bm25.get_scores(tokenized_query)
-                ranked_indices = np.argsort(-scores)
+                tokenized_query = bm25s.tokenize(query_text)
+                docs, _ = retriever.retrieve(tokenized_query, k=len(candidate_texts))
+                ranked_indices = np.array(docs[0])
 
                 # Find positive index in candidate list
                 positive_idx = None
