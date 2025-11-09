@@ -1,4 +1,5 @@
 import csv
+import json
 from collections import defaultdict
 from pathlib import Path
 from tqdm import tqdm  # type: ignore
@@ -237,72 +238,6 @@ def _map_word_indices_to_char_positions(
         return None
 
 
-def _map_normalized_to_original(
-    original_text: str, normalized_text: str, norm_start: int, norm_end: int
-) -> tuple[int, int] | None:
-    """
-    Map normalized text positions back to original text positions.
-
-    Returns (start_char, end_char) in original_text or None if mapping fails.
-    """
-    # Get the substring from normalized text
-    norm_substring = normalized_text[norm_start:norm_end]
-
-    # Find this substring in original text
-    # Since normalization only changes whitespace, we can find word sequences
-    norm_words = norm_substring.split()
-    if not norm_words:
-        return None
-
-    # Try to find the word sequence in original text
-    original_words = original_text.split()
-    normalized_all_words = normalized_text.split()
-
-    # Find word indices in normalized text
-    char_count = 0
-    norm_start_idx = 0
-    norm_end_idx = len(normalized_all_words)
-
-    for i, word in enumerate(normalized_all_words):
-        if char_count <= norm_start < char_count + len(word):
-            norm_start_idx = i
-        if char_count <= norm_end <= char_count + len(word):
-            norm_end_idx = i + 1
-            break
-        char_count += len(word) + 1
-
-    if norm_start_idx >= norm_end_idx:
-        return None
-
-    # Map to original words
-    if len(original_words) == len(normalized_all_words):
-        # Word counts match - direct mapping
-        char_pos = 0
-        start_char = 0
-        end_char = len(original_text)
-
-        for i, word in enumerate(original_words):
-            if i == norm_start_idx:
-                start_char = char_pos
-            if i == norm_end_idx - 1:
-                end_char = char_pos + len(word)
-                break
-            char_pos += len(word) + 1
-
-        return (start_char, end_char)
-    else:
-        # Word counts differ - try to find substring directly
-        # Try finding the phrase with different whitespace patterns
-        for sep in [" ", "  ", "\t"]:
-            target_phrase = sep.join(norm_words)
-            start_char = original_text.find(target_phrase)
-            if start_char != -1:
-                end_char = start_char + len(target_phrase)
-                return (start_char, end_char)
-
-        return None
-
-
 def mask_verbatim_in_text(
     text: str, passages: list[tuple[int, int]], mask_token: str = "<VERBATIM>"
 ) -> str:
@@ -344,62 +279,115 @@ def mask_verbatim_in_text(
 
 
 def mask_verbatim_passages(
-    input_path: str | Path,
+    queries_path: str | Path,
+    qrel_path: str | Path,
+    judgments_path: str | Path,
     output_path: str | Path,
     min_verbatim_length: int = 50,
-    min_word_count: int = 10,
     mask_token: str = "<VERBATIM>",
 ) -> None:
     """
-    Create a version of par-to-par-cleaned where verbatim passages from targets are masked in queries.
+    Create a version of queries_cleaned.tsv where verbatim passages from relevant documents (qrels) are masked.
 
     Args:
-        input_path: Path to input par-to-par-cleaned.csv file
-        output_path: Path to output CSV file with masked verbatim passages
+        queries_path: Path to input queries_cleaned.tsv file
+        qrel_path: Path to qrel.txt file
+        judgments_path: Path to judgments_cleaned.json file
+        output_path: Path to output TSV file with masked verbatim passages
         min_verbatim_length: Minimum length of verbatim passage to mask (in characters)
-        min_word_count: Minimum word count for queries to process
         mask_token: Token to replace verbatim passages with
     """
-    # First pass: group rows by TEXT_FROM to collect all targets for each query
-    print("Pass 1: Grouping rows by query paragraph...")
-    query_to_targets: dict[str, list[str]] = defaultdict(list)
-    all_rows: list[dict] = []
-    removed_count = 0
+    # Load judgments to get paragraph texts
+    print("Loading judgments...")
+    with open(judgments_path, "r", encoding="utf-8") as f:
+        judgments = json.load(f)
 
-    with open(input_path, "r", encoding="utf-8") as infile:
-        reader = csv.DictReader(infile)
-        fieldnames = reader.fieldnames
+    # Build paragraph index: (celex, paragraph_number) -> text
+    paragraph_texts: dict[tuple[str, int], str] = {}
+    for celex, judgment in tqdm(judgments.items(), desc="Indexing paragraphs"):
+        for par_num_str, text in judgment.get("paragraphs", {}).items():
+            try:
+                par_num = int(par_num_str)
+                paragraph_texts[(celex, par_num)] = text
+            except ValueError:
+                continue
 
-        if not fieldnames:
-            raise ValueError("CSV file appears to be empty or malformed")
+    print(f"Indexed {len(paragraph_texts)} paragraphs")
 
-        for row in tqdm(reader, desc="Grouping queries"):
-            text_from = row.get("TEXT_FROM", "").strip()
-            text_to = row.get("TEXT_TO", "").strip()
+    # Load queries
+    print("\nLoading queries...")
+    queries: list[tuple[str, int, str]] = []  # (celex, paragraph_number, query_text)
+    query_key_to_text: dict[tuple[str, int], str] = {}
 
-            # Skip queries with less than min_word_count words
-            if text_from:
-                word_count = len(text_from.split())
-                if word_count < min_word_count:
-                    removed_count += 1
-                    continue
+    with open(queries_path, "r", encoding="utf-8") as infile:
+        reader = csv.reader(infile, delimiter="\t")
+        next(reader)  # Skip header
 
-            if text_from and text_to:
-                query_to_targets[text_from].append(text_to)
+        for row in tqdm(reader, desc="Loading queries"):
+            if len(row) < 3:
+                continue
+            celex = row[0].strip()
+            par_num_str = row[1].strip()
+            query_text = row[2].strip()
 
-            all_rows.append(row)
+            try:
+                par_num = int(par_num_str)
+            except ValueError:
+                continue
 
-    print(f"Found {len(query_to_targets)} unique query paragraphs")
-    print(f"Total rows: {len(all_rows)}")
-    print(f"Removed {removed_count} rows with queries below {min_word_count} words")
+            query_key = (celex, par_num)
+            queries.append((celex, par_num, query_text))
+            query_key_to_text[query_key] = query_text
 
-    # Second pass: mask verbatim passages for each unique query
-    print("\nPass 2: Finding and masking verbatim passages...")
-    masked_queries: dict[str, str] = {}
+    print(f"Loaded {len(queries)} queries")
 
-    for query_text, target_texts in tqdm(
-        query_to_targets.items(), desc="Masking verbatim passages"
+    # Load qrel to map queries to relevant documents
+    print("\nLoading qrel...")
+    query_to_targets: dict[tuple[str, int], list[str]] = defaultdict(list)
+
+    with open(qrel_path, "r", encoding="utf-8") as f:
+        for line in tqdm(f, desc="Loading qrel"):
+            parts = line.strip().split()
+            if len(parts) < 4:
+                continue
+
+            query_id = parts[0]
+            doc_id = parts[2]
+
+            # Parse celex_paragraph_number format
+            try:
+                celex_q, par_num_q_str = query_id.rsplit("_", 1)
+                celex_d, par_num_d_str = doc_id.rsplit("_", 1)
+                par_num_q = int(par_num_q_str)
+                par_num_d = int(par_num_d_str)
+            except (ValueError, IndexError):
+                continue
+
+            query_key = (celex_q, par_num_q)
+            doc_key = (celex_d, par_num_d)
+
+            # Get target text from paragraph index
+            if doc_key in paragraph_texts:
+                target_text = paragraph_texts[doc_key]
+                query_to_targets[query_key].append(target_text)
+
+    print(f"Loaded qrel mappings for {len(query_to_targets)} queries")
+
+    # Mask verbatim passages for each query
+    print("\nFinding and masking verbatim passages...")
+    masked_queries: dict[tuple[str, int], str] = {}
+    modified_count = 0
+
+    for query_key, query_text in tqdm(
+        query_key_to_text.items(), desc="Masking verbatim passages"
     ):
+        target_texts = query_to_targets.get(query_key, [])
+
+        if not target_texts:
+            # No relevant documents, keep original
+            masked_queries[query_key] = query_text
+            continue
+
         # Remove duplicates from target_texts
         unique_targets = list(dict.fromkeys(target_texts))
 
@@ -411,51 +399,48 @@ def mask_verbatim_passages(
         if passages:
             # Mask the passages
             masked_query = mask_verbatim_in_text(query_text, passages, mask_token)
-            masked_queries[query_text] = masked_query
+            masked_queries[query_key] = masked_query
+            modified_count += 1
         else:
             # No verbatim passages found, keep original
-            masked_queries[query_text] = query_text
+            masked_queries[query_key] = query_text
 
-    # Count how many queries were modified
-    modified_count = sum(1 for k, v in masked_queries.items() if k != v)
-    print(f"\nModified {modified_count} out of {len(masked_queries)} unique queries")
+    print(f"\nModified {modified_count} out of {len(masked_queries)} queries")
 
-    # Third pass: update rows with masked queries
-    print("\nPass 3: Updating rows with masked queries...")
-    output_rows = []
-
-    for row in tqdm(all_rows, desc="Updating rows"):
-        output_row = row.copy()
-        text_from = row.get("TEXT_FROM", "").strip()
-
-        if text_from and text_from in masked_queries:
-            output_row["TEXT_FROM"] = masked_queries[text_from]
-
-        output_rows.append(output_row)
-
-    # Save output CSV
-    print(f"\nSaving masked par-to-par data to {output_path}...")
+    # Write output TSV
+    print(f"\nSaving masked queries to {output_path}...")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8", newline="") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(output_rows)
+        writer = csv.writer(outfile, delimiter="\t")
+        writer.writerow(["celex", "paragraph_number", "query"])
+
+        for celex, par_num, _ in queries:
+            query_key = (celex, par_num)
+            masked_query = masked_queries.get(
+                query_key, query_key_to_text.get(query_key, "")
+            )
+            writer.writerow([celex, par_num, masked_query])
 
     print(f"\nComplete!")
-    print(f"Processed {len(output_rows)} rows")
-    print(f"Masked verbatim passages in {modified_count} unique queries")
+    print(f"Processed {len(queries)} queries")
+    print(f"Masked verbatim passages in {modified_count} queries")
 
 
 if __name__ == "__main__":
     # Define paths
     base_dir = Path(__file__).parent.parent
-    input_path = base_dir / "data" / "par-to-par-cleaned.csv"
-    output_path = base_dir / "data" / "par-to-par-cleaned-masked.csv"
+    queries_path = base_dir / "data" / "evaluation" / "queries_cleaned.tsv"
+    qrel_path = base_dir / "data" / "evaluation" / "qrel.txt"
+    judgments_path = base_dir / "data" / "judgments_cleaned.json"
+    output_path = base_dir / "data" / "evaluation" / "queries_cleaned_masked.tsv"
 
     # Run masking
     mask_verbatim_passages(
-        input_path=input_path,
+        queries_path=queries_path,
+        qrel_path=qrel_path,
+        judgments_path=judgments_path,
         output_path=output_path,
         min_verbatim_length=50,
-        min_word_count=10,
         mask_token="<VERBATIM>",
     )

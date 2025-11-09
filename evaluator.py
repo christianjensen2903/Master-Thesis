@@ -552,7 +552,7 @@ class Evaluator:
 
 
 if __name__ == "__main__":
-    from retrievers import DenseRetriever, GNNRetriever, TfidfRetriever
+    from retrievers import DenseRetriever, GNNRetriever, TfidfRetriever, BOWRetriever
     from example_gnn_usage import CitationGNN
     import torch
     from sentence_transformers import SentenceTransformer
@@ -562,6 +562,11 @@ if __name__ == "__main__":
         strip_accents="ascii",
         norm="l2",
     )
+
+    # retriever = BOWRetriever(
+    #     lowercase=True,
+    #     stop_words="english",
+    # )
 
     # retriever = DenseRetriever(
     #     model_name="checkpoints/simcse_citation_model",
@@ -588,14 +593,13 @@ if __name__ == "__main__":
 
     evaluator = Evaluator(
         retriever=retriever,
-        mode="all_paragraphs",
+        # mode="all_paragraphs",
         judgments_path="data/judgments_cleaned.json",
-        queries_path="data/evaluation/queries_cleaned.tsv",
+        queries_path="data/evaluation/queries_cleaned_masked.tsv",
         qrel_path="data/evaluation/qrel.txt",
         train_cutoff_year=2018,
         top_k=10000,
         # save_embeddings_path="artifacts/simcse_embeddings.npy",
     )
 
-    score = evaluator.run()
-    print(f"Final MAP: {score:.3f}")
+    evaluator.run()
