@@ -4,6 +4,7 @@ from .dense_retriever import DenseRetriever
 from .gnn_retriever import GNNRetriever
 from .bow_retriever import BOWRetriever
 from .bge_m3_retriever import BGEM3Retriever
+from .ltr_retriever import LTRRetriever
 
 __all__ = [
     "BaseRetriever",
@@ -12,4 +13,5 @@ __all__ = [
     "GNNRetriever",
     "BOWRetriever",
     "BGEM3Retriever",
+    "LTRRetriever",
 ]
