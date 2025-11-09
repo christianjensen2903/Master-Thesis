@@ -1,7 +1,7 @@
 import pandas as pd  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from gnn_trainers import GNNTrainer
-from torch_geometric.nn import SAGEConv, GCNConv
+from torch_geometric.nn import SAGEConv
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
@@ -18,7 +18,7 @@ class CitationGNN(nn.Module):
         self.norms = nn.ModuleList()
 
         for _ in range(num_layers):
-            self.convs.append(GCNConv(input_dim, input_dim))
+            self.convs.append(SAGEConv(input_dim, input_dim))
             self.norms.append(nn.LayerNorm(input_dim))
 
         # Learnable residual weight

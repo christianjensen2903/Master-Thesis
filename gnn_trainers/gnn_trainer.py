@@ -9,6 +9,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.data import Data  # type: ignore
 from torch_geometric.loader import NeighborLoader  # type: ignore
+from torch_geometric.utils import to_undirected  # type: ignore
 from tqdm import tqdm  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from validation_utils import split_data_by_date
@@ -183,6 +184,8 @@ class GNNTrainer:
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+            # Make edges bidirectional
+            edge_index = to_undirected(edge_index, num_nodes=len(texts))
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
 
@@ -203,8 +206,16 @@ class GNNTrainer:
             edge_index = batch.edge_index
             batch_size = batch.batch_size
 
-            # Get embeddings for nodes in this batch
-            embeddings = model(x, edge_index)
+            # Mask edges to prevent leakage: remove edges from anchors to neighbor nodes
+            # Keep edges where: (1) destination is anchor (can receive from neighbors), OR
+            #                   (2) source is neighbor (neighbors can talk to each other)
+            # This removes edges: anchor -> neighbor (which would leak anchor info to positives)
+            src, dst = edge_index
+            edge_mask = (dst < batch_size) | (src >= batch_size)
+            masked_edge_index = edge_index[:, edge_mask]
+
+            # Get embeddings for nodes in this batch with masked edges
+            embeddings = model(x, masked_edge_index)
 
             anchor_emb = model.encode_query(x[:batch_size])
 
