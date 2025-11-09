@@ -18,7 +18,6 @@ from data_loader import (
     build_citation_graph,
 )
 from retrievers.base_retriever import BaseRetriever
-from retrievers.ltr_retriever import LTRRetriever
 
 # Type alias for evaluator modes
 EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
@@ -457,19 +456,6 @@ class Evaluator:
         print(f"Train paragraphs: {np.sum(self.paragraph_set == 'train')}")
         print(f"Test paragraphs: {np.sum(self.paragraph_set == 'test')}")
 
-        # Set metadata arrays in LTR retriever if applicable
-
-        if isinstance(self.retriever, LTRRetriever):
-            assert self.paragraph_celex is not None
-            assert self.paragraph_number is not None
-            assert self.paragraph_dates is not None
-            print("Setting metadata arrays in LTR retriever...")
-            self.retriever.set_metadata_arrays(
-                paragraph_celex=self.paragraph_celex,
-                paragraph_number=self.paragraph_number,
-                paragraph_dates=self.paragraph_dates,
-            )
-
         # Try to load embeddings if not provided
         if self.embeddings is None and self.save_embeddings_path:
             print("\nAttempting to load embeddings from disk...")
@@ -490,12 +476,7 @@ class Evaluator:
             print("\nGenerating embeddings from retriever...")
             train_mask = self.paragraph_set == "train"
             # Fit on training data, transform on all data
-            # Pass citation graph to GNN retrievers for structure-aware embeddings
-            fit_kwargs = {"mask": train_mask}
-            if hasattr(self.retriever, "build_graph"):  # GNN retriever
-                fit_kwargs["citation_graph"] = self.cited_by_pid
-                fit_kwargs["paragraph_dates"] = self.paragraph_dates
-            self.retriever.fit(self.pid_to_text, **fit_kwargs)
+            self.retriever.fit(self.pid_to_text, mask=train_mask)
             self.embeddings = self.retriever.transform(self.pid_to_text)
             print(f"Embeddings shape: {self.embeddings.shape}")
         else:
@@ -527,39 +508,33 @@ class Evaluator:
 
 
 if __name__ == "__main__":
-    from retrievers import DenseRetriever, GNNRetriever, TfidfRetriever
+    from retrievers import DenseRetriever, GNNRetriever
     from example_gnn_usage import CitationGNN
     import torch
     from sentence_transformers import SentenceTransformer
 
-    retriever = DenseRetriever(
-        model_name="checkpoints/simcse_citation_model",
-        max_seq_length=256,
+    # retriever = DenseRetriever(
+    #     model_name="checkpoints/simcse_citation_model",
+    #     max_seq_length=256,
+    # )
+
+    encoding_model = "checkpoints/simcse_citation_model"
+    text_encoder = SentenceTransformer(encoding_model)
+
+    in_channels = text_encoder.get_sentence_embedding_dimension()
+
+    model = CitationGNN(
+        in_channels, hidden_dim=512, output_dim=in_channels, num_layers=3
     )
 
-    # encoding_model = "checkpoints/simcse_citation_model"
-    # text_encoder = SentenceTransformer(encoding_model)
+    model.load_state_dict(torch.load("checkpoints/gnn/best_model.pt"))
 
-    # in_channels = text_encoder.get_sentence_embedding_dimension()
-
-    # model = CitationGNN(
-    #     in_channels, hidden_dim=512, output_dim=in_channels, num_layers=3
-    # )
-
-    # model.load_state_dict(torch.load("checkpoints/gnn/best_model.pt"))
-
-    # retriever = GNNRetriever(
-    #     gnn_model=model,
-    #     # model_path="checkpoints/gnn/best_model.pt",
-    #     text_encoder_name=encoding_model,
-    #     batch_size=32,
-    # )
-
-    # retriever = TfidfRetriever(
-    #     stop_words="english",
-    #     strip_accents="ascii",
-    #     norm="l2",
-    # )
+    retriever = GNNRetriever(
+        gnn_model=model,
+        # model_path="checkpoints/gnn/best_model.pt",
+        text_encoder_name=encoding_model,
+        batch_size=32,
+    )
 
     evaluator = Evaluator(
         retriever=retriever,
