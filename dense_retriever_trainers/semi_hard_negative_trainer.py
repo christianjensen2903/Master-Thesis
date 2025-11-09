@@ -152,20 +152,26 @@ class SemiHardNegativeDenseRetrieverTrainer(BaseDenseRetrieverTrainer):
                 distances, positive_idx, positive_distance
             )
 
-            # Add positive pair
-            train_data.append({"sentence1": query_text, "sentence2": doc_text})
-
-            # Add semi-hard negative pairs (ensure positive is not included)
-            for neg_idx in semi_hard_indices:
-                if neg_idx == positive_idx:
-                    continue
-                neg_text = candidate_texts[neg_idx]
+            if len(semi_hard_indices) == 0:
+                # Fallback: use positive pair only if no negatives found
                 train_data.append(
                     {
                         "sentence1": query_text,
-                        "sentence2": neg_text,
+                        "sentence2": doc_text,
                     }
                 )
+                continue
+
+            # Use first semi-hard negative for triplet format (anchor, positive, negative)
+            neg_idx = semi_hard_indices[0]
+            neg_text = candidate_texts[neg_idx]
+            train_data.append(
+                {
+                    "sentence1": query_text,
+                    "sentence2": doc_text,
+                    "sentence3": neg_text,
+                }
+            )
 
         train_dataset = Dataset.from_list(train_data)
         return train_dataset, corpus, queries, relevant_docs
