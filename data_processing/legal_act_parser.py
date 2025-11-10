@@ -2,14 +2,11 @@ from collections import OrderedDict
 from bs4 import BeautifulSoup, Tag
 import re
 import json
-from urllib.parse import urljoin
 from pathlib import Path
-from typing import Any
 from tqdm import tqdm  # type: ignore
 
 
 class LegalActParser:
-    BASE_URL = "https://eur-lex.europa.eu/"
 
     def parse(self, html_path: Path) -> dict:
         """Parse legal act and return structured data"""
@@ -17,31 +14,14 @@ class LegalActParser:
             content = file.read()
         self.soup = BeautifulSoup(content, "lxml")
 
-        modifies_documents = self._extract_related_documents("relatedDocsTbMS")
-        modified_by_documents = self._extract_related_documents("relatedDocsTb")
-
         preamble = self._parse_preamble()
         articles = self._parse_articles()
-        article_notes = [note for article in articles for note in article["notes"]]
-        article_references = [
-            ref for article in articles for ref in article["references"]
-        ]
 
         return {
             "title": self._parse_title(),
             "preamble": preamble,
             "articles": articles,
             "final_part": self._parse_final_part(),
-            "notes": preamble["notes"] + article_notes,
-            "references": list(
-                dict.fromkeys(preamble["references"] + article_references)
-            ),
-            "annexes": self._parse_annexes(),
-            "summary": self._get_summary(),
-            "related_documents": {
-                "modifies": modifies_documents,
-                "modified_by": modified_by_documents,
-            },
         }
 
     def _parse_title(self) -> str:
@@ -122,133 +102,6 @@ class LegalActParser:
 
         return articles
 
-    def _parse_annexes(self) -> list[dict]:
-        annexes = []
-        divs_with_anx_id = self.soup.find_all(
-            "div", class_="eli-container", id=lambda x: x and x.startswith("anx")
-        )
-
-        for div in divs_with_anx_id:
-            annex_id = ""
-            annex_title = ""
-            annex_text = ""
-            annex_table = ""
-
-            for c in div.children:
-                if not isinstance(c, Tag):
-                    continue
-
-                if c.name == "p" and "doc-ti" in str(c.get("class")):
-                    annex_id = c.text.strip()
-                elif (
-                    c.name == "p"
-                    and "ti-grseq-1" in str(c.get("class"))
-                    and not annex_title
-                ):
-                    annex_title = c.text.strip()
-                elif c.name == "table" and "table" in str(c.get("class")):
-                    annex_table = self._html_table_to_markdown(str(c))
-                else:
-                    annex_text += self._clean_text(c.text)
-
-            annex_text = annex_text.lstrip("\n").rstrip("\n").replace("\n\n\n", "\n")
-
-            annexes.append(
-                {
-                    "id": annex_id,
-                    "title": annex_title,
-                    "text": annex_text,
-                    "table": annex_table,
-                    "references": self._extract_directives_and_regulations(annex_text),
-                }
-            )
-
-        return annexes
-
-    def _get_summary(self) -> dict:
-        """Extract summary information supporting multiple languages"""
-        title_h1 = self.soup.find("h1", class_="ti-main")
-        title_text = title_h1.text if title_h1 else ""
-
-        lastmod_div = self.soup.find("p", class_="lastmod")
-        last_modified = lastmod_div.text.strip() if lastmod_div else ""
-
-        chapter_contents = {}
-        chapters = self.soup.find_all("h2", class_="ti-chapter")
-
-        for chapter in chapters:
-            chapter_title = chapter.text.strip()
-            content = []
-
-            for sibling in chapter.find_next_siblings():
-                sibling_classes = sibling.get("class")
-                if sibling_classes and isinstance(sibling_classes, list):
-                    if sibling.name == "h2" and (
-                        "ti-chapter" in sibling_classes or "lastmod" in sibling_classes
-                    ):
-                        break
-                elif sibling.name == "h2":
-                    break
-
-                if sibling.name == "ul":
-                    list_items = sibling.find_all("li")
-                    for item in list_items:
-                        text = "- " + item.get_text().strip().replace("\xa0", "")
-                        content.append(text)
-                else:
-                    content.append(sibling.get_text().replace("\xa0", ""))
-
-            chapter_contents[chapter_title] = "\n".join(content)
-
-        return {
-            "title": title_text,
-            "chapters": chapter_contents,
-            "last_modified": last_modified,
-        }
-
-    def _extract_related_documents(self, table_id: str) -> list[dict]:
-        table = self.soup.find("table", id=table_id)
-        if not table:
-            return []
-
-        thead = table.find("thead")
-        if not thead:
-            return []
-
-        headers = [header.get_text(strip=True) for header in thead.find_all("th")]
-
-        tbody = table.find("tbody")
-        if not tbody:
-            return []
-
-        data_list = []
-        for row in tbody.find_all("tr"):
-            columns = row.find_all("td")
-            data_dict: dict[str, Any] = {}
-
-            for i, key in enumerate(headers):
-                if i >= len(columns):
-                    continue
-
-                if key == "Act":
-                    a_tag = columns[i].find("a")
-                    if a_tag:
-                        href = a_tag.get("href")
-                        relative_url = href if isinstance(href, str) else ""
-                        absolute_url = urljoin(self.BASE_URL, relative_url)
-                        data_dict[key] = {
-                            "celex": a_tag.get_text(strip=True),
-                            "url": absolute_url,
-                        }
-                    else:
-                        data_dict[key] = {}
-                else:
-                    data_dict[key] = columns[i].get_text(strip=True)
-
-            data_list.append(data_dict)
-
-        return data_list
-
     def _extract_notes(self, div: Tag | None) -> list[dict]:
         if not div:
             return []
@@ -277,21 +130,6 @@ class LegalActParser:
             cleaned_note_text = self._extract_note_text(note_text)
             note_dic["text"] = cleaned_note_text
 
-            url = ""
-            if foot_note and parent_p:
-                a_tags = parent_p.find_all("a")
-                if len(a_tags) >= 2:
-                    second_a_tag = a_tags[1]
-                    href = second_a_tag.get("href", "")
-                    if href and isinstance(href, str):
-                        index = href.find("legal-content")
-                        url = (
-                            "https://eur-lex.europa.eu/" + href[index:]
-                            if index != -1
-                            else ""
-                        )
-
-            note_dic["url"] = url
             note_dic["reference"] = self._extract_directive_at_beginning(
                 cleaned_note_text
             )
