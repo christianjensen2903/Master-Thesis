@@ -427,6 +427,75 @@ def mask_verbatim_passages(
     print(f"Masked verbatim passages in {modified_count} queries")
 
 
+def mask_verbatim_passages_par_to_par(
+    input_path: str | Path,
+    output_path: str | Path,
+    min_verbatim_length: int = 50,
+    mask_token: str = "<VERBATIM>",
+) -> None:
+    """
+    Create a version of par-to-par-cleaned.csv where verbatim passages from TEXT_TO are masked in TEXT_FROM.
+
+    Args:
+        input_path: Path to input par-to-par-cleaned.csv file
+        output_path: Path to output CSV file with masked verbatim passages
+        min_verbatim_length: Minimum length of verbatim passage to mask (in characters)
+        mask_token: Token to replace verbatim passages with
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    # Load par-to-par data
+    print(f"Loading data from {input_path}...")
+    rows: list[dict[str, str]] = []
+    fieldnames: list[str] = []
+
+    with open(input_path, "r", encoding="utf-8") as infile:
+        reader = csv.DictReader(infile)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(tqdm(reader, desc="Loading rows"))
+
+    print(f"Loaded {len(rows)} rows")
+
+    if "TEXT_FROM" not in fieldnames or "TEXT_TO" not in fieldnames:
+        raise ValueError("CSV must contain TEXT_FROM and TEXT_TO columns")
+
+    # Mask verbatim passages for each row
+    print("\nFinding and masking verbatim passages...")
+    modified_count = 0
+
+    for row in tqdm(rows, desc="Masking verbatim passages"):
+        text_from = row.get("TEXT_FROM", "").strip()
+        text_to = row.get("TEXT_TO", "").strip()
+
+        if not text_from or not text_to:
+            # Skip rows with empty text
+            continue
+
+        # Find verbatim passages in TEXT_FROM that match TEXT_TO
+        passages = find_verbatim_passages(text_from, [text_to], min_verbatim_length)
+
+        if passages:
+            # Mask the passages
+            masked_text = mask_verbatim_in_text(text_from, passages, mask_token)
+            row["TEXT_FROM"] = masked_text
+            modified_count += 1
+
+    print(f"\nModified {modified_count} out of {len(rows)} rows")
+
+    # Write output CSV
+    print(f"\nSaving masked data to {output_path}...")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8", newline="") as outfile:
+        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nComplete!")
+    print(f"Processed {len(rows)} rows")
+    print(f"Masked verbatim passages in {modified_count} rows")
+
+
 if __name__ == "__main__":
     # Define paths
     base_dir = Path(__file__).parent.parent
@@ -436,11 +505,17 @@ if __name__ == "__main__":
     output_path = base_dir / "data" / "evaluation" / "queries_cleaned_masked.tsv"
 
     # Run masking
-    mask_verbatim_passages(
-        queries_path=queries_path,
-        qrel_path=qrel_path,
-        judgments_path=judgments_path,
-        output_path=output_path,
+    # mask_verbatim_passages(
+    #     queries_path=queries_path,
+    #     qrel_path=qrel_path,
+    #     judgments_path=judgments_path,
+    #     output_path=output_path,
+    #     min_verbatim_length=50,
+    #     mask_token="<VERBATIM>",
+    # )
+    mask_verbatim_passages_par_to_par(
+        input_path=base_dir / "data" / "par-to-par-cleaned.csv",
+        output_path=base_dir / "data" / "par-to-par-cleaned-masked.csv",
         min_verbatim_length=50,
         mask_token="<VERBATIM>",
     )
