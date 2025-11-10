@@ -531,6 +531,29 @@ class NoMetadataError(Exception):
     pass
 
 
+def is_allowed_document_type(celex: str) -> bool:
+
+    # Define allowed combinations: (section, letters)
+    allowed_combinations = {
+        ("6", "CJ"),  # Court of Justice - Judgment
+        ("3", "L"),  # Directives
+        ("3", "R"),  # Regulations
+    }
+
+    # Pattern to extract section and letters
+    # Sector 6: 6YYYY[Court][Type]####
+    # Sector 3: 3YYYY[Type]####
+    pattern = re.compile(r"^(\d)\d{4}([A-Z]{1,2})\d{4}$")
+    match = pattern.match(celex)
+
+    if match:
+        section = match.group(1)
+        letters = match.group(2)
+        return (section, letters) in allowed_combinations
+
+    return False
+
+
 class EcjHtmlParser(object):
     """
     Parses HTML files and extracts the citations to other cases and to relevant paragraphs if those citations exist
@@ -865,6 +888,18 @@ class EcjHtmlParser(object):
 
                         target_celex = caseid_to_celex(link_entry.get_text(strip=True))
                         logger.info(f"Extracted target CELEX: {target_celex}")
+
+                        # Filter: Only include allowed document types
+                        # HTML parser only extracts case citations, but we verify it's a CJ judgment
+                        if not is_allowed_document_type(target_celex):
+                            logger.debug(
+                                "Skipping citation to non-allowed document type %s from HTML parser"
+                                % target_celex
+                            )
+                            continue
+
+                        # For CJ judgments from HTML, we assume paragraphs (HTML parser extracts paragraph citations)
+                        # Pages would be detected differently, but HTML parser focuses on paragraph links
                         citations.append(
                             {
                                 "target": target_celex,
@@ -1103,13 +1138,14 @@ class EcjXmlParser(object):
 
         return citation_roots
 
-    def read_citations_and_citing_paragraphs(self, treaties=False):
+    def read_citations_and_citing_paragraphs(self, include_all=True):
         """
         Reads the citations from the XML and returns a list of dictionaries for each citation,
         where each dictionary contains the target celex, a list of paragraphs citing the target and
         if exists, the target paragraphs that is referenced
-        :param treaties: bool, default False
-            If True, the method will process the citations to treaties
+        :param include_all: bool, default True
+            If True, the method will process citations to all document types (treaties, regulations,
+            directives, legal acts, and case law). If False, only case law citations are included.
         :return:
         list of citation dictionaries
         """
@@ -1132,10 +1168,11 @@ class EcjXmlParser(object):
         for root in roots:
             celex = root.xpath(EcjXmlParser.XPATH_CELEX_FROM_CITATION_ROOT)[0]
 
-            # Skip citations to treaties if the flag is not set
-            if not treaties and celex.startswith("3"):
-                logger.info("Skipping citation to treaty %s" % celex)
+            # Filter to only include allowed document types: CJ judgments, Directives, Regulations, Delegated Regulations
+            if not is_allowed_document_type(celex):
+                logger.info("Skipping citation to non-allowed document type %s" % celex)
                 continue
+
             citation_pairs = root.xpath("./ANNOTATION")
             if len(citation_pairs) != 0:
                 citations_list = self._citation_and_citing_paragraphs(
@@ -1146,6 +1183,68 @@ class EcjXmlParser(object):
                 logger.debug("Will proceed with processing the HTML file")
 
         return citations_list
+
+    def _detect_unit(self, citation_string: str) -> str:
+        """
+        Detects the unit type from a citation string. Handles both prefix formats (A107, N107)
+        and nested formats (107P1, 03P5L2) where numbers are followed by unit letters.
+        Common prefixes: A=articles, N=paragraphs, P=pages, R=recitals, C=chapters, T=titles, L=lines
+
+        :param citation_string: The citation string to analyze
+        :return: The detected unit type (articles, paragraphs, pages, recitals, chapters, titles, lines, or unknown)
+        """
+        if not citation_string:
+            return "unknown"
+
+        citation_string = citation_string.strip().upper()
+
+        # Check for explicit unit prefixes at the start (A107, N107, P5, etc.)
+        if citation_string.startswith("A"):
+            return "articles"
+        elif citation_string.startswith("N"):
+            return "paragraphs"
+        elif citation_string.startswith("P"):
+            return "pages"
+        elif citation_string.startswith("R"):
+            return "recitals"
+        elif citation_string.startswith("C"):
+            return "chapters"
+        elif citation_string.startswith("T"):
+            return "titles"
+        elif citation_string.startswith("L"):
+            return "lines"
+
+        # Handle nested formats like "107P1" (Article 107, Paragraph 1) or "03P5L2" (Article 03, Paragraph 5, Line 2)
+        # Pattern: number followed by unit letter(s)
+        # For "107P1", the first unit is implied to be Article (A) if it starts with digits
+        # For "03P5L2", same logic applies
+
+        # Check if it starts with digits (nested format without explicit prefix)
+        if re.match(r"^\d+", citation_string):
+            # Look for the first unit letter after a number
+            # Pattern: digits followed by unit letter (P, N, L, R, C, T)
+            match = re.search(r"\d+([PNLRCT])", citation_string)
+            if match:
+                unit_letter = match.group(1)
+                unit_map = {
+                    "P": "paragraphs",  # In nested format, P after number usually means paragraph
+                    "N": "paragraphs",
+                    "L": "lines",
+                    "R": "recitals",
+                    "C": "chapters",
+                    "T": "titles",
+                }
+                # However, if the string starts with digits and has P, it might be Article X Paragraph Y
+                # Check if there's a pattern like "107P1" - this is likely Article 107, Paragraph 1
+                if re.match(r"^\d+P\d+", citation_string):
+                    # This is likely Article X, Paragraph Y format
+                    return "articles"
+                return unit_map.get(unit_letter, "paragraphs")
+            # If no unit letter found but starts with digits, likely an article number
+            return "articles"
+
+        # Default to paragraphs for backward compatibility
+        return "paragraphs"
 
     def _citation_and_citing_paragraphs(self, citations_list, celex, citation_pairs):
         """
@@ -1165,20 +1264,14 @@ class EcjXmlParser(object):
                 if len(citing) > 0:
                     cited_par = cited[0]
                     citations_dict = {}
-                    if cited_par.startswith("N"):
-                        cited_unit = "paragraphs"
-                    else:
-                        cited_unit = "pages"
+                    cited_unit = self._detect_unit(cited_par)
                     citation_string = citing[0]
+
                     citations_dict["from"] = self._citing_paragraphs(citation_string)
                     citations_dict["to"] = self._citing_paragraphs(cited_par)
                     citations_dict["target"] = celex
                     citations_dict["cited_unit"] = cited_unit
-
-                    if citation_string.strip().startswith("P"):
-                        citations_dict.setdefault("unit", "pages")
-                    else:
-                        citations_dict.setdefault("unit", "paragraphs")
+                    citations_dict["unit"] = self._detect_unit(citation_string)
                     citations_list.append(citations_dict)
                 else:
                     logger.warning(
@@ -1188,13 +1281,12 @@ class EcjXmlParser(object):
             elif len(citing) > 0:
                 citations_dict = {}
                 citation_string = citing[0]
+                detected_unit = self._detect_unit(citation_string)
+
                 output_pars = self._citing_paragraphs(citation_string)
                 citations_dict.setdefault("from", output_pars)
                 citations_dict.setdefault("target", celex)
-                if citation_string.strip().startswith("P"):
-                    citations_dict.setdefault("unit", "pages")
-                else:
-                    citations_dict.setdefault("unit", "paragraphs")
+                citations_dict["unit"] = detected_unit
                 citations_list.append(citations_dict)
         return citations_list
 
@@ -1211,29 +1303,85 @@ class EcjXmlParser(object):
 
     def _preconditionListText(self, text):
         """
-        Preconditions the list of paragraphs/pages sentence by removing the beginning and splitting the sentence
+        Preconditions the list of citation units (paragraphs/pages/articles/etc.) by removing
+        the unit prefix and splitting the sentence. Supports articles (A), paragraphs (N),
+        pages (P), recitals (R), chapters (C), titles (T), and lines (L).
+        Also handles nested formats like "107P1" (Article 107, Paragraph 1) and "03P5L2" (Article 03, Paragraph 5, Line 2).
+        For nested formats, extracts only the base number (e.g., "08" from "08P2").
         """
         # convert 3 - 5 to 3-5 so that it will be unaffected when we split by space
         pageListText = re.sub(r"(\s+)?-(\s+)?", "-", text)
-        # remove starting characters from the list of paragraph numbers
-        pageListText = re.sub(r"^[PNC,]T?\s?", "", pageListText)
+
+        # Check if this is a nested format (starts with digits, e.g., "107P1", "03P5L2", "08P2")
+        # For nested formats, extract only the base number (remove subunit parts like P2, L2, etc.)
+        if re.match(r"^\d+[PNLRCT]", pageListText):
+            # Extract only the first number part (e.g., "8" from "08P2")
+            match = re.match(r"^(\d+)", pageListText)
+            if match:
+                base_number = str(
+                    int(match.group(1))
+                )  # Convert "08" to "8", remove leading zeros
+                pageListText = re.sub(r"^\d+[PNLRCT].*", base_number, pageListText)
+            pageListText = re.sub(r"[J:]", "", pageListText)
+            return pageListText.split()
+
+        # For prefix formats (A107, N107, P5, etc.), remove the starting unit prefix
+        # The pattern matches one or more unit prefixes (A, P, N, R, C, T, L) optionally followed by whitespace
+        pageListText = re.sub(r"^[APNRC,]+T?\s*", "", pageListText)
+        # Also handle L (lines) prefix
+        pageListText = re.sub(r"^L\s*", "", pageListText)
         # WTF some par numbers had a J or :
         pageListText = re.sub(r"[J:]", "", pageListText)
         return pageListText.split()
 
     def _processRange(self, listEntry):
         """
-        Processes a single list entry and returns a range if the entry is separated by hyphen
+        Processes a single list entry and returns a range if the entry is separated by hyphen.
+        Handles ranges for articles, paragraphs, pages, recitals, chapters, titles, and lines.
+        Also handles nested formats like "107P1-107P3" (Article 107, Paragraphs 1-3).
+        For nested formats, extracts only the base number (e.g., "08" from "08P2").
         :param listEntry:
-        :return: a list of string containing the source paragraphs
+        :return: a list of string containing the source unit numbers
         """
+        # Check if this is a nested format (contains unit letters like P, L, etc.)
+        if re.search(r"[PNLRCT]\d+", listEntry):
+            # Extract only the base number from nested formats
+            # For "08P2", extract "8"; for "107P1-107P3", extract "107" from both sides
+            if "-" in listEntry:
+                # Handle ranges like "08P2-08P5" or "107P1-107P3"
+                parts = listEntry.split("-")
+                base_numbers = []
+                for part in parts:
+                    match = re.match(r"^(\d+)", part)
+                    if match:
+                        # Remove leading zeros: "08" -> "8"
+                        base_numbers.append(str(int(match.group(1))))
+                if len(base_numbers) == 2:
+                    # If we have a range, try to expand it
+                    try:
+                        fromNum = int(base_numbers[0])
+                        toNum = int(base_numbers[1])
+                        r = list(range(fromNum, toNum + 1))
+                        return [str(num) for num in r]
+                    except ValueError:
+                        return base_numbers
+                return base_numbers
+            else:
+                # Single nested format like "08P2" - extract just "8"
+                match = re.match(r"^(\d+)", listEntry)
+                if match:
+                    # Remove leading zeros: "08" -> "8"
+                    return [str(int(match.group(1)))]
+                return [listEntry]
+
         # split to find the ends of the range
-        listEntry = listEntry.split("-")
-        if self._celex.startswith(("3", "6")) and len(listEntry) > 1:
+        listEntry_split = listEntry.split("-")
+        if self._celex.startswith(("3", "6")) and len(listEntry_split) > 1:
             try:
-                # Remove the APN and space from the beginning and end of the string
-                fromNum = int(listEntry[0].strip("APN "))
-                toNum = int(listEntry[1])
+                # Remove unit prefixes (A=articles, P=pages, N=paragraphs, R=recitals, C=chapters, T=titles, L=lines)
+                # and spaces from the beginning and end of the string
+                fromNum = int(listEntry_split[0].strip("APNRC L "))
+                toNum = int(listEntry_split[1].strip("APNRC L "))
                 r = list(range(fromNum, toNum + 1))
                 return [str(num) for num in r]
             except ValueError:
@@ -1241,7 +1389,7 @@ class EcjXmlParser(object):
         elif self._celex.startswith("1"):
             return None
         else:
-            return listEntry  # no range just a single number
+            return listEntry_split  # no range just a single number
 
     def _remove_unwanted_entries(self, d):
         """Removes some of the entries in e.g. national submissions, because those are superfluous. Like for example
@@ -1471,4 +1619,4 @@ class EcjXmlParser(object):
 
 if __name__ == "__main__":
     parser = Reader(root="judgments")
-    print(parser.values_from_xml(parser.xmlfiles[-1]))
+    print(json.dumps(parser.values_from_xml(parser.xmlfiles[-5]), indent=4))
