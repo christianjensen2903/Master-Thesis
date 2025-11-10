@@ -250,8 +250,8 @@ class DenseRetrieverTrainer:
                         # Fallback: use positive pair only if no negatives found
                         train_data.append(
                             {
-                                "sentence1": query_text,
-                                "sentence2": doc_text,
+                                "query": query_text,
+                                "positive": doc_text,
                             }
                         )
                     else:
@@ -260,9 +260,9 @@ class DenseRetrieverTrainer:
                             neg_text = candidate_texts[neg_idx]
                             train_data.append(
                                 {
-                                    "sentence1": query_text,
-                                    "sentence2": doc_text,
-                                    "sentence3": neg_text,
+                                    "query": query_text,
+                                    "positive": doc_text,
+                                    "negative": neg_text,
                                 }
                             )
 
