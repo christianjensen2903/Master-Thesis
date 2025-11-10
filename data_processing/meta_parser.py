@@ -23,12 +23,14 @@ import os.path as path
 from bs4 import BeautifulSoup as bs
 import glob
 import lxml
-import time
 import sys
 import pandas as pd  # type: ignore
 import fnmatch
 
 logger = logging.getLogger(__name__)
+
+# Set logger to info level
+logger.setLevel(logging.WARNING)
 
 
 CELEX_REG = r"6(?P<year>\d{4})(?P<court>\w)(?P<type>\w)(?P<no>\d{4})"
@@ -121,7 +123,7 @@ class Reader(object):
     ie time they were downloaded.
     """
 
-    def __init__(self, root, batch_size=500, sleep=0.5):
+    def __init__(self, root, batch_size=500):
         """
         Init with a root folder, where all cases are contained in subdirectories
         :param root:
@@ -130,7 +132,6 @@ class Reader(object):
         self._root = root
         self.output = OrderedDict()
         self._batch_size = batch_size
-        self._sleep = sleep
 
         sys.stderr.write("glob\n")
         # Get all folders in the root directory
@@ -153,6 +154,9 @@ class Reader(object):
 
             # Try English metadata first
             metafile = path.join(d, "eng_metadata.xml")
+
+            if not path.exists(metafile):
+                metafile = path.join(d, "metadata.xml")
 
             if not path.exists(metafile):
                 metafile = path.join(d, "fra_metadata.xml")
@@ -223,7 +227,6 @@ class Reader(object):
         except IndexError:
             sys.stderr.write(f"Language {lang3} not found in the list of languages\n")
             lang2 = None
-            print(df[df["lang3"] == lang3])
             exit(-1)
         return lang2
 
@@ -271,7 +274,6 @@ class Reader(object):
             if case_lang3_lower:
                 lang_prefix_map[case_lang] = case_lang3_lower[:3]
 
-        # Iterate over English, French and the case language and check if the judgment.html and summary.html files
         # are available. We hope that at least English or French is available together with the case language
         for lang in {"EN", "FR", case_lang}:
             if lang is None:
@@ -280,34 +282,18 @@ class Reader(object):
             # Try both naming conventions: eng_judgment.html and judgment.html
             filename = path.join(dir_celex, f"{lang_prefix}_judgment.html")
             if not path.exists(filename):
-                # Fallback to simple judgment.html in the same folder
-                filename = path.join(dir_celex, "judgment.html")
+                continue
 
-            # We are checking below if the text is available
-            try:
-                with open(filename, encoding="utf8") as htmlfile:
-                    content = htmlfile.read()
-                    if "The requested document does not exist." in content:
-                        continue  # in that cases ignore the text
-                summary_filename = path.join(dir_celex, f"{lang_prefix}_summary.html")
-                if not path.exists(summary_filename):
-                    # Fallback to simple summary.html
-                    summary_filename = path.join(dir_celex, "summary.html")
+            files_to_return[lang] = {
+                "judgment": filename,
+            }
 
-                files_to_return[lang] = {
-                    "judgment": filename,
-                    "summary": summary_filename,
-                }
-            except FileNotFoundError:
-                logger.error(f"judgment.html isn't available at {filename}")
-                print(f"judgment.html isn't available at {filename}")
-                files_to_return[lang] = None
         return files_to_return
 
     def values_from_xml(self, file):
 
         # try:
-        parser = EcjXmlParser(file, self._sleep)
+        parser = EcjXmlParser(file)
         # except NoMetadataError:
         #     return None
 
@@ -317,34 +303,21 @@ class Reader(object):
         logger.debug("Citations:%s" % str(citations))
 
         if len(citations) == 0:
-            logger.error("No citations found for %s." % celex)
-            print("No citations found for %s." % celex)
-            # Check if the document is an Advocate General's opinion
-            if parser.is_advocate_general_opinion():
+            logger.info("No citations found for %s." % celex)
+            case_dir = path.dirname(file)
+            # Try English HTML first, then French, then fallback to simple judgment.html
+            html_case_file = path.join(case_dir, "eng_judgment.html")
+            if not os.path.exists(html_case_file):
                 logger.info(
-                    "The document is an Advocate General's opinion. "
-                    "\n\t\tCitation extraction from HTML is not yet supported and will therefore proceed. "
+                    "English HTML version doesn't exist, will try to extract citations from the French"
                 )
-                print(
-                    "The document is an Advocate General's opinion. Citation extraction from HTML is skipped."
-                )
+                html_case_file = path.join(case_dir, "fra_judgment.html")
+            if not os.path.exists(html_case_file):
+                logger.info(f"No HTML file found in {case_dir}")
             else:
-                case_dir = path.dirname(file)
-                # Try English HTML first, then French, then fallback to simple judgment.html
-                html_case_file = path.join(case_dir, "eng_judgment.html")
-                if not os.path.exists(html_case_file):
-                    html_case_file = path.join(case_dir, "judgment.html")
-                if not os.path.exists(html_case_file):
-                    logger.info(
-                        "English HTML version doesn't exist, will try to extract citations from the French"
-                    )
-                    html_case_file = path.join(case_dir, "fra_judgment.html")
-                if not os.path.exists(html_case_file):
-                    logger.warning(f"No HTML file found in {case_dir}")
-                else:
-                    html_parser = EcjHtmlParser(html_case_file)
-                    citations = html_parser.read_citations_and_citing_paragraphs()
-                    logger.debug("Citations from HTML:%s" % str(citations))
+                html_parser = EcjHtmlParser(html_case_file)
+                citations = html_parser.read_citations_and_citing_paragraphs()
+                logger.debug("Citations from HTML:%s" % str(citations))
 
         # output = OrderedDict()
         output = {}
@@ -358,7 +331,6 @@ class Reader(object):
         if len(authentic_lang) > 0:
             output["files"] = self.infer_filenames(file, authentic_lang[0])
         else:
-            print("\tnot possible to detect original language in %s" % celex)
             logger.error("not possible to detect original language in %s" % celex)
             output["files"] = {}
         output["meta"] = {}  # OrderedDict()
@@ -414,12 +386,11 @@ class Reader(object):
             rest = cur
             start = cur - self._batch_size
 
+        os.makedirs(output_dir, exist_ok=True)
         fname = os.path.join(output_dir, "results_%d-%d.json" % (start, rest))
         with open(fname, mode="w+", encoding="utf8") as outfile:
             json.dump(output, outfile, indent=4)
         logger.info(f"Wrote {fname}")
-        print(f"Wrote {fname}")
-        print("---")
         return
 
     def add_values(self, output, output_small):
@@ -440,7 +411,6 @@ class Reader(object):
         """
         xmlfiles = self.xmlfiles
         logger.info(f"Will parse {len(xmlfiles)} files")
-        print(f"Will parse {len(xmlfiles)} files, starting from {start_from}")
 
         batch_size = self._batch_size
         # batch_stops = xmlfiles[::batch_size]
@@ -452,8 +422,6 @@ class Reader(object):
         for elem in xmlfiles[cur:]:
             logger.info("Parsing %s" % elem)
             if not path.exists(elem):
-                # if XML not available continue
-                print("\tXML not available")
                 logger.info("\tXML not available")
                 continue
             try:
@@ -495,7 +463,6 @@ class Reader(object):
         try:
             # Remove from json_files all names starting with 'meta_all'
             json_files = [f for f in json_files if not "meta_all" in f]
-            print("removed previous results")
             logger.info("removed previous results")
         except ValueError as e:
             pass
@@ -506,15 +473,11 @@ class Reader(object):
         global_js = {}
         for jsf in json_files:
             logger.info(f"Reading {jsf}")
-            print(f"Reading {jsf}")
             json_part = json.load(open(jsf, encoding="utf-8"))
             global_js.update(json_part)
-
-        print("Sorting global JSON...")
         global_js = self._sort_json(global_js)
 
         logger.debug("First item:" + list(global_js.keys())[0])
-        print("Will write global JSON")
         logger.info("Will write global JSON")
 
         # and store at the filesystem
@@ -525,6 +488,53 @@ class Reader(object):
 
         logger.info("Global JSON written successfully!")
         return json_out_path
+
+    def merge_result_batches(
+        self, results_dir: str, output_json: str = "all_results.json"
+    ) -> str:
+        """
+        Merges all result batch files (results_*.json) into a single file.
+
+        :param results_dir: str
+            the directory containing the result batch JSON files
+        :param output_json: str
+            the filename for the merged JSON output. Default: "all_results.json"
+        :return: str
+            the path to the merged output file
+        """
+        json_files = glob.glob(os.path.join(results_dir, "results_*.json"))
+        # Sort by filename to ensure proper order (results_0-500.json, results_500-1000.json, etc.)
+        json_files.sort()
+
+        # Exclude the output file if it already exists
+        output_path = os.path.join(results_dir, output_json)
+        json_files = [f for f in json_files if f != output_path]
+
+        logger.info(f"Found {len(json_files)} batch files to merge")
+
+        # construct a global big JSON with all results
+        global_js = OrderedDict()
+        total_cases = 0
+
+        for jsf in json_files:
+            logger.info(f"Reading {os.path.basename(jsf)}")
+            json_part = json.load(open(jsf, encoding="utf-8"))
+            batch_size = len(json_part)
+            total_cases += batch_size
+            global_js.update(json_part)
+            logger.info(f"  Added {batch_size} cases (total: {total_cases})")
+
+        logger.info(f"Merged {total_cases} cases total")
+        global_js = self._sort_json(global_js)
+
+        logger.info("Will write merged results JSON")
+
+        # and store at the filesystem
+        with open(output_path, mode="w+", encoding="utf-8") as outf:
+            json.dump(global_js, outf, indent=4, ensure_ascii=False)
+
+        logger.info(f"Merged results JSON written successfully to {output_path}!")
+        return output_path
 
 
 class NoMetadataError(Exception):
@@ -760,7 +770,6 @@ class EcjHtmlParser(object):
         if re.search(r"\s", linked_case_text):
             linked_case_text = re.split(r"\s", linked_case_text)[0]
         linked_case_id = unidecode(linked_case_text)
-        print(f"Linked case is: {linked_case_id} ")
         logger.info(f"Linked case is: {linked_case_id} ")
         # The first link to a case in the text can be a link to the case itself in the introduction,
         # where the relevant text just describes, how the case came up. We don't need such an incident,
@@ -788,10 +797,6 @@ class EcjHtmlParser(object):
                 )
             except AttributeError:
                 logger.error(
-                    f"No paragraph number found for case link: {unidecode(c.get_text(strip=True))}. "
-                    f"The case link might be in the conclusion as in 62019CJ0883"
-                )
-                print(
                     f"No paragraph number found for case link: {unidecode(c.get_text(strip=True))}. "
                     f"The case link might be in the conclusion as in 62019CJ0883"
                 )
@@ -833,8 +838,6 @@ class EcjHtmlParser(object):
         :return:
             citations: the citations to other cases and to relevant paragraphs if those citations exist and
         """
-        logger.info(f"\t Entering _parse_citations for {self.filepath}")
-        print(f"\tEntering _parse_citations for {self.filepath}")
         citations = []
         try:
             with open(self.filepath, mode="r", encoding="utf-8") as f:
@@ -843,22 +846,17 @@ class EcjHtmlParser(object):
                 # Find all <a> elements with class "coj-CourtLink" and where the text does not contain "EU:", which is
                 # an indication that the citation has a case number eg. C-123/12
                 links = soup.find_all(
-                    "a", class_="coj-CourtLink", text=lambda x: x and "EU:" not in x
+                    "a", class_="coj-CourtLink", string=lambda x: x and "EU:" not in x
                 )
                 if len(links) == 0:
-                    logger.error(
-                        f"\tCannot parse citations for {self.filepath}. HTML file does not contain links"
-                    )
-                    print(
-                        f"\tCannot parse citations for {self.filepath}. HTML file does not contain links"
+                    logger.info(
+                        f"Cannot parse citations for {self.filepath}. HTML file does not contain links"
                     )
                     return citations  # Which are empty but the code shall return
 
                 links_dict = self._arrange_links(links)
 
                 for par_number in links_dict.keys():
-                    logger.info(10 * "=")
-                    logger.info(f"WIll work with citations in paragraph {par_number}")
                     # extract the case links and the number links
                     case_links = links_dict[par_number]["case_links"]
                     number_links = links_dict[par_number]["number_links"]
@@ -911,7 +909,6 @@ class EcjHtmlParser(object):
                         )
         except FileNotFoundError:
             logger.error("Neither HTML file is available at %s" % self.filepath)
-            print("Neither HTML file is available at %s" % self.filepath)
 
         except Exception as e:
             logger.exception(f"Error {e} occured exiting")
@@ -1006,8 +1003,7 @@ class EcjXmlParser(object):
 
     IDS_TO_IGNORE = ["EM", "IC"]  # Member States  # Institutions
 
-    def __init__(self, filepath, sleep=0.5):
-        time.sleep(sleep)
+    def __init__(self, filepath):
         try:
             self._tree = etree.parse(filepath)
             self._filepath = filepath
@@ -1090,10 +1086,10 @@ class EcjXmlParser(object):
             else:
                 # TODO: perhaps isolate the parties' names before the v. We could leave them blank as the court uses
                 #  structured references
-                logger.warning("Case doesn't have a short title")
+                logger.info("Case doesn't have a short title")
                 return ""
         elif len(short_title_node) == 0:
-            logger.warning("Case doesn't have a short title")
+            logger.info("Case doesn't have a short title")
             return ""
 
     def read_keywords(self):
@@ -1153,17 +1149,6 @@ class EcjXmlParser(object):
         roots = self.read_citations()
         # Log the number of citations
         logger.debug("Number of citations:%d" % len(roots))
-
-        # If roots have zero length, then the XML file is incomplete
-        # and we will proceed with processing the HTML file
-        # if len(roots) == 0:
-        #     logger.warning("There are no citations in the metadata")
-        #     logger.debug("Will proceed with processing the HTML file")
-        #     # Initialize the EcjHTMLParser
-        #     html_file = path.join(path.dirname(self._filepath), 'judgment.html')
-        #     html_parser = EcjHtmlParser(html_file)
-        #     citations_list = html_parser.read_citations_and_citing_paragraphs()
-        #     return citations_list
 
         for root in roots:
             celex = root.xpath(EcjXmlParser.XPATH_CELEX_FROM_CITATION_ROOT)[0]
@@ -1274,9 +1259,14 @@ class EcjXmlParser(object):
                     citations_dict["unit"] = self._detect_unit(citation_string)
                     citations_list.append(citations_dict)
                 else:
-                    logger.warning(
-                        "Reference to %s has no FRAGMENT_CITING_SOURCE" % celex
-                    )
+                    cited_par = cited[0]
+                    citations_dict = {}
+                    cited_unit = self._detect_unit(cited_par)
+
+                    citations_dict["to"] = self._citing_paragraphs(cited_par)
+                    citations_dict["target"] = celex
+                    citations_dict["cited_unit"] = cited_unit
+                    citations_list.append(citations_dict)
 
             elif len(citing) > 0:
                 citations_dict = {}
@@ -1610,7 +1600,7 @@ class EcjXmlParser(object):
         # Usually they indicate the national court with *A9* or *P1* but can have other indications
         # We clean this part and get the court
 
-        results = soup.find_all(text=re.compile(self.NATIONAL_COURT))
+        results = soup.find_all(string=re.compile(self.NATIONAL_COURT))
         # Process mult
 
     def is_advocate_general_opinion(self):
@@ -1619,4 +1609,7 @@ class EcjXmlParser(object):
 
 if __name__ == "__main__":
     parser = Reader(root="judgments")
-    print(json.dumps(parser.values_from_xml(parser.xmlfiles[-5]), indent=4))
+    parser.process(output_dir="results")
+    # To merge all batch result files into one:
+    # parser.merge_result_batches("results", "all_results.json")
+    # print(json.dumps(parser.values_from_xml(parser.xmlfiles[-5]), indent=4))
