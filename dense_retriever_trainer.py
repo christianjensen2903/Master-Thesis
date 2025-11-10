@@ -1,38 +1,35 @@
 import os
-import json
-from datetime import datetime as dt
-
-import numpy as np
+import pandas as pd  # type: ignore
 from tqdm import tqdm  # type: ignore
 from datasets import Dataset  # type: ignore
-import bm25s  # type: ignore
 from sentence_transformers import (
     SentenceTransformer,
     SentenceTransformerTrainer,
     SentenceTransformerTrainingArguments,
     losses,
 )
+from sentence_transformers.training_args import BatchSamplers
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
+from validation_utils import split_data_by_date
 
 
 class DenseRetrieverTrainer:
-    """Trainer for dense retrievers with optional BM25-based hard negative sampling."""
 
     def __init__(
         self,
         model_name: str,
         training_args: SentenceTransformerTrainingArguments,
+        validation_split: float = 0.1,
         use_wandb: bool = True,
         max_seq_length: int | None = None,
         loss_scale: float = 20.0,
-        num_negatives: int = 1,
     ):
         self.model_name = model_name
         self.training_args = training_args
+        self.validation_split = validation_split
         self.use_wandb = use_wandb
         self.max_seq_length = max_seq_length
         self.loss_scale = loss_scale
-        self.num_negatives = num_negatives
 
         if self.training_args is not None:
             output_dir_init = self.training_args.output_dir
@@ -42,115 +39,56 @@ class DenseRetrieverTrainer:
             os.makedirs("output/model", exist_ok=True)
 
     def load_and_split_data(
-        self,
-        judgments_path: str,
-        qrel_path: str,
-        cutoff_year: int,
-    ) -> tuple[
-        dict[str, list[str]],
-        dict[str, str],
-        dict[str, str],
-        dict[str, str],
-        dict[str, set[str]],
-    ]:
-        """Load data from judgments and qrel files, grouped by query."""
-        print("Loading judgments...")
-        with open(judgments_path) as f:
-            judgments = json.load(f)
+        self, paragraph_file: str, cutoff_year: int
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Load data and split into train/validation sets."""
+        df = pd.read_csv(paragraph_file)
+        df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
 
-        # Build paragraph index: (celex, number) -> text and date
-        paragraph_data: dict[tuple[str, int], tuple[str, dt]] = {}
+        df["DATE_TO"] = pd.to_datetime(df["DATE_TO"])
 
-        for celex, judgment in judgments.items():
-            meta = judgment.get("meta", {}).get("meta", {})
-            date_str = meta.get("date")
-
-            try:
-                date = dt.strptime(date_str, "%Y-%m-%d")
-            except:
-                continue
-
-            for par_num, text in judgment["paragraphs"].items():
-                key = (celex, int(par_num))
-                paragraph_data[key] = (text, date)
-
-        print(f"Loaded {len(paragraph_data)} paragraphs from judgments")
-
-        # Load qrel grouped by query
-        print("Loading qrel...")
-        train_qrel: dict[str, list[str]] = {}
-        train_queries: dict[str, str] = {}
-        train_corpus: dict[str, str] = {}
-        val_queries: dict[str, str] = {}
-        val_relevant: dict[str, set[str]] = {}
-
-        cutoff_date = dt(cutoff_year, 1, 1)
-
-        with open(qrel_path, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split()
-                query_id_raw = parts[0]
-                doc_id_raw = parts[2]
-
-                # Parse celex_paragraph_number format
-                celex_q, par_num_q = query_id_raw.rsplit("_", 1)
-                celex_d, par_num_d = doc_id_raw.rsplit("_", 1)
-
-                query_key = (celex_q, int(par_num_q))
-                doc_key = (celex_d, int(par_num_d))
-
-                # Only include if both exist
-                if query_key not in paragraph_data or doc_key not in paragraph_data:
-                    continue
-
-                query_text, query_date = paragraph_data[query_key]
-                doc_text, _ = paragraph_data[doc_key]
-
-                # Create IDs in format celex::paragraph_number
-                query_id_str = f"{query_key[0]}::{query_key[1]}"
-                doc_id_str = f"{doc_key[0]}::{doc_key[1]}"
-
-                # Add to corpus
-                train_corpus[query_id_str] = query_text
-                train_corpus[doc_id_str] = doc_text
-
-                if query_date < cutoff_date:
-                    # Training data
-                    if query_id_str not in train_qrel:
-                        train_qrel[query_id_str] = []
-                        train_queries[query_id_str] = query_text
-                    train_qrel[query_id_str].append(doc_id_str)
-                else:
-                    # Validation data
-                    if doc_id_str in train_corpus:
-                        if query_id_str not in val_queries:
-                            val_queries[query_id_str] = query_text
-                            val_relevant[query_id_str] = set()
-                        val_relevant[query_id_str].add(doc_id_str)
-
-        train_citations = sum(len(docs) for docs in train_qrel.values())
-        val_citations = sum(len(docs) for docs in val_relevant.values())
-
-        print(f"\n📅 Temporal Split:")
-        print(
-            f"  Train: before {cutoff_date.date()} ({len(train_qrel)} queries, {train_citations} citations)"
+        df["FROM_ID"] = (
+            df["CELEX_FROM"].astype(str) + "::" + df["NUMBER_FROM"].astype(str)
         )
-        print(
-            f"  Val: after {cutoff_date.date()} ({len(val_queries)} queries, {val_citations} citations)"
-        )
+        df["TO_ID"] = df["CELEX_TO"].astype(str) + "::" + df["NUMBER_TO"].astype(str)
 
-        return train_qrel, train_queries, train_corpus, val_queries, val_relevant
+        return split_data_by_date(df, cutoff_year)
 
     def create_ir_evaluator(
-        self,
-        corpus: dict[str, str],
-        queries: dict[str, str],
-        relevant_docs: dict[str, set[str]],
+        self, val_df: pd.DataFrame, train_df: pd.DataFrame
     ) -> InformationRetrievalEvaluator:
         """Create an Information Retrieval evaluator for validation."""
+        queries = {}
+        documents = {}
+        relevant_docs: dict[str, set[str]] = {}
+
+        for _, row in train_df.iterrows():
+            text_from = str(row["TEXT_FROM"])
+            text_to = str(row["TEXT_TO"])
+            from_id = str(row["FROM_ID"])
+            to_id = str(row["TO_ID"])
+
+            documents[from_id] = text_from
+            documents[to_id] = text_to
+
+        for _, row in val_df.iterrows():
+            text_from = str(row["TEXT_FROM"])
+            text_to = str(row["TEXT_TO"])
+            from_id = str(row["FROM_ID"])
+            to_id = str(row["TO_ID"])
+
+            if to_id not in documents:
+                continue
+
+            if from_id not in queries:
+                queries[from_id] = text_from
+                relevant_docs[from_id] = set()
+
+            relevant_docs[from_id].add(to_id)
+
         evaluator = InformationRetrievalEvaluator(
             queries=queries,
-            corpus=corpus,
+            corpus=documents,
             relevant_docs=relevant_docs,
             name="validation_ir",
             show_progress_bar=True,
@@ -160,124 +98,30 @@ class DenseRetrieverTrainer:
 
         return evaluator
 
-    def _select_hard_negatives(
-        self, ranked_indices: np.ndarray, positive_indices: set[int]
-    ) -> list[int]:
-        """Select top hard negatives from ranked candidates, excluding all positives."""
-        # ranked_indices contains candidate indices sorted by similarity (highest first)
-        # Exclude all positives from ranked list
-        candidates = ranked_indices[~np.isin(ranked_indices, list(positive_indices))]
-
-        if len(candidates) == 0:
-            return []
-
-        # Select top negatives (already sorted by similarity)
-        num_samples = min(self.num_negatives, len(candidates))
-        return candidates[:num_samples].tolist()
-
-    def get_training_data(
-        self,
-        judgments_path: str,
-        qrel_path: str,
-        cutoff_year: int,
-    ) -> tuple[Dataset, dict[str, str], dict[str, str], dict[str, set[str]]]:
-        """Get training data with optional BM25-based hard negatives."""
-        train_qrel, train_queries, corpus, val_queries, val_relevant = (
-            self.load_and_split_data(judgments_path, qrel_path, cutoff_year)
-        )
+    def get_simcse_data(
+        self, paragraph_file: str, cutoff_year: int
+    ) -> tuple[Dataset, pd.DataFrame, pd.DataFrame]:
+        """Get data for sentence pair training."""
+        train_df, val_df = self.load_and_split_data(paragraph_file, cutoff_year)
 
         train_data = []
-
-        if self.num_negatives == 0:
-            # Simple pair format when no negatives are used
-            for query_id, query_text in tqdm(
-                train_queries.items(),
-                desc="Creating training dataset",
-            ):
-                for doc_id in train_qrel[query_id]:
-                    doc_text = corpus[doc_id]
-                    train_data.append({"sentence1": query_text, "sentence2": doc_text})
-        else:
-            # Use BM25 to find hard negatives
-            candidate_texts = list(corpus.values())
-            candidate_ids = list(corpus.keys())
-
-            print("Fitting BM25 on training data...")
-            tokenized_corpus = bm25s.tokenize(candidate_texts)
-            retriever = bm25s.BM25()
-            retriever.index(tokenized_corpus)
-
-            # Create mapping from document ID to index for efficient lookup
-            id_to_idx = {doc_id: idx for idx, doc_id in enumerate(candidate_ids)}
-
-            for query_id, query_text in tqdm(
-                train_queries.items(),
-                desc="Creating training dataset with hard negatives",
-            ):
-                positive_doc_ids = train_qrel[query_id]
-                num_positives = len(positive_doc_ids)
-
-                # Get indices of all positive documents
-                positive_indices = set()
-                for doc_id in positive_doc_ids:
-                    idx = id_to_idx.get(doc_id)
-                    if idx is not None:
-                        positive_indices.add(idx)
-
-                if len(positive_indices) == 0:
-                    continue
-
-                # Rank candidates using BM25 with k = num_positives + num_negatives
-                k = num_positives + self.num_negatives
-                tokenized_query = bm25s.tokenize(query_text, show_progress=False)
-                docs, _ = retriever.retrieve(
-                    tokenized_query,
-                    k=k,
-                    show_progress=False,
-                )
-                ranked_indices = np.array(docs[0])
-
-                # Select hard negatives (excluding all positives)
-                hard_negative_indices = self._select_hard_negatives(
-                    ranked_indices, positive_indices
-                )
-
-                # Create training examples: each positive gets n negatives
-                for doc_id in positive_doc_ids:
-                    doc_text = corpus[doc_id]
-
-                    if len(hard_negative_indices) == 0:
-                        # Fallback: use positive pair only if no negatives found
-                        train_data.append(
-                            {
-                                "query": query_text,
-                                "positive": doc_text,
-                            }
-                        )
-                    else:
-                        # Create one example per negative for this positive
-                        for neg_idx in hard_negative_indices:
-                            neg_text = candidate_texts[neg_idx]
-                            train_data.append(
-                                {
-                                    "query": query_text,
-                                    "positive": doc_text,
-                                    "negative": neg_text,
-                                }
-                            )
+        for _, row in tqdm(
+            train_df.iterrows(),
+            total=len(train_df),
+            desc="Creating training dataset",
+        ):
+            text_from = str(row["TEXT_FROM"])
+            text_to = str(row["TEXT_TO"])
+            train_data.append({"sentence1": text_from, "sentence2": text_to})
 
         train_dataset = Dataset.from_list(train_data)
-        return train_dataset, corpus, val_queries, val_relevant
+        return train_dataset, val_df, train_df
 
-    def train(
-        self,
-        judgments_path: str,
-        qrel_path: str,
-        cutoff_year: int,
-    ) -> SentenceTransformer:
-        """Train the dense retriever model."""
-        train_dataset, corpus, queries, relevant_docs = self.get_training_data(
-            judgments_path, qrel_path, cutoff_year
+    def train(self, paragraph_file: str, cutoff_year: int) -> SentenceTransformer:
+        """Train a sentence embedding model using SIMCSE with MultipleNegativesRankingLoss."""
+
+        train_dataset, val_df, train_df = self.get_simcse_data(
+            paragraph_file, cutoff_year
         )
 
         model = SentenceTransformer(self.model_name)
@@ -287,14 +131,9 @@ class DenseRetrieverTrainer:
         train_loss = losses.MultipleNegativesRankingLoss(
             model=model, scale=self.loss_scale
         )
-        evaluator = self.create_ir_evaluator(corpus, queries, relevant_docs)
+        evaluator = self.create_ir_evaluator(val_df, train_df)
 
-        if self.num_negatives == 0:
-            print(f"\nTraining {self.model_name} with MultipleNegativesRankingLoss...")
-        else:
-            print(
-                f"\nTraining {self.model_name} with Hard Negatives (top {self.num_negatives} from BM25)..."
-            )
+        print(f"\nTraining {self.model_name} with MultipleNegativesRankingLoss...")
         print(f"Total training examples: {len(train_dataset)}")
 
         trainer = SentenceTransformerTrainer(
@@ -313,3 +152,32 @@ class DenseRetrieverTrainer:
 
         print(f"Training finished. Model saved to {output_dir}")
         return model
+
+
+if __name__ == "__main__":
+    trainer = DenseRetrieverTrainer(
+        model_name="all-MiniLM-L6-v2",
+        training_args=SentenceTransformerTrainingArguments(
+            output_dir="checkpoints/dense_retriever",
+            num_train_epochs=10,
+            weight_decay=0.01,
+            bf16=False,
+            fp16=False,
+            gradient_accumulation_steps=4,
+            per_device_train_batch_size=16,
+            per_device_eval_batch_size=16,
+            metric_for_best_model="validation_ir_map@1000",
+            gradient_checkpointing=True,
+            warmup_ratio=0.1,
+            learning_rate=2e-5,
+            report_to="wandb",
+            eval_strategy="steps",
+            eval_steps=1000,
+            save_steps=1000,
+            save_total_limit=10,
+            lr_scheduler_type="cosine",
+            save_strategy="best",
+            batch_sampler=BatchSamplers.NO_DUPLICATES,
+        ),
+    )
+    trainer.train(paragraph_file="data/par-to-par-cleaned.csv", cutoff_year=2018)
