@@ -67,8 +67,6 @@ class DenseRetrieverTrainer:
             text_to = str(row["TEXT_TO"])
             from_id = str(row["FROM_ID"])
             to_id = str(row["TO_ID"])
-
-            documents[from_id] = text_from
             documents[to_id] = text_to
 
         for _, row in val_df.iterrows():
