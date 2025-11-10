@@ -9,6 +9,8 @@ import os
 
 dotenv.load_dotenv()
 
+cookies: dict[str, str] = {}
+
 
 class CaseScraper:
 
@@ -31,6 +33,7 @@ class CaseScraper:
             async with session.get(
                 url,
                 headers=headers,
+                cookies=cookies,
                 proxy=self.proxy,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
@@ -40,7 +43,11 @@ class CaseScraper:
             return None, None
 
     def _build_headers(self, accept: str) -> dict[str, str]:
-        headers: dict[str, str] = {"Accept": accept, "User-Agent": self.ua.random}
+        headers: dict[str, str] = {
+            "Accept": accept,
+            "User-Agent": self.ua.random,
+            "Referer": "https://eur-lex.europa.eu/",
+        }
         return headers
 
     @staticmethod
@@ -103,6 +110,18 @@ class CaseScraper:
         if content and status != 404:
             return content
         return None
+
+    async def scrape_legal_act(self, celex_id: str, out_dir: Path) -> None:
+        conn = aiohttp.TCPConnector(limit=6, ttl_dns_cache=300, force_close=False)
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+            headers = self._build_headers("text/html,application/xhtml+xml")
+            url = f"https://eur-lex.europa.eu/legal-content/en/TXT/HTML/?uri=CELEX:{celex_id}"
+            content, status = await self.fetch_single(session, url, headers)
+            if content and status != 404:
+                await self.save_bytes(out_dir / f"{celex_id}.html", content)
+            else:
+                print(f"Skipped {celex_id}.html - no valid content found")
 
     async def scrape_case(self, case_id: str, out_dir: Path) -> None:
         # TODO: Clean function by removing reading of files
@@ -179,8 +198,11 @@ def main() -> None:
     proxy = None
     scraper = CaseScraper(proxy=proxy)
     try:
+        # asyncio.run(
+        #     scraper.scrape_case(case_id="61954CC0001", out_dir=Path("judgments"))
+        # )
         asyncio.run(
-            scraper.scrape_case(case_id="61954CC0001", out_dir=Path("judgments"))
+            scraper.scrape_legal_act(celex_id="31960L0921", out_dir=Path("legal_acts"))
         )
     except KeyboardInterrupt:
         print("Interrupted by user.")

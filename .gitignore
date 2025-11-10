@@ -13,3 +13,5 @@ eurlex_rdf
 *.jsonl
 checkpoints
 wandb
+LEG_EN_HTML_20251109_01_00
+legal_acts
