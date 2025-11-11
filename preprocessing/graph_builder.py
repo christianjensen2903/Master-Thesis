@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
-
+import re
 import numpy as np
 import torch
 from torch_geometric.data import Data, HeteroData  # type: ignore
@@ -99,6 +99,34 @@ class BaseGraphBuilder(ABC):
         return selected_pars
 
 
+def parse_celex(celex):
+    """Parse CELEX into components (CJ only)"""
+    match = re.match(r"(\d)(\d{4})CJ(\d+)", celex)
+    if match:
+        sector, year, number = match.groups()
+        return {"sector": int(sector), "year": int(year), "number": int(number)}
+    raise ValueError(f"Invalid CELEX format (expected CJ type): {celex}")
+
+
+def encode_celex(celex, paragraph):
+    """Encode CELEX + paragraph to tensor (CJ only)"""
+    parsed = parse_celex(celex)
+
+    tensor = torch.tensor(
+        [parsed["sector"], parsed["year"], parsed["number"], paragraph]
+    )
+
+    return tensor
+
+
+def decode_celex(tensor):
+    """Decode tensor back to (CELEX, paragraph)"""
+    sector, year, number, paragraph = tensor.tolist()
+    celex = f"{sector}{year:04d}CJ{number:04d}"
+
+    return celex, paragraph
+
+
 class HomogeneousGraphBuilder(BaseGraphBuilder):
     """
     Homogeneous graph builder with only bidirectional citing edges.
@@ -129,7 +157,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         idx_to_metadata: dict[int, dict] = {}
         embeddings_list = []
         node_times = []
-        node_indices = []
+        node_ids = []
 
         for par_idx in selected_pars:
             meta = self.par_metadata[par_idx]
@@ -139,7 +167,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             node_id_to_idx[node_id] = current_idx
             idx_to_metadata[current_idx] = meta
             embeddings_list.append(self.par_embeddings[par_idx])
-            node_indices.append(par_idx)
+            node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
 
             # Add timestamp (convert date to Unix timestamp)
             date_str = meta.get("date")
@@ -157,7 +185,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
         # Create PyTorch Geometric Data
         x = torch.tensor(np.array(embeddings_list), dtype=torch.float32)
-        node_indices_tensor = torch.tensor(node_indices, dtype=torch.long)
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -166,12 +193,14 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
         node_times_tensor = torch.tensor(node_times, dtype=torch.long)
 
+        node_ids_tensor = torch.stack(node_ids)
+
         graph_data = Data(
             x=x,
             edge_index=edge_index,
             num_nodes=len(embeddings_list),
-            node_indices=node_indices_tensor,
             time=node_times_tensor,  # For temporal sampling
+            node_id_hash=node_ids_tensor,  # Hashed node IDs
         )
 
         print(

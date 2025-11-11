@@ -1,19 +1,4 @@
-"""
-Simple incremental GNN evaluator.
-
-Workflow:
-1. Build graph with all training data and embed it
-2. Load test queries and qrels
-3. For each test query in chronological order:
-   - Embed query with modified graph (only incoming edges, no edges to citations)
-   - Rank all nodes before it
-   - Compute metrics (MAP, recall)
-   - Add query to graph and re-embed its k-hop neighborhood
-"""
-
-import pickle
-import csv
-from collections import defaultdict
+import pandas as pd
 from evaluator import EvaluatorMode
 from datetime import datetime
 
@@ -26,19 +11,25 @@ from torch_geometric.utils import k_hop_subgraph  # type: ignore
 from torch_geometric.loader import NeighborLoader  # type: ignore
 from tqdm import tqdm  # type: ignore
 
-from preprocessing.graph_builder import HomogeneousGraphBuilder
+from preprocessing.graph_builder import HomogeneousGraphBuilder, decode_celex
 
 
-def compute_ap(ranked_pids: np.ndarray, relevant_pids: set[str]) -> float:
+def compute_ap(ranked_pids: np.ndarray, relevant_pids: set[tuple[str, int]]) -> float:
     """Compute average precision."""
     num_relevant = len(relevant_pids)
     if num_relevant == 0:
         return 0.0
 
+    # Convert numpy array to list of tuples to ensure hashability
+    ranked_list = [
+        tuple(pid.tolist()) if isinstance(pid, np.ndarray) else pid
+        for pid in ranked_pids
+    ]
+
     precisions = []
     num_hits = 0
 
-    for i, pid in enumerate(ranked_pids):
+    for i, pid in enumerate(ranked_list):
         if pid in relevant_pids:
             num_hits += 1
             precision = num_hits / (i + 1)
@@ -48,14 +39,20 @@ def compute_ap(ranked_pids: np.ndarray, relevant_pids: set[str]) -> float:
 
 
 def compute_recall_at_k(
-    ranked_pids: np.ndarray, relevant_pids: set[str], k: int
+    ranked_pids: np.ndarray, relevant_pids: set[tuple[str, int]], k: int
 ) -> float:
     """Compute recall at k."""
     if len(relevant_pids) == 0:
         return 0.0
 
     top_k = ranked_pids[:k]
-    num_relevant_in_top_k = len(set(top_k) & relevant_pids)
+    # Convert numpy array elements to tuples for set operations
+    top_k_list = [
+        tuple(pid.tolist()) if isinstance(pid, np.ndarray) else pid for pid in top_k
+    ]
+    top_k_set = set(top_k_list)
+
+    num_relevant_in_top_k = len(top_k_set & relevant_pids)
     return num_relevant_in_top_k / len(relevant_pids)
 
 
@@ -66,8 +63,7 @@ class SimpleIncrementalEvaluator:
         self,
         gnn_model: nn.Module,
         preprocessed_dir: str,
-        queries_path: str,
-        qrel_path: str,
+        par_to_par_path: str,
         train_cutoff_year: int = 2018,
         k_hops: int = 2,
         device: str | None = None,
@@ -75,8 +71,7 @@ class SimpleIncrementalEvaluator:
     ):
         self.gnn_model = gnn_model
         self.preprocessed_dir = preprocessed_dir
-        self.queries_path = queries_path
-        self.qrel_path = qrel_path
+        self.par_to_par_path = par_to_par_path
         self.train_cutoff_year = train_cutoff_year
         self.k_hops = k_hops
         self.mode = mode
@@ -96,54 +91,9 @@ class SimpleIncrementalEvaluator:
             include_only_citing=(self.mode == "citation_pairs")
         )
 
-        self.graph_data = self.graph_data.sort_by_time()
-
         self.embeddings = self._compute_initial_embeddings(
             self.graph_data, self.train_cutoff_year
         )
-
-    def load_queries_and_qrels(
-        self,
-    ) -> tuple[list[tuple[str, str]], dict[str, list[str]]]:
-        """
-        Load test queries and qrels.
-
-        Returns:
-            queries: List of (query_id, query_text) for test queries
-            qrels: Dict mapping query_id -> list of relevant doc ids
-        """
-        print("\nLoading queries...")
-        queries = []
-
-        with open(self.queries_path) as f:
-            reader = csv.reader(f, delimiter="\t")
-            next(reader)  # Skip header
-
-            for celex, par_num, query_text in reader:
-                query_id = f"par:{celex}:{par_num}"
-                queries.append((query_id, query_text))
-
-        print("\nLoading qrels...")
-        qrels: dict[str, list[str]] = defaultdict(list)
-
-        with open(self.qrel_path) as f:
-            for line in f:
-                parts = line.strip().split()
-                query_id_raw = parts[0]
-                doc_id_raw = parts[2]
-
-                # Parse celex_paragraph format
-                celex_q, par_num_q = query_id_raw.rsplit("_", 1)
-                celex_d, par_num_d = doc_id_raw.rsplit("_", 1)
-
-                query_id = f"par:{celex_q}:{par_num_q}"
-                doc_id = f"par:{celex_d}:{par_num_d}"
-
-                qrels[query_id].append(doc_id)
-
-        print(f"Loaded {len(queries)} test queries with qrels")
-
-        return queries, dict(qrels)
 
     def _compute_initial_embeddings(
         self, graph_data: Data, cutoff_year: int
@@ -166,22 +116,30 @@ class SimpleIncrementalEvaluator:
 
     def run(self, k_values: list[int] = [5, 10, 100]) -> float:
         """Run full incremental evaluation."""
-        # Load data
-        queries, qrels = self.load_queries_and_qrels()
+        df = pd.read_csv(self.par_to_par_path)
 
-        cutoff_timestamp = datetime.strptime(
-            str(self.train_cutoff_year), "%Y"
-        ).timestamp()
-        node_mask = self.graph_data.time >= cutoff_timestamp
+        # Convert DATE_FROM to datetime and only keep those after the cutoff year
+        df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
+        cutoff_date = datetime.strptime(str(self.train_cutoff_year), "%Y")
+        df = df[df["DATE_FROM"] >= cutoff_date]
 
-        unique_times = self.graph_data.time[node_mask].unique().sort()[0]
+        # Group by DATE_FROM
+        grouped_by_date = df.groupby("DATE_FROM")
 
         ap_scores = []
         recall_scores: dict[int, list[float]] = {k: [] for k in k_values}
 
-        for time in tqdm(unique_times, desc="Evaluating"):
+        for date, group in tqdm(grouped_by_date, desc="Evaluating"):
+
+            date_str = date.normalize().strftime("%Y-%m-%d")
+            date_normalized = datetime.fromisoformat(date_str)
+            time = int(date_normalized.timestamp())
+
+            # Try exact match first
             mask = self.graph_data.time == time
+
             cand_indices = self.graph_data.time < time
+
             cand_emb = self.embeddings[cand_indices]
 
             num_nodes = mask.sum()
@@ -192,8 +150,9 @@ class SimpleIncrementalEvaluator:
                 input_nodes=mask.nonzero(as_tuple=True)[0],
                 num_neighbors=[-1] * self.k_hops,
                 time_attr="time",
+                batch_size=10000,
             )
-            sub = next(iter(loader))
+            sub: Data = next(iter(loader))
 
             src, dst = sub.edge_index
             edge_mask = (dst < num_nodes) | (src >= num_nodes)
@@ -202,28 +161,44 @@ class SimpleIncrementalEvaluator:
             with torch.no_grad():
                 embeddings = self.gnn_model(sub.x, masked_edge_index)
 
-            query_global_idx = sub.node_indices[:num_nodes]
-            cand_global_idx = torch.nonzero(cand_indices, as_tuple=False).squeeze(1)
-
-            cand_emb = self.embeddings[cand_global_idx]
             query_emb = embeddings[:num_nodes]
             sim = torch.matmul(query_emb, cand_emb.T)
 
-            _, sim_ord = torch.topk(sim, k=10, dim=1, largest=True, sorted=True)
+            _, sim_ord = torch.topk(sim, k=1000, dim=1, largest=True, sorted=True)
 
-            ranked_global_idx = cand_global_idx[sim_ord]
+            query_ids = [
+                decode_celex(node_id) for node_id in sub.node_id_hash[:num_nodes]
+            ]
 
-            def to_id(gidx: int):
-                return self.builder.par_metadata[gidx]["id"]
+            ranked_ids = [
+                [decode_celex(node_id) for node_id in row]
+                for row in self.graph_data.node_id_hash[sim_ord]
+            ]
 
-            query_ids = [to_id(int(g)) for g in query_global_idx]
-            ranked_ids = [[to_id(int(g)) for g in row] for row in ranked_global_idx]
+            # Group by CELEX_FROM and NUMBER_FROM
+            grouped_by_celex_and_number = group.groupby(["CELEX_FROM", "NUMBER_FROM"])
 
-            for qi, qid in enumerate(query_ids):
-                relevant_set = set(qrels.get(qid, []))  # robust if missing
-                ranked_list = ranked_ids[qi]
+            for celex_from, number_from in query_ids:
+                # Only evaluate queries that actually cite (appear in citation data as sources)
+                if (celex_from, number_from) not in grouped_by_celex_and_number.groups:
+                    # Skip nodes that are only cited but don't cite anything themselves
+                    continue
 
-                ranked_array: NDArray = np.asarray(ranked_list)
+                # Get the relevant rows for this query
+                relevant_rows = group.loc[
+                    grouped_by_celex_and_number.groups[(celex_from, number_from)]
+                ]
+                # Extract (CELEX_TO, NUMBER_TO) tuples as the relevant set
+                relevant_set = set(
+                    zip(
+                        relevant_rows["CELEX_TO"].astype(str),
+                        relevant_rows["NUMBER_TO"].astype(int),
+                    )
+                )
+
+                ranked_list = ranked_ids[query_ids.index((celex_from, number_from))]
+
+                ranked_array: NDArray = np.asarray(ranked_list, dtype=object)
                 ap = compute_ap(ranked_array, relevant_set)
                 for k in k_values:
                     k = min(k, len(ranked_array))
@@ -261,8 +236,7 @@ if __name__ == "__main__":
     evaluator = SimpleIncrementalEvaluator(
         gnn_model=model,
         preprocessed_dir="data/preprocessed",
-        queries_path="data/evaluation/queries_cleaned_masked.tsv",
-        qrel_path="data/evaluation/qrel.txt",
+        par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
         k_hops=2,
         device="cuda" if torch.cuda.is_available() else "cpu",
