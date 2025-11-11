@@ -46,11 +46,11 @@ def evaluate_recall_vs_k(
     evaluator = Evaluator(
         retriever=retriever,
         mode=mode,  # type: ignore
-        csv_path="data/par-to-par-cleaned.csv",
-        metadata_path="data/par-to-par.json",
         judgments_path="data/judgments_cleaned.json",
+        par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
-        top_k=max_k + 100,  # Retrieve more than max k to ensure we have enough candidates
+        top_k=max_k
+        + 100,  # Retrieve more than max k to ensure we have enough candidates
     )
 
     print("Loading and preparing data...")
@@ -83,7 +83,9 @@ def evaluate_recall_vs_k(
     recall_sorted = [recall_scores[k] for k in k_sorted]
 
     plt.figure(figsize=(10, 6))
-    plt.plot(k_sorted, recall_sorted, marker="o", linestyle="-", linewidth=2, markersize=6)
+    plt.plot(
+        k_sorted, recall_sorted, marker="o", linestyle="-", linewidth=2, markersize=6
+    )
     plt.xlabel("k", fontsize=12)
     plt.ylabel("Recall", fontsize=12)
     plt.title(f"Recall vs k using {model_path.split('/')[-1]}", fontsize=14)
@@ -117,4 +119,3 @@ if __name__ == "__main__":
         output_path="artifacts/recall_vs_k_simcse.png",
         mode="citation_pairs",
     )
-

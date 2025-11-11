@@ -109,8 +109,7 @@ class Evaluator:
         embeddings: NDArray | None = None,
         mode: EvaluatorMode = "citation_pairs",
         judgments_path: str = "data/judgments_cleaned.json",
-        queries_path: str = "data/evaluation/queries.tsv",
-        qrel_path: str = "data/evaluation/qrel.txt",
+        par_to_par_path: str = "data/par-to-par-cleaned.csv",
         train_cutoff_year: int = 2018,
         top_k: int | None = None,
         save_embeddings_path: str | None = None,
@@ -119,8 +118,7 @@ class Evaluator:
         self.embeddings = embeddings
         self.mode: EvaluatorMode = mode
         self.judgments_path = judgments_path
-        self.queries_path = queries_path
-        self.qrel_path = qrel_path
+        self.par_to_par_path = par_to_par_path
         self.train_cutoff_year = train_cutoff_year
         self.top_k = top_k
         self.save_embeddings_path = save_embeddings_path
@@ -149,8 +147,8 @@ class Evaluator:
         # Load all paragraphs from judgments.json
         self._load_paragraphs()
 
-        # Load queries and qrel
-        self._load_queries_and_qrel()
+        # Load citation pairs from par-to-par CSV
+        self._load_citation_pairs()
 
         # Filter paragraphs for citation_pairs mode
         if self.mode == "citation_pairs":
@@ -207,48 +205,66 @@ class Evaluator:
         )
         self.paragraph_set = np.array([p["set_type"] for p in paragraphs], dtype=object)
 
-    def _load_queries_and_qrel(self) -> None:
-        """Load queries and qrel files."""
+    def _load_citation_pairs(self) -> None:
+        """Load citation pairs from par-to-par CSV file."""
         assert self.celex_number_to_pid is not None
+        assert self.pid_to_text is not None
 
-        print("Loading queries...")
-        query_data = []
-        with open(self.queries_path, "r", encoding="utf-8") as f:
-            reader = csv.reader(f, delimiter="\t")
-            next(reader)  # Skip header
-            for celex, par_num, query_text in reader:
-                key = (celex, int(par_num))
-                if key in self.celex_number_to_pid:
-                    query_data.append((self.celex_number_to_pid[key], query_text))
+        print(f"Loading citation pairs from {self.par_to_par_path}...")
 
-        self.query_pids = [pid for pid, _ in query_data]
-        self.query_texts = np.array([text for _, text in query_data], dtype=object)
+        # Read CSV file
+        query_texts_dict: dict[tuple[str, int], str] = {}  # query_key -> query_text
+        qrel_dict: dict[tuple[str, int], list[tuple[str, int]]] = defaultdict(list)
 
-        print("Loading qrel...")
-        self.qrel = defaultdict(list)
-        with open(self.qrel_path, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split()
-                query_id = parts[0]
-                doc_id = parts[2]
+        skipped = 0
+        with open(self.par_to_par_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                celex_from = str(row["CELEX_FROM"])
+                number_from = int(row["NUMBER_FROM"])
+                text_from = str(row["TEXT_FROM"])
+                celex_to = str(row["CELEX_TO"])
+                number_to = int(row["NUMBER_TO"])
 
-                # Parse celex_paragraph_number format
-                celex_q, par_num_q = query_id.rsplit("_", 1)
-                celex_d, par_num_d = doc_id.rsplit("_", 1)
+                query_key = (celex_from, number_from)
+                doc_key = (celex_to, number_to)
 
-                query_key = (celex_q, int(par_num_q))
-                doc_key = (celex_d, int(par_num_d))
-
+                # Skip if either paragraph not in our index
                 if (
-                    query_key in self.celex_number_to_pid
-                    and doc_key in self.celex_number_to_pid
+                    query_key not in self.celex_number_to_pid
+                    or doc_key not in self.celex_number_to_pid
                 ):
-                    query_pid = self.celex_number_to_pid[query_key]
-                    doc_pid = self.celex_number_to_pid[doc_key]
-                    self.qrel[query_pid].append(doc_pid)
+                    skipped += 1
+                    continue
+
+                # Store query text from TEXT_FROM
+                if query_key not in query_texts_dict:
+                    query_texts_dict[query_key] = text_from
+
+                qrel_dict[query_key].append(doc_key)
+
+        if skipped > 0:
+            print(f"Skipped {skipped} citation pairs (paragraphs not in index)")
+
+        # Build query lists
+        query_keys = sorted(query_texts_dict.keys())
+        self.query_pids = [self.celex_number_to_pid[key] for key in query_keys]
+        self.query_texts = np.array(
+            [query_texts_dict[key] for key in query_keys], dtype=object
+        )
+
+        # Build qrel mapping (query_pid -> list of doc_pids)
+        self.qrel = {}
+        for query_key in query_keys:
+            query_pid = self.celex_number_to_pid[query_key]
+            doc_pids = [
+                self.celex_number_to_pid[doc_key] for doc_key in qrel_dict[query_key]
+            ]
+            if doc_pids:
+                self.qrel[query_pid] = doc_pids
 
         print(
-            f"Loaded {len(self.query_pids)} queries with {sum(len(v) for v in self.qrel.values())} qrel entries"
+            f"Loaded {len(self.query_pids)} queries with {sum(len(v) for v in self.qrel.values())} citation pairs"
         )
 
     def _filter_to_citation_paragraphs(self) -> None:
@@ -589,8 +605,7 @@ if __name__ == "__main__":
         retriever=retriever,
         # mode="all_paragraphs",
         judgments_path="data/judgments_cleaned.json",
-        queries_path="data/evaluation/queries_cleaned_masked.tsv",
-        qrel_path="data/evaluation/qrel.txt",
+        par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
         top_k=10000,
         # save_embeddings_path="artifacts/simcse_embeddings.npy",

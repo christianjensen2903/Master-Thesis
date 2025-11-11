@@ -17,15 +17,11 @@ def main() -> None:
     encoding_model = "checkpoints/simcse_citation_model"
     model_path = "checkpoints/gnn/best_model.pt"
     mode: EvaluatorMode = "citation_pairs"  # "citation_pairs" or "all_paragraphs"
-    csv_path = "data/par-to-par-cleaned.csv"
-    metadata_path = "data/par-to-par.json"
-    judgments_path = "data/judgments_cleaned.json"
+    par_to_par_path = "data/par-to-par-cleaned.csv"
+    preprocessed_dir = "data/preprocessed"
     train_cutoff_year = 2018
     k_hops = 2  # How many hops to re-embed when adding a node
     top_k = 10000  # Limit retrieval to top-k candidates
-    embeddings_cache_dir = (
-        "artifacts/embeddings_cache"  # Cache directory for text embeddings
-    )
 
     # Load text encoder to get embedding dimension
     print("Loading text encoder...")
@@ -47,15 +43,13 @@ def main() -> None:
         gnn_model=model,
         text_encoder_name=encoding_model,
         mode=mode,
-        csv_path=csv_path,
-        metadata_path=metadata_path,
-        judgments_path=judgments_path,
+        preprocessed_dir=preprocessed_dir,
+        par_to_par_path=par_to_par_path,
         train_cutoff_year=train_cutoff_year,
         k_hops=k_hops,
         top_k=top_k,
         device="cuda" if torch.cuda.is_available() else "cpu",
         normalize_embeddings=True,
-        embeddings_cache_dir=embeddings_cache_dir,
     )
 
     # Run evaluation
