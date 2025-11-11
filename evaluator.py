@@ -125,12 +125,6 @@ class Evaluator:
         self.top_k = top_k
         self.save_embeddings_path = save_embeddings_path
 
-        # Validate mode
-        if mode not in ["citation_pairs", "all_paragraphs"]:
-            raise ValueError(
-                f"Invalid mode: {mode}. Must be 'citation_pairs' or 'all_paragraphs'"
-            )
-
         # Data structures (populated by load_and_prepare)
         self.pid_to_text: NDArray[np.object_] | None = None
         self.celex_number_to_pid: dict[tuple[str, int], int] | None = None

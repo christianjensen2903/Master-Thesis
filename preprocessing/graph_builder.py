@@ -10,6 +10,7 @@ import pickle
 from abc import ABC, abstractmethod
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -60,6 +61,16 @@ class BaseGraphBuilder(ABC):
         """Build and return graph data structure."""
         pass
 
+    def _date_to_timestamp(self, date_str: str | None) -> int:
+        """Convert ISO date string to Unix timestamp (seconds since epoch)."""
+        if not date_str:
+            return 0
+        try:
+            dt = datetime.fromisoformat(date_str)
+            return int(dt.timestamp())
+        except (ValueError, AttributeError):
+            return 0
+
     def _filter_paragraphs(
         self, include_only_citing: bool, train_cutoff_year: int | None
     ) -> list[int]:
@@ -69,9 +80,8 @@ class BaseGraphBuilder(ABC):
         citing_pars = set()
         if include_only_citing:
             for src_id, tgt_id in self.citations:
-                if src_id.startswith("par:"):
+                if src_id.startswith("par:") and tgt_id.startswith("par:"):
                     citing_pars.add(src_id)
-                if tgt_id.startswith("par:"):
                     citing_pars.add(tgt_id)
 
         for i, meta in enumerate(self.par_metadata):
@@ -119,6 +129,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         idx_to_metadata: dict[int, dict] = {}
         embeddings_list = []
         node_times = []
+        node_indices = []
 
         for par_idx in selected_pars:
             meta = self.par_metadata[par_idx]
@@ -128,10 +139,11 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             node_id_to_idx[node_id] = current_idx
             idx_to_metadata[current_idx] = meta
             embeddings_list.append(self.par_embeddings[par_idx])
+            node_indices.append(par_idx)
 
-            # Add timestamp (use year or 0 if not available)
-            year = meta.get("year", 0)
-            node_times.append(year if year else 0)
+            # Add timestamp (convert date to Unix timestamp)
+            date_str = meta.get("date")
+            node_times.append(self._date_to_timestamp(date_str))
 
         # Build citation edges (bidirectional)
         edge_list = []
@@ -145,6 +157,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
         # Create PyTorch Geometric Data
         x = torch.tensor(np.array(embeddings_list), dtype=torch.float32)
+        node_indices_tensor = torch.tensor(node_indices, dtype=torch.long)
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -157,6 +170,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             x=x,
             edge_index=edge_index,
             num_nodes=len(embeddings_list),
+            node_indices=node_indices_tensor,
             time=node_times_tensor,  # For temporal sampling
         )
 
@@ -217,8 +231,9 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             par_idx_to_metadata[current_idx] = meta
             par_embeddings_list.append(self.par_embeddings[par_idx])
 
-            year = meta.get("year", 0)
-            par_times.append(year if year else 0)
+            # Convert date to Unix timestamp
+            date_str = meta.get("date")
+            par_times.append(self._date_to_timestamp(date_str))
 
             # Track which paragraphs belong to each case
             celex = meta["celex"]
@@ -239,7 +254,7 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             art_idx_to_metadata[current_idx] = meta
             art_embeddings_list.append(self.art_embeddings[art_idx])
 
-            # Articles don't have years, use 0
+            # Articles don't have dates, use 0
             art_times.append(0)
 
             # Track which articles belong to each legal act
@@ -260,16 +275,16 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             case_emb = np.mean([par_embeddings_list[i] for i in par_indices], axis=0)
             case_embeddings_list.append(case_emb)
 
-            # Use earliest paragraph's year
-            case_year = min(par_times[i] for i in par_indices)
-            case_times.append(case_year)
+            # Use earliest paragraph's date timestamp
+            case_timestamp = min(par_times[i] for i in par_indices)
+            case_times.append(case_timestamp)
 
             case_idx_to_metadata[current_idx] = {
                 "id": f"case:{celex}",
                 "type": "case",
                 "celex": celex,
                 "num_paragraphs": len(par_indices),
-                "year": case_year,
+                "timestamp": case_timestamp,
             }
 
         # Build legal act nodes (average of articles)

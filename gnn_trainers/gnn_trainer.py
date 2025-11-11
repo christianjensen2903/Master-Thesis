@@ -175,6 +175,7 @@ class GNNTrainer:
             batch_size=self.batch_size,
             input_nodes=None,  # Sample all nodes
             shuffle=True,
+            time_attr="time",
         )
 
         print(f"\nStarting training for {self.epochs} epochs...")
