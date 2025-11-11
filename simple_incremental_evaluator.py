@@ -68,6 +68,7 @@ class SimpleIncrementalEvaluator:
         k_hops: int = 2,
         device: str | None = None,
         mode: EvaluatorMode = "citation_pairs",
+        top_k: int = 10000,
     ):
         self.gnn_model = gnn_model
         self.preprocessed_dir = preprocessed_dir
@@ -75,6 +76,7 @@ class SimpleIncrementalEvaluator:
         self.train_cutoff_year = train_cutoff_year
         self.k_hops = k_hops
         self.mode = mode
+        self.top_k = top_k
 
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -138,7 +140,9 @@ class SimpleIncrementalEvaluator:
             # Try exact match first
             mask = self.graph_data.time == time
 
-            cand_indices = self.graph_data.time < time
+            cand_mask = self.graph_data.time < time
+            # Convert boolean mask to actual indices
+            cand_indices = torch.where(cand_mask)[0]
 
             cand_emb = self.embeddings[cand_indices]
 
@@ -150,7 +154,7 @@ class SimpleIncrementalEvaluator:
                 input_nodes=mask.nonzero(as_tuple=True)[0],
                 num_neighbors=[-1] * self.k_hops,
                 time_attr="time",
-                batch_size=10000,
+                batch_size=100000,
             )
             sub: Data = next(iter(loader))
 
@@ -164,15 +168,18 @@ class SimpleIncrementalEvaluator:
             query_emb = embeddings[:num_nodes]
             sim = torch.matmul(query_emb, cand_emb.T)
 
-            _, sim_ord = torch.topk(sim, k=1000, dim=1, largest=True, sorted=True)
+            k = min(self.top_k, sim.size(1))
+            _, sim_ord = torch.topk(sim, k=k, dim=1, largest=True, sorted=True)
 
             query_ids = [
                 decode_celex(node_id) for node_id in sub.node_id_hash[:num_nodes]
             ]
 
+            # Map sim_ord indices (relative to cand_emb) back to original graph indices
+            ranked_node_indices = cand_indices[sim_ord]
             ranked_ids = [
                 [decode_celex(node_id) for node_id in row]
-                for row in self.graph_data.node_id_hash[sim_ord]
+                for row in self.graph_data.node_id_hash[ranked_node_indices]
             ]
 
             # Group by CELEX_FROM and NUMBER_FROM
@@ -240,6 +247,7 @@ if __name__ == "__main__":
         train_cutoff_year=2018,
         k_hops=2,
         device="cuda" if torch.cuda.is_available() else "cpu",
+        top_k=1000,
     )
 
     metrics = evaluator.run()

@@ -25,12 +25,6 @@ class CitationGNN(nn.Module):
         self.residual_weight = nn.Parameter(torch.tensor(0.5))
         self.dropout = nn.Dropout(0.1)
 
-        # Simplified query projection
-        self.query_proj = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.LayerNorm(input_dim),
-        )
-
     def forward(self, x, edge_index):
         x_orig = x
 
@@ -44,12 +38,10 @@ class CitationGNN(nn.Module):
         alpha = torch.sigmoid(self.residual_weight)
         x = alpha * x_orig + (1 - alpha) * x
 
-        return x
+        # Normalize embeddings
+        x = F.normalize(x, p=2, dim=1)
 
-    def encode_query(self, x):
-        """Process queries (not in graph) through projection."""
-        # return x
-        return self.query_proj(x)
+        return x
 
 
 def train_example() -> None:
