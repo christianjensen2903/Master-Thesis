@@ -69,22 +69,19 @@ def train_example() -> None:
     )
 
     trainer = GNNTrainer(
-        text_encoder_name=encoding_model,
+        preprocessed_dir="data/preprocessed",
         output_path="checkpoints/gnn",
         batch_size=2**10,
         epochs=400,
-        eval_every_n_epochs=20,
         learning_rate=5e-5,
         weight_decay=1e-4,
         temperature=0.07,
-        validation_split=0.1,
-        embeddings_cache_dir="artifacts/embeddings_cache",
         num_hops=2,
     )
 
     # Train on paragraph pairs (pass model to train method)
     cutoff_year = 2018
-    trainer.train(model, "data/par-to-par-cleaned.csv", cutoff_year)
+    trainer.train(model, cutoff_year)
 
     print("\nTraining complete!")
 

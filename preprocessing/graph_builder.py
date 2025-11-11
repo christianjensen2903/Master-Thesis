@@ -100,7 +100,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         self,
         train_cutoff_year: int | None = None,
         include_only_citing: bool = True,
-    ) -> tuple[Data, dict[str, int], dict[int, dict], np.ndarray]:
+    ) -> Data:
         """
         Build homogeneous citation graph.
 
@@ -110,9 +110,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
         Returns:
             graph_data: PyTorch Geometric Data object
-            node_id_to_idx: Mapping from node IDs to graph indices
-            idx_to_metadata: Mapping from graph indices to metadata
-            node_times: Timestamp for each node (for temporal sampling)
         """
         # Filter paragraphs
         selected_pars = self._filter_paragraphs(include_only_citing, train_cutoff_year)
@@ -167,7 +164,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             f"Built homogeneous graph: {len(embeddings_list)} nodes, {edge_index.shape[1]} edges"
         )
 
-        return graph_data, node_id_to_idx, idx_to_metadata, np.array(node_times)
+        return graph_data
 
 
 class HeterogeneousGraphBuilder(BaseGraphBuilder):
@@ -188,12 +185,7 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         self,
         train_cutoff_year: int | None = None,
         include_only_citing: bool = False,
-    ) -> tuple[
-        HeteroData,
-        dict[str, dict[str, int]],
-        dict[str, dict[int, dict]],
-        dict[str, np.ndarray],
-    ]:
+    ) -> HeteroData:
         """
         Build heterogeneous graph with case and act nodes.
 
@@ -203,9 +195,6 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
 
         Returns:
             graph_data: PyTorch Geometric HeteroData object
-            node_id_to_idx: Mapping from node IDs to indices per node type
-            idx_to_metadata: Mapping from indices to metadata per node type
-            node_times: Timestamps for each node type (for temporal sampling)
         """
         data = HeteroData()
 
@@ -383,28 +372,6 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             # Add reverse edge
             data["legal_act", "contains", "article"].edge_index = edge_index.flip([0])
 
-        # Collect all mappings
-        node_id_to_idx = {
-            "paragraph": par_node_id_to_idx,
-            "article": art_node_id_to_idx,
-            "case": case_node_id_to_idx,
-            "legal_act": act_node_id_to_idx,
-        }
-
-        idx_to_metadata = {
-            "paragraph": par_idx_to_metadata,
-            "article": art_idx_to_metadata,
-            "case": case_idx_to_metadata,
-            "legal_act": act_idx_to_metadata,
-        }
-
-        node_times = {
-            "paragraph": np.array(par_times),
-            "article": np.array(art_times),
-            "case": np.array(case_times),
-            "legal_act": np.array(act_times),
-        }
-
         print(f"Built heterogeneous graph:")
         print(f"  Paragraphs: {len(par_embeddings_list)}")
         print(f"  Articles: {len(art_embeddings_list)}")
@@ -412,4 +379,4 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         print(f"  Legal acts: {len(act_embeddings_list)}")
         print(f"  Edge types: {len(data.edge_types)}")
 
-        return data, node_id_to_idx, idx_to_metadata, node_times
+        return data

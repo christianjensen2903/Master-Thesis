@@ -16,6 +16,7 @@ from tqdm import tqdm  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 
 from evaluator import compute_ap_fast, compute_recall_at_k_fast
+from preprocessing.graph_builder import HomogeneousGraphBuilder
 
 # Type alias for evaluator modes
 EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
@@ -36,41 +37,33 @@ class IncrementalGNNEvaluator:
     def __init__(
         self,
         gnn_model: nn.Module,
-        text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        preprocessed_dir: str,
+        queries_path: str,
+        qrel_path: str,
+        text_encoder_name: str,
         mode: EvaluatorMode = "citation_pairs",
-        judgments_path: str = "data/judgments_cleaned.json",
-        queries_path: str = "data/evaluation/queries.tsv",
-        qrel_path: str = "data/evaluation/qrel.txt",
-        csv_path: str = "data/par-to-par-cleaned.csv",
         train_cutoff_year: int = 2018,
         k_hops: int = 2,
         top_k: int | None = None,
         device: str | None = None,
         normalize_embeddings: bool = True,
-        embeddings_cache_dir: str | None = None,
     ):
         self.gnn_model = gnn_model
-        self.text_encoder_name = text_encoder_name
-        self.mode: EvaluatorMode = mode
-        self.judgments_path = judgments_path
+        self.preprocessed_dir = preprocessed_dir
         self.queries_path = queries_path
         self.qrel_path = qrel_path
-        self.csv_path = csv_path
+        self.text_encoder_name = text_encoder_name
+        self.mode: EvaluatorMode = mode
         self.train_cutoff_year = train_cutoff_year
         self.k_hops = k_hops
         self.top_k = top_k
         self.normalize_embeddings = normalize_embeddings
-        self.embeddings_cache_dir = embeddings_cache_dir
 
         # Validate mode
         if mode not in ["citation_pairs", "all_paragraphs"]:
             raise ValueError(
                 f"Invalid mode: {mode}. Must be 'citation_pairs' or 'all_paragraphs'"
             )
-
-        # Create cache directory if specified
-        if self.embeddings_cache_dir:
-            os.makedirs(self.embeddings_cache_dir, exist_ok=True)
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -80,8 +73,8 @@ class IncrementalGNNEvaluator:
         self.gnn_model = self.gnn_model.to(self.device)
         self.gnn_model.eval()
 
-        # Initialize text encoder
-        print(f"Loading text encoder: {text_encoder_name}")
+        # Initialize text encoder for encoding queries at evaluation time
+        print(f"Loading text encoder for queries: {text_encoder_name}")
         self.text_encoder = SentenceTransformer(text_encoder_name)
 
         # Data structures (populated by load_and_prepare)
@@ -101,112 +94,89 @@ class IncrementalGNNEvaluator:
         self.current_embeddings: torch.Tensor | None = None
         self.text_embeddings: torch.Tensor | None = None  # Raw text embeddings
         self.nodes_in_graph: set[int] = set()
+        self.pid_to_node_idx: dict[int, int] = (
+            {}
+        )  # Maps evaluator PID to graph node index
+        self.node_idx_to_pid: dict[int, int] = (
+            {}
+        )  # Maps graph node index to evaluator PID
 
         # Evaluation metrics
         self.query_results: list[dict] = []
 
-    def _sanitize_model_name(self, model_name: str) -> str:
-        """Sanitize model name to be a valid filename by removing path separators."""
-        basename = os.path.basename(model_name)
-        return basename.replace("/", "_").replace("\\", "_")
-
-    def _get_embeddings_cache_key(self) -> str:
-        """Generate cache key based on mode and model."""
-        model_name = self._sanitize_model_name(self.text_encoder_name)
-        return f"{model_name}_{self.mode}"
-
-    def _load_cached_embeddings(self) -> np.ndarray | None:
-        """Load embeddings from cache if they exist."""
-        if not self.embeddings_cache_dir:
-            return None
-
-        cache_key = self._get_embeddings_cache_key()
-
-        cache_path = os.path.join(self.embeddings_cache_dir, f"{cache_key}.npy")
-
-        if os.path.exists(cache_path):
-            print(f"Loading cached embeddings from {cache_path}")
-            try:
-                embeddings = np.load(cache_path)
-                return embeddings
-            except Exception as e:
-                print(f"Failed to load cached embeddings: {e}")
-                return None
-        return None
-
-    def _save_cached_embeddings(self, embeddings: np.ndarray) -> None:
-        """Save embeddings to cache."""
-        if not self.embeddings_cache_dir:
-            return
-
-        cache_key = self._get_embeddings_cache_key()
-        cache_path = os.path.join(self.embeddings_cache_dir, f"{cache_key}.npy")
-
-        print(f"Saving embeddings to cache: {cache_path}")
-        try:
-            np.save(cache_path, embeddings)
-        except Exception as e:
-            print(f"Failed to save embeddings to cache: {e}")
-
     def load_and_prepare(self) -> None:
         """Load all data and prepare for evaluation."""
-        # Load all paragraphs from judgments.json
-        self._load_paragraphs()
+        self._load_from_graph_builder()
 
-        # Load queries and qrel
+    def _load_from_graph_builder(self) -> None:
+        """Load data using HomogeneousGraphBuilder from preprocessed data."""
+        if not self.preprocessed_dir:
+            raise ValueError("preprocessed_dir must be set to use graph builder")
+
+        print(f"\nLoading data from preprocessed directory: {self.preprocessed_dir}")
+        builder = HomogeneousGraphBuilder(self.preprocessed_dir)
+
+        # Build mappings from metadata
+        self.pid_to_text = np.array(
+            [meta.get("text", "") for meta in builder.par_metadata], dtype=object
+        )
+        self.celex_number_to_pid = {
+            (meta["celex"], meta["paragraph_number"]): i
+            for i, meta in enumerate(builder.par_metadata)
+        }
+
+        def extract_year_from_date(meta: dict) -> int | None:
+            """Extract year from date field in metadata."""
+            date_str = meta.get("date")
+            if not date_str or (isinstance(date_str, str) and not date_str.strip()):
+                return None
+            try:
+                # Date might be ISO format string (YYYY-MM-DD) or datetime object
+                if isinstance(date_str, str):
+                    date_obj = dt.strptime(date_str, "%Y-%m-%d")
+                    return date_obj.year
+                elif hasattr(date_str, "year"):
+                    return date_str.year
+                return None
+            except (ValueError, AttributeError):
+                return None
+
+        self.paragraph_dates = np.array(
+            [
+                (
+                    np.datetime64(meta["date"])
+                    if meta.get("date")
+                    else np.datetime64("NaT")
+                )
+                for meta in builder.par_metadata
+            ],
+            dtype="datetime64[ns]",
+        )
+        self.paragraph_celex = np.array(
+            [meta["celex"] for meta in builder.par_metadata], dtype=object
+        )
+        self.paragraph_number = np.array(
+            [meta["paragraph_number"] for meta in builder.par_metadata], dtype=object
+        )
+        self.paragraph_set = np.array(
+            [
+                (
+                    "train"
+                    if (year := extract_year_from_date(meta)) is not None
+                    and year < self.train_cutoff_year
+                    else "test"
+                )
+                for meta in builder.par_metadata
+            ],
+            dtype=object,
+        )
+
+        # Load queries and qrel (still need these from files)
         self._load_queries_and_qrel()
 
         # Filter paragraphs for citation_pairs mode
         if self.mode == "citation_pairs":
             self._filter_to_citation_paragraphs()
-
-    def _load_paragraphs(self) -> None:
-        """Load all paragraphs from judgments.json."""
-        print("Loading judgments...")
-        with open(self.judgments_path) as f:
-            judgments = json.load(f)
-
-        paragraphs = []
-        for celex, judgment in tqdm(judgments.items(), desc="Processing judgments"):
-            # Get date from meta
-            meta = judgment.get("meta", {}).get("meta", {})
-            date_str = meta.get("date")
-
-            try:
-                date = dt.strptime(date_str, "%Y-%m-%d")
-            except:
-                continue
-
-            year = date.year
-            set_type = "train" if year < self.train_cutoff_year else "test"
-
-            for par_num, text in judgment["paragraphs"].items():
-                paragraphs.append(
-                    {
-                        "text": text,
-                        "celex": celex,
-                        "date": date,
-                        "number": int(par_num),
-                        "set_type": set_type,
-                    }
-                )
-
-        # Sort paragraphs by date for chronological processing
-        paragraphs.sort(key=lambda p: (p["date"], p["celex"], p["number"]))
-
-        # Build arrays
-        self.pid_to_text = np.array([p["text"] for p in paragraphs], dtype=object)
-        self.celex_number_to_pid = {
-            (p["celex"], p["number"]): pid for pid, p in enumerate(paragraphs)
-        }
-        self.paragraph_dates = np.array(
-            [p["date"] for p in paragraphs], dtype="datetime64[ns]"
-        )
-        self.paragraph_celex = np.array([p["celex"] for p in paragraphs], dtype=object)
-        self.paragraph_number = np.array(
-            [p["number"] for p in paragraphs], dtype=object
-        )
-        self.paragraph_set = np.array([p["set_type"] for p in paragraphs], dtype=object)
 
     def _load_queries_and_qrel(self) -> None:
         """Load queries and qrel files."""
@@ -322,80 +292,91 @@ class IncrementalGNNEvaluator:
         )
 
     def initialize_graph_with_training_data(self) -> None:
-        """Initialize graph with all training paragraphs."""
-        assert self.pid_to_text is not None
+        """
+        Initialize graph with ALL nodes (train + test) but only training edges.
+        This allows us to use PIDs directly as graph node indices.
+        """
+        if not self.preprocessed_dir:
+            raise ValueError("preprocessed_dir must be set to use graph builder")
+
+        print("\nInitializing graph with all nodes and training edges...")
+        builder = HomogeneousGraphBuilder(self.preprocessed_dir)
+
+        # Build graph with training edges to get the structure
+        training_graph = builder.build_graph(
+            train_cutoff_year=self.train_cutoff_year,
+            include_only_citing=(self.mode == "citation_pairs"),
+        )
+
+        # Get text embeddings for ALL citation-involved paragraphs from builder
+        # We need embeddings for all paragraphs that evaluator has after filtering
+        assert self.celex_number_to_pid is not None
         assert self.paragraph_set is not None
+        assert self.pid_to_text is not None
+
+        num_pids = len(self.pid_to_text)
+        embedding_dim = training_graph.x.shape[1]
+
+        # Load text embeddings for all paragraphs from builder
+        # Create embeddings array indexed by evaluator PIDs
+        all_embeddings = np.zeros((num_pids, embedding_dim), dtype=np.float32)
+
+        # Map builder's paragraph indices to evaluator PIDs and copy embeddings
+        for builder_idx, meta in enumerate(builder.par_metadata):
+            celex = meta["celex"]
+            par_num = meta["paragraph_number"]
+            key = (celex, par_num)
+            if key in self.celex_number_to_pid:
+                eval_pid = self.celex_number_to_pid[key]
+                all_embeddings[eval_pid] = builder.par_embeddings[builder_idx]
+
+        self.text_embeddings = torch.tensor(all_embeddings, dtype=torch.float32)
+
+        # Create graph with all nodes but only training edges
+        # Get training edge indices and map them to evaluator PIDs
+        train_edges = []
+        training_pids = set(
+            int(pid) for pid in np.where(self.paragraph_set == "train")[0]
+        )
+
+        # Build edges from qrel for training paragraphs only
         assert self.qrel is not None
+        for src_pid in training_pids:
+            if src_pid in self.qrel:
+                for tgt_pid in self.qrel[src_pid]:
+                    if tgt_pid in training_pids:
+                        # Bidirectional edges
+                        train_edges.append([src_pid, tgt_pid])
+                        train_edges.append([tgt_pid, src_pid])
 
-        print("\nInitializing graph with training data...")
-
-        # Get training paragraph IDs
-        train_mask = self.paragraph_set == "train"
-        train_pids = np.where(train_mask)[0]
-        train_pids_set = set(train_pids.tolist())
-
-        # Try to load cached embeddings
-        cached_embeddings = self._load_cached_embeddings()
-
-        if cached_embeddings is not None and len(cached_embeddings) == len(
-            self.pid_to_text
-        ):
-            print(f"Using cached embeddings (shape: {cached_embeddings.shape})")
-            all_text_embeddings = cached_embeddings
-        else:
-            if cached_embeddings is not None:
-                print(
-                    f"Cache size mismatch: {len(cached_embeddings)} vs {len(self.pid_to_text)}"
-                )
-
-            # Encode all texts first (including test, so we can add them incrementally)
-            print("Encoding all paragraph texts...")
-            all_text_embeddings = self.text_encoder.encode(
-                self.pid_to_text.tolist(),
-                batch_size=32,
-                show_progress_bar=True,
-                convert_to_numpy=True,
-            )
-            print("Encoded all paragraph texts")
-
-            # Save to cache
-            self._save_cached_embeddings(all_text_embeddings)
-
-        self.text_embeddings = torch.tensor(all_text_embeddings, dtype=torch.float32)
-
-        # Build initial graph with training data only
-        # Use qrel to build citation edges
-        train_edge_list = []
-        for src_pid, cited_pids in self.qrel.items():
-            if src_pid in train_pids_set:
-                for tgt_pid in cited_pids:
-                    # Only include edges where both nodes are in training set
-                    if tgt_pid in train_pids_set:
-                        # Edge direction: tgt -> src (citation direction)
-                        train_edge_list.append([tgt_pid, src_pid])
-
-        if train_edge_list:
-            edge_index = (
-                torch.tensor(train_edge_list, dtype=torch.long).t().contiguous()
-            )
-            # Make undirected for GNN message passing
-            edge_index = to_undirected(edge_index, num_nodes=len(self.pid_to_text))
+        # Create graph data
+        if train_edges:
+            edge_index = torch.tensor(train_edges, dtype=torch.long).t().contiguous()
+            # Remove duplicate edges
+            edge_index = torch.unique(edge_index, dim=1)
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
 
-        print(f"Initial graph: {len(train_pids)} nodes, {edge_index.shape[1]} edges")
-
-        # Create graph data
         self.graph_data = Data(
             x=self.text_embeddings,
             edge_index=edge_index,
-            num_nodes=len(self.pid_to_text),
+            num_nodes=num_pids,
         )
 
-        # Mark training nodes as being in graph
-        self.nodes_in_graph = train_pids_set
+        # Track which PIDs have edges (training paragraphs)
+        self.nodes_in_graph = training_pids
 
-        # Compute initial embeddings
+        # PIDs == graph node indices, so mappings are identity
+        self.pid_to_node_idx = {pid: pid for pid in range(num_pids)}
+        self.node_idx_to_pid = {pid: pid for pid in range(num_pids)}
+
+        print(
+            f"Initialized graph: {num_pids} nodes total, "
+            f"{len(training_pids)} training nodes, "
+            f"{edge_index.shape[1]} edges"
+        )
+
+        # Compute initial GNN embeddings
         self._compute_gnn_embeddings()
 
     def _compute_gnn_embeddings(self) -> None:
@@ -419,6 +400,7 @@ class IncrementalGNNEvaluator:
             if self.normalize_embeddings:
                 embeddings = F.normalize(embeddings, p=2, dim=1)
 
+            # Since PIDs == graph node indices, embeddings are already PID-indexed
             self.current_embeddings = embeddings.cpu()
 
     def _update_k_egonet(self, node_id: int) -> None:
@@ -519,39 +501,42 @@ class IncrementalGNNEvaluator:
     ) -> dict | None:
         """
         Retrieve candidates for a query and compute metrics.
-        Uses query text from queries file if available, otherwise falls back to paragraph text.
+        Encodes query using its GNN embedding with masked citation edges (similar to trainer).
         """
         assert self.current_embeddings is not None
-        assert self.pid_to_text is not None
-        assert self.query_pids is not None
-        assert self.query_texts is not None
+        assert self.graph_data is not None
         assert self.qrel is not None
 
-        # Get query text - use modified query text if available
-        if query_pid in self.query_pids:
-            query_idx = self.query_pids.index(query_pid)
-            query_text = self.query_texts[query_idx]
-        else:
-            # Fallback to original paragraph text
-            query_text = self.pid_to_text[query_pid]
-
-        # Get query embedding
+        # Get query embedding from graph with masked citation edges
+        # Mask edges FROM query_pid to its citations to prevent information leakage
         with torch.no_grad():
-            query_text_emb = self.text_encoder.encode(
-                [query_text],
-                batch_size=1,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-            )
-            query_tensor = torch.from_numpy(query_text_emb).float().to(self.device)
-            # Use gnn_model to encode query
-            encode_fn = getattr(self.gnn_model, "encode_query")
-            query_emb = encode_fn(query_tensor)
+            edge_index = self.graph_data.edge_index
+
+            # Mask edges where source is query_pid and destination is a cited paragraph
+            if query_pid in self.qrel:
+                cited_pids = set(self.qrel[query_pid])
+                src, dst = edge_index
+                # Keep edges where: source is NOT query OR destination is NOT cited
+                edge_mask = (src != query_pid) | ~torch.tensor(
+                    [dst_node.item() in cited_pids for dst_node in dst],
+                    dtype=torch.bool,
+                    device=edge_index.device,
+                )
+                masked_edge_index = edge_index[:, edge_mask]
+            else:
+                # No citations to mask
+                masked_edge_index = edge_index
+
+            # Get GNN embedding for query with masked edges
+            x = self.graph_data.x.to(self.device)
+            masked_edge_index = masked_edge_index.to(self.device)
+
+            embeddings = self.gnn_model(x, masked_edge_index)
 
             if self.normalize_embeddings:
-                query_emb = F.normalize(query_emb, p=2, dim=1)
+                embeddings = F.normalize(embeddings, p=2, dim=1)
 
-            query_emb = query_emb.cpu().numpy()[0]
+            query_emb = embeddings[query_pid].cpu().numpy()
 
         # Get candidate embeddings
         candidate_embs = self.current_embeddings[candidate_pids].numpy()
@@ -629,7 +614,7 @@ class IncrementalGNNEvaluator:
         all_ap_scores: list[float] = []
         all_recall_scores: dict[int, list[float]] = {k: [] for k in k_values}
 
-        for test_pid in tqdm(test_pids, desc="Incremental evaluation"):
+        for test_pid in tqdm(test_query_pids_set, desc="Incremental evaluation"):
             test_date = self.paragraph_dates[test_pid]
 
             # Candidate pool: all paragraphs strictly before this one (already in graph)
@@ -642,25 +627,16 @@ class IncrementalGNNEvaluator:
                 dtype=np.int64,
             )
 
-            # Only evaluate if this is a query paragraph and has citations
-            should_evaluate = (
-                test_pid in test_query_pids_set
-                and len(candidate_pids) > 0
-                and test_pid in self.qrel
-                and len(self.qrel[test_pid]) > 0
+            # Retrieve and evaluate
+            result = self._retrieve_and_evaluate(
+                int(test_pid), candidate_pids, k_values
             )
 
-            if should_evaluate:
-                # Retrieve and evaluate
-                result = self._retrieve_and_evaluate(
-                    int(test_pid), candidate_pids, k_values
-                )
-
-                if result is not None:
-                    all_ap_scores.append(result["ap"])
-                    for k in k_values:
-                        all_recall_scores[k].append(result["recall"][k])
-                    self.query_results.append(result)
+            if result is not None:
+                all_ap_scores.append(result["ap"])
+                for k in k_values:
+                    all_recall_scores[k].append(result["recall"][k])
+                self.query_results.append(result)
 
             # Add node to graph for future queries (all test paragraphs are added)
             self._add_node_to_graph(int(test_pid))
@@ -734,11 +710,11 @@ if __name__ == "__main__":
     # Run incremental evaluation
     evaluator = IncrementalGNNEvaluator(
         gnn_model=model,
-        text_encoder_name=encoding_model,
-        judgments_path="data/judgments_cleaned.json",
+        preprocessed_dir="data/preprocessed",
         queries_path="data/evaluation/queries_cleaned_masked.tsv",
         qrel_path="data/evaluation/qrel.txt",
-        csv_path="data/par-to-par-cleaned.csv",
+        text_encoder_name=encoding_model,
+        mode="citation_pairs",
         train_cutoff_year=2018,
         k_hops=2,
         top_k=10000,
