@@ -1,13 +1,12 @@
 import json
 import os
-import re
+import csv
 from datetime import datetime as dt
 from collections import defaultdict
-from typing import Literal
+from typing import Literal, Any
 
 import numpy as np
 from numpy.typing import NDArray
-import pandas as pd  # type: ignore
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,10 +37,11 @@ class IncrementalGNNEvaluator:
         self,
         gnn_model: nn.Module,
         text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        mode: EvaluatorMode = "all_paragraphs",
-        csv_path: str = "data/par-to-par-cleaned.csv",
-        metadata_path: str = "data/par-to-par.json",
+        mode: EvaluatorMode = "citation_pairs",
         judgments_path: str = "data/judgments_cleaned.json",
+        queries_path: str = "data/evaluation/queries.tsv",
+        qrel_path: str = "data/evaluation/qrel.txt",
+        csv_path: str = "data/par-to-par-cleaned.csv",
         train_cutoff_year: int = 2018,
         k_hops: int = 2,
         top_k: int | None = None,
@@ -52,9 +52,10 @@ class IncrementalGNNEvaluator:
         self.gnn_model = gnn_model
         self.text_encoder_name = text_encoder_name
         self.mode: EvaluatorMode = mode
-        self.csv_path = csv_path
-        self.metadata_path = metadata_path
         self.judgments_path = judgments_path
+        self.queries_path = queries_path
+        self.qrel_path = qrel_path
+        self.csv_path = csv_path
         self.train_cutoff_year = train_cutoff_year
         self.k_hops = k_hops
         self.top_k = top_k
@@ -83,15 +84,17 @@ class IncrementalGNNEvaluator:
         print(f"Loading text encoder: {text_encoder_name}")
         self.text_encoder = SentenceTransformer(text_encoder_name)
 
-        # Data structures
-        self.paragraphs: list[dict] = []
+        # Data structures (populated by load_and_prepare)
         self.pid_to_text: NDArray[np.object_] | None = None
-        self.celex_number_to_pid: dict[tuple[str, int], int] = {}
+        self.celex_number_to_pid: dict[tuple[str, int], int] | None = None
         self.paragraph_dates: NDArray | None = None
+        self.paragraph_celex: NDArray[np.object_] | None = None
+        self.paragraph_number: NDArray[np.object_] | None = None
         self.paragraph_set: NDArray[np.object_] | None = None
 
-        # Citation graph (ground truth)
-        self.cited_by_pid: dict[int, list[int]] = {}
+        self.query_pids: list[int] | None = None
+        self.query_texts: NDArray[np.object_] | None = None
+        self.qrel: dict[int, list[int]] | None = None
 
         # Graph state (evolves during evaluation)
         self.graph_data: Data | None = None
@@ -146,84 +149,26 @@ class IncrementalGNNEvaluator:
             print(f"Failed to save embeddings to cache: {e}")
 
     def load_and_prepare(self) -> None:
-        """Load paragraphs and citation data based on mode."""
+        """Load all data and prepare for evaluation."""
+        # Load all paragraphs from judgments.json
+        self._load_paragraphs()
+
+        # Load queries and qrel
+        self._load_queries_and_qrel()
+
+        # Filter paragraphs for citation_pairs mode
         if self.mode == "citation_pairs":
-            self._load_citation_pairs_mode()
-        else:
-            self._load_all_paragraphs_mode()
+            self._filter_to_citation_paragraphs()
 
-    def _load_citation_pairs_mode(self) -> None:
-        """Load data in citation pairs mode (using par-to-par CSV only)"""
-        from data_loader import (
-            load_citation_data,
-            split_train_test,
-            build_paragraph_index,
-        )
-
-        print("Loading citation pairs data...")
-        df = pd.read_csv(self.csv_path).dropna()
-
-        with open(self.metadata_path) as f:
-            metadata = json.load(f)
-
-        train_meta, test_meta = split_train_test(metadata, self.train_cutoff_year)
-
-        (
-            pid_to_text,
-            celex_number_to_pid,
-            paragraph_dates,
-            paragraph_celex,
-            paragraph_number,
-            paragraph_set,
-        ) = build_paragraph_index(df, train_meta, test_meta)
-
-        # Build paragraphs list for consistency
-        paragraphs = []
-        for pid in range(len(pid_to_text)):
-            celex = paragraph_celex[pid]
-            number = paragraph_number[pid]
-            paragraphs.append(
-                {
-                    "text": pid_to_text[pid],
-                    "celex": celex,
-                    "date": paragraph_dates[pid].astype("O"),
-                    "number": int(number),
-                    "set_type": paragraph_set[pid],
-                }
-            )
-
-        # Sort by date for chronological processing
-        paragraphs.sort(key=lambda p: (p["date"], p["celex"], p["number"]))
-
-        # Rebuild arrays in sorted order
-        self.paragraphs = paragraphs
-        self.pid_to_text = np.array([p["text"] for p in paragraphs], dtype=object)
-        self.celex_number_to_pid = {
-            (p["celex"], p["number"]): pid for pid, p in enumerate(paragraphs)
-        }
-        self.paragraph_dates = np.array(
-            [p["date"] for p in paragraphs], dtype="datetime64[ns]"
-        )
-        self.paragraph_set = np.array([p["set_type"] for p in paragraphs], dtype=object)
-
-        print(f"Total paragraphs: {len(self.pid_to_text)}")
-        print(f"Train: {np.sum(self.paragraph_set == 'train')}")
-        print(f"Test: {np.sum(self.paragraph_set == 'test')}")
-
-        # Build citation graph
-        self._build_citation_graph(df)
-
-    def _load_all_paragraphs_mode(self) -> None:
-        """Load data in all paragraphs mode (using judgments_cleaned.json)"""
+    def _load_paragraphs(self) -> None:
+        """Load all paragraphs from judgments.json."""
         print("Loading judgments...")
         with open(self.judgments_path) as f:
             judgments = json.load(f)
 
-        # Build paragraph index from all judgments
         paragraphs = []
         for celex, judgment in tqdm(judgments.items(), desc="Processing judgments"):
-
-            # Get date from meta (nested structure)
+            # Get date from meta
             meta = judgment.get("meta", {}).get("meta", {})
             date_str = meta.get("date")
 
@@ -246,11 +191,10 @@ class IncrementalGNNEvaluator:
                     }
                 )
 
-        # Sort paragraphs by date to enable chronological processing
+        # Sort paragraphs by date for chronological processing
         paragraphs.sort(key=lambda p: (p["date"], p["celex"], p["number"]))
 
         # Build arrays
-        self.paragraphs = paragraphs
         self.pid_to_text = np.array([p["text"] for p in paragraphs], dtype=object)
         self.celex_number_to_pid = {
             (p["celex"], p["number"]): pid for pid, p in enumerate(paragraphs)
@@ -258,60 +202,137 @@ class IncrementalGNNEvaluator:
         self.paragraph_dates = np.array(
             [p["date"] for p in paragraphs], dtype="datetime64[ns]"
         )
+        self.paragraph_celex = np.array([p["celex"] for p in paragraphs], dtype=object)
+        self.paragraph_number = np.array(
+            [p["number"] for p in paragraphs], dtype=object
+        )
         self.paragraph_set = np.array([p["set_type"] for p in paragraphs], dtype=object)
 
-        print(f"Total paragraphs: {len(self.pid_to_text)}")
-        print(f"Train: {np.sum(self.paragraph_set == 'train')}")
-        print(f"Test: {np.sum(self.paragraph_set == 'test')}")
+    def _load_queries_and_qrel(self) -> None:
+        """Load queries and qrel files."""
+        assert self.celex_number_to_pid is not None
 
-        # Load citation pairs for ground truth
-        print("Loading citation pairs for ground truth...")
-        df = pd.read_csv(self.csv_path).dropna()
-        self._build_citation_graph(df)
+        print("Loading queries...")
+        query_data = []
+        with open(self.queries_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter="\t")
+            next(reader)  # Skip header
+            for celex, par_num, query_text in reader:
+                key = (celex, int(par_num))
+                if key in self.celex_number_to_pid:
+                    query_data.append((self.celex_number_to_pid[key], query_text))
 
-    def _build_citation_graph(self, df: pd.DataFrame) -> None:
-        """Build citation graph from par-to-par CSV."""
-        cited_by_pid = defaultdict(set)
-        skipped = 0
+        self.query_pids = [pid for pid, _ in query_data]
+        self.query_texts = np.array([text for _, text in query_data], dtype=object)
 
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Building citations"):
-            celex_from = row["CELEX_FROM"]
-            number_from = row["NUMBER_FROM"]
-            celex_to = row["CELEX_TO"]
-            number_to = row["NUMBER_TO"]
+        print("Loading qrel...")
+        self.qrel = defaultdict(list)
+        with open(self.qrel_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                query_id = parts[0]
+                doc_id = parts[2]
 
-            src_key = (str(celex_from), int(number_from))
-            tgt_key = (str(celex_to), int(number_to))
+                # Parse celex_paragraph_number format
+                celex_q, par_num_q = query_id.rsplit("_", 1)
+                celex_d, par_num_d = doc_id.rsplit("_", 1)
 
-            if (
-                src_key not in self.celex_number_to_pid
-                or tgt_key not in self.celex_number_to_pid
-            ):
-                skipped += 1
-                continue
+                query_key = (celex_q, int(par_num_q))
+                doc_key = (celex_d, int(par_num_d))
 
-            src_pid = self.celex_number_to_pid[src_key]
-            tgt_pid = self.celex_number_to_pid[tgt_key]
-            cited_by_pid[src_pid].add(tgt_pid)
+                if (
+                    query_key in self.celex_number_to_pid
+                    and doc_key in self.celex_number_to_pid
+                ):
+                    query_pid = self.celex_number_to_pid[query_key]
+                    doc_pid = self.celex_number_to_pid[doc_key]
+                    self.qrel[query_pid].append(doc_pid)
 
-        if skipped > 0:
-            print(
-                f"Skipped {skipped}/{len(df)} citation pairs (paragraphs not in index)"
-            )
+        print(
+            f"Loaded {len(self.query_pids)} queries with {sum(len(v) for v in self.qrel.values())} qrel entries"
+        )
 
-        # Convert to sorted lists for determinism
-        self.cited_by_pid = {k: sorted(v) for k, v in cited_by_pid.items()}
+    def _filter_to_citation_paragraphs(self) -> None:
+        """Filter paragraphs to only those involved in citations for citation_pairs mode."""
+        assert self.qrel is not None
+        assert self.pid_to_text is not None
+        assert self.celex_number_to_pid is not None
+        assert self.paragraph_dates is not None
+        assert self.paragraph_celex is not None
+        assert self.paragraph_number is not None
+        assert self.paragraph_set is not None
+        assert self.query_pids is not None
+        assert self.query_texts is not None
+
+        print("Filtering to citation-involved paragraphs...")
+
+        # Collect all paragraphs involved in any citation
+        citation_involved_pids: set[int] = set()
+        for query_pid, cited_pids in self.qrel.items():
+            citation_involved_pids.add(query_pid)
+            citation_involved_pids.update(cited_pids)
+
+        # Create sorted list of citation-involved pids
+        old_pids = sorted(citation_involved_pids)
+
+        # Create mapping from old pid to new pid
+        old_to_new_pid = {old_pid: new_pid for new_pid, old_pid in enumerate(old_pids)}
+
+        # Filter all arrays to only citation-involved paragraphs
+        self.pid_to_text = self.pid_to_text[old_pids]
+        self.paragraph_dates = self.paragraph_dates[old_pids]
+        self.paragraph_celex = self.paragraph_celex[old_pids]
+        self.paragraph_number = self.paragraph_number[old_pids]
+        self.paragraph_set = self.paragraph_set[old_pids]
+
+        # Update celex_number_to_pid mapping
+        new_celex_number_to_pid = {}
+        for (celex, number), old_pid in self.celex_number_to_pid.items():
+            if old_pid in old_to_new_pid:
+                new_celex_number_to_pid[(celex, number)] = old_to_new_pid[old_pid]
+        self.celex_number_to_pid = new_celex_number_to_pid
+
+        # Update query_pids and query_texts
+        new_query_pids = []
+        new_query_texts = []
+        old_query_texts = self.query_texts
+        for idx, old_pid in enumerate(self.query_pids):
+            if old_pid in old_to_new_pid:
+                new_query_pids.append(old_to_new_pid[old_pid])
+                new_query_texts.append(old_query_texts[idx])
+        self.query_pids = new_query_pids
+        self.query_texts = np.array(new_query_texts, dtype=object)
+
+        # Update qrel
+        new_qrel: dict[int, list[int]] = {}
+        for old_query_pid, old_cited_pids in self.qrel.items():
+            if old_query_pid in old_to_new_pid:
+                new_query_pid = old_to_new_pid[old_query_pid]
+                new_cited_pids = [
+                    old_to_new_pid[old_cited_pid]
+                    for old_cited_pid in old_cited_pids
+                    if old_cited_pid in old_to_new_pid
+                ]
+                if new_cited_pids:
+                    new_qrel[new_query_pid] = new_cited_pids
+        self.qrel = new_qrel
+
+        print(
+            f"Filtered from {len(citation_involved_pids)} to {len(old_pids)} citation-involved paragraphs"
+        )
 
     def initialize_graph_with_training_data(self) -> None:
         """Initialize graph with all training paragraphs."""
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
+        assert self.qrel is not None
 
         print("\nInitializing graph with training data...")
 
         # Get training paragraph IDs
         train_mask = self.paragraph_set == "train"
         train_pids = np.where(train_mask)[0]
+        train_pids_set = set(train_pids.tolist())
 
         # Try to load cached embeddings
         cached_embeddings = self._load_cached_embeddings()
@@ -343,12 +364,13 @@ class IncrementalGNNEvaluator:
         self.text_embeddings = torch.tensor(all_text_embeddings, dtype=torch.float32)
 
         # Build initial graph with training data only
+        # Use qrel to build citation edges
         train_edge_list = []
-        for src_pid in train_pids:
-            if src_pid in self.cited_by_pid:
-                for tgt_pid in self.cited_by_pid[src_pid]:
+        for src_pid, cited_pids in self.qrel.items():
+            if src_pid in train_pids_set:
+                for tgt_pid in cited_pids:
                     # Only include edges where both nodes are in training set
-                    if tgt_pid in train_pids:
+                    if tgt_pid in train_pids_set:
                         # Edge direction: tgt -> src (citation direction)
                         train_edge_list.append([tgt_pid, src_pid])
 
@@ -371,7 +393,7 @@ class IncrementalGNNEvaluator:
         )
 
         # Mark training nodes as being in graph
-        self.nodes_in_graph = set(train_pids.tolist())
+        self.nodes_in_graph = train_pids_set
 
         # Compute initial embeddings
         self._compute_gnn_embeddings()
@@ -454,6 +476,7 @@ class IncrementalGNNEvaluator:
         Add a node to the graph and update its k-hop neighborhood embeddings.
         """
         assert self.graph_data is not None
+        assert self.qrel is not None
 
         if node_id in self.nodes_in_graph:
             return  # Already in graph
@@ -461,17 +484,17 @@ class IncrementalGNNEvaluator:
         # Add edges for this node (citations from/to nodes already in graph)
         new_edges = []
 
-        # Add citations FROM this node to older nodes
-        if node_id in self.cited_by_pid:
-            for tgt_pid in self.cited_by_pid[node_id]:
+        # Add citations FROM this node to older nodes (node_id cites older nodes)
+        if node_id in self.qrel:
+            for tgt_pid in self.qrel[node_id]:
                 if tgt_pid in self.nodes_in_graph:
-                    # Citation edge: tgt -> src
+                    # Citation edge: tgt -> node_id (tgt is cited by node_id)
                     new_edges.append([tgt_pid, node_id])
 
-        # Add citations TO this node from older nodes
+        # Add citations TO this node from older nodes (older nodes cite node_id)
         for src_pid in self.nodes_in_graph:
-            if src_pid in self.cited_by_pid and node_id in self.cited_by_pid[src_pid]:
-                # Citation edge: node_id -> src_pid (src_pid cites node_id)
+            if src_pid in self.qrel and node_id in self.qrel[src_pid]:
+                # Citation edge: node_id -> src_pid (node_id is cited by src_pid)
                 new_edges.append([node_id, src_pid])
 
         if new_edges:
@@ -496,12 +519,23 @@ class IncrementalGNNEvaluator:
     ) -> dict | None:
         """
         Retrieve candidates for a query and compute metrics.
+        Uses query text from queries file if available, otherwise falls back to paragraph text.
         """
         assert self.current_embeddings is not None
         assert self.pid_to_text is not None
+        assert self.query_pids is not None
+        assert self.query_texts is not None
+        assert self.qrel is not None
 
-        # Get query embedding (use query encoder)
-        query_text = self.pid_to_text[query_pid]
+        # Get query text - use modified query text if available
+        if query_pid in self.query_pids:
+            query_idx = self.query_pids.index(query_pid)
+            query_text = self.query_texts[query_idx]
+        else:
+            # Fallback to original paragraph text
+            query_text = self.pid_to_text[query_pid]
+
+        # Get query embedding
         with torch.no_grad():
             query_text_emb = self.text_encoder.encode(
                 [query_text],
@@ -509,10 +543,10 @@ class IncrementalGNNEvaluator:
                 show_progress_bar=False,
                 convert_to_numpy=True,
             )
-            query_tensor = torch.tensor(  # type: ignore[call-overload]
-                query_text_emb, dtype=torch.float32, device=self.device
-            )
-            query_emb = self.gnn_model.encode_query(query_tensor)  # type: ignore[misc]
+            query_tensor = torch.from_numpy(query_text_emb).float().to(self.device)
+            # Use gnn_model to encode query
+            encode_fn = getattr(self.gnn_model, "encode_query")
+            query_emb = encode_fn(query_tensor)
 
             if self.normalize_embeddings:
                 query_emb = F.normalize(query_emb, p=2, dim=1)
@@ -534,8 +568,8 @@ class IncrementalGNNEvaluator:
             ranked_order = np.argsort(-similarities)
             ranked_pids = candidate_pids[ranked_order]
 
-        # Get ground truth relevant documents
-        relevant_pids = np.array(self.cited_by_pid.get(query_pid, []), dtype=np.int64)
+        # Get ground truth relevant documents from qrel
+        relevant_pids = np.array(self.qrel.get(query_pid, []), dtype=np.int64)
 
         # Filter to only candidates that are actually relevant
         relevant_mask = np.isin(relevant_pids, candidate_pids)
@@ -569,15 +603,27 @@ class IncrementalGNNEvaluator:
     ) -> dict[str, float]:
         """
         Run incremental evaluation on test paragraphs in chronological order.
+        Only evaluates on paragraphs that are in query_pids (have queries).
+        All paragraphs (including query ones) are added to the graph.
         """
         assert self.paragraph_set is not None
         assert self.paragraph_dates is not None
+        assert self.query_pids is not None
+        assert self.qrel is not None
 
         # Get test paragraphs sorted by date (already sorted in load_and_prepare)
         test_mask = self.paragraph_set == "test"
         test_pids = np.where(test_mask)[0]
 
-        print(f"\nEvaluating on {len(test_pids)} test paragraphs incrementally...")
+        # Get test query pids (subset of test paragraphs that have queries)
+        test_query_pids_set = set(
+            pid for pid in self.query_pids if self.paragraph_set[pid] == "test"
+        )
+
+        print(
+            f"\nEvaluating on {len(test_pids)} test paragraphs "
+            f"({len(test_query_pids_set)} with queries) incrementally..."
+        )
 
         # Track metrics
         all_ap_scores: list[float] = []
@@ -596,32 +642,27 @@ class IncrementalGNNEvaluator:
                 dtype=np.int64,
             )
 
-            if len(candidate_pids) == 0:
-                # Add to graph and continue
-                self._add_node_to_graph(int(test_pid))
-                continue
-
-            # Only evaluate if there are citations to measure
-            if (
-                test_pid not in self.cited_by_pid
-                or len(self.cited_by_pid[test_pid]) == 0
-            ):
-                # Add to graph and continue
-                self._add_node_to_graph(int(test_pid))
-                continue
-
-            # Retrieve and evaluate
-            result = self._retrieve_and_evaluate(
-                int(test_pid), candidate_pids, k_values
+            # Only evaluate if this is a query paragraph and has citations
+            should_evaluate = (
+                test_pid in test_query_pids_set
+                and len(candidate_pids) > 0
+                and test_pid in self.qrel
+                and len(self.qrel[test_pid]) > 0
             )
 
-            if result is not None:
-                all_ap_scores.append(result["ap"])
-                for k in k_values:
-                    all_recall_scores[k].append(result["recall"][k])
-                self.query_results.append(result)
+            if should_evaluate:
+                # Retrieve and evaluate
+                result = self._retrieve_and_evaluate(
+                    int(test_pid), candidate_pids, k_values
+                )
 
-            # Add node to graph for future queries
+                if result is not None:
+                    all_ap_scores.append(result["ap"])
+                    for k in k_values:
+                        all_recall_scores[k].append(result["recall"][k])
+                    self.query_results.append(result)
+
+            # Add node to graph for future queries (all test paragraphs are added)
             self._add_node_to_graph(int(test_pid))
 
         # Compute final metrics
@@ -645,7 +686,18 @@ class IncrementalGNNEvaluator:
     def run(self) -> dict[str, float]:
         """Run full incremental evaluation pipeline."""
         print(f"Mode: {self.mode}")
+        print("Loading and preparing data...")
         self.load_and_prepare()
+
+        assert self.pid_to_text is not None
+        assert self.paragraph_set is not None
+        assert self.query_pids is not None
+
+        print(f"Unique paragraphs: {len(self.pid_to_text)}")
+        print(f"Train paragraphs: {np.sum(self.paragraph_set == 'train')}")
+        print(f"Test paragraphs: {np.sum(self.paragraph_set == 'test')}")
+        print(f"Total queries: {len(self.query_pids)}")
+
         self.initialize_graph_with_training_data()
         metrics = self.evaluate_incremental()
 
@@ -655,13 +707,11 @@ class IncrementalGNNEvaluator:
 
         metric_name = f"MAP@{self.top_k}" if self.top_k else "MAP"
         map_score = metrics.get(f"map@{self.top_k}" if self.top_k else "map", 0.0)
-        print(f"{metric_name}: {map_score:.4f}")
+        print(f"\n{metric_name}: {map_score:.3f}")
 
         for k in [5, 10, 100]:
             if f"recall@{k}" in metrics:
-                print(f"Recall@{k}: {metrics[f'recall@{k}']:.4f}")
-
-        print(f"\nTotal queries evaluated: {len(self.query_results)}")
+                print(f"Recall@{k}: {metrics[f'recall@{k}']:.3f}")
 
         return metrics
 
@@ -677,7 +727,7 @@ if __name__ == "__main__":
     in_channels = text_encoder.get_sentence_embedding_dimension()
 
     model = CitationGNN(
-        in_channels, hidden_dim=512, output_dim=in_channels, num_layers=3
+        in_channels, hidden_dim=512, output_dim=in_channels, num_layers=2
     )
     model.load_state_dict(torch.load("checkpoints/gnn/best_model.pt"))
 
@@ -685,8 +735,10 @@ if __name__ == "__main__":
     evaluator = IncrementalGNNEvaluator(
         gnn_model=model,
         text_encoder_name=encoding_model,
-        csv_path="data/par-to-par-cleaned.csv",
         judgments_path="data/judgments_cleaned.json",
+        queries_path="data/evaluation/queries_cleaned_masked.tsv",
+        qrel_path="data/evaluation/qrel.txt",
+        csv_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
         k_hops=2,
         top_k=10000,

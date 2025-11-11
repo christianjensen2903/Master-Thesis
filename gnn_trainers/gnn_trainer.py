@@ -388,7 +388,6 @@ class GNNTrainer:
             from_id = str(row["FROM_ID"])
             to_id = str(row["TO_ID"])
 
-            docs[from_id] = text_from
             docs[to_id] = text_to
 
         # Build queries and relevant docs from validation data
