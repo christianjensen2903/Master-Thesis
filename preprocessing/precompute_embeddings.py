@@ -10,7 +10,7 @@ import pickle
 from pathlib import Path
 from typing import Any
 from datetime import datetime
-
+import pandas as pd  # type: ignore
 import numpy as np
 from sentence_transformers import SentenceTransformer  # type: ignore
 from tqdm import tqdm  # type: ignore
@@ -48,7 +48,7 @@ class EmbeddingPreprocessor:
         # Collect all paragraphs with metadata
         paragraphs_data = []
         for celex, judgment in tqdm(judgments.items(), desc="Processing judgments"):
-            meta = judgment.get("meta", {}).get("meta", {})
+            meta = judgment.get("meta", {})
             date_str = meta.get("date")
 
             # Parse date
@@ -196,6 +196,7 @@ class EmbeddingPreprocessor:
 
     def process_citations(
         self,
+        judgments_path: str,
         par_to_par_path: str,
         output_dir: str,
     ) -> None:
@@ -206,23 +207,41 @@ class EmbeddingPreprocessor:
         - citations.pkl: List of (source_id, target_id) citation edges
         """
         print("Loading citation data...")
-        with open(par_to_par_path) as f:
-            citations_data = json.load(f)
+        with open(judgments_path) as f:
+            judgments = json.load(f)
+
+        df = pd.read_csv(par_to_par_path)
 
         # Extract citation edges
         citations = []
-        for celex, data in tqdm(citations_data.items(), desc="Processing citations"):
-            for citation in data.get("citations", []):
-                src_num = citation.get("paragraph_from")
-                tgt_celex = citation.get("celex_to")
-                tgt_num = citation.get("paragraph_to")
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing citations"):
+            source_id = f"par:{row['CELEX_FROM']}:{row['NUMBER_FROM']}"
+            target_id = f"par:{row['CELEX_TO']}:{row['NUMBER_TO']}"
+            citations.append((source_id, target_id))
 
-                if src_num is not None and tgt_celex and tgt_num is not None:
-                    source_id = f"par:{celex}:{src_num}"
-                    target_id = f"par:{tgt_celex}:{tgt_num}"
-                    citations.append((source_id, target_id))
+        print(f"Found {len(citations)} paragraph-to-paragraph citation edges")
 
-        print(f"Found {len(citations)} citation edges")
+        # Extract paragraph-to-article citation edges
+        article_citations = []
+        for celex_from, judgment in tqdm(
+            judgments.items(), total=len(judgments), desc="Processing article citations"
+        ):
+            meta = judgment.get("meta", {})
+            for reference in meta.get("references", []):
+                if reference.get("unit") != "paragraphs":
+                    continue
+
+                if reference.get("cited_unit") != "articles":
+                    continue
+                for from_par in reference.get("from", []):
+                    source_id = f"par:{celex_from}:{from_par}"
+                    for to_art in reference.get("to", []):
+                        target_id = f"art:{reference.get('target')}:{to_art}"
+                        article_citations.append((source_id, target_id))
+
+        print(f"Found {len(article_citations)} paragraph-to-article citation edges")
+
+        citations.extend(article_citations)
 
         # Save citations
         output_path = Path(output_dir)
@@ -265,7 +284,7 @@ def main():
     parser.add_argument(
         "--citations",
         type=str,
-        default="data/par-to-par.json",
+        default="data/par-to-par-og.csv",
         help="Path to paragraph-to-paragraph citations JSON file",
     )
     parser.add_argument(
@@ -294,22 +313,22 @@ def main():
     )
 
     # Process paragraphs
-    print("\n" + "=" * 80)
-    print("PROCESSING PARAGRAPHS")
-    print("=" * 80)
-    preprocessor.process_judgments(args.judgments, args.output_dir)
+    # print("\n" + "=" * 80)
+    # print("PROCESSING PARAGRAPHS")
+    # print("=" * 80)
+    # preprocessor.process_judgments(args.judgments, args.output_dir)
 
-    # Process articles
-    print("\n" + "=" * 80)
-    print("PROCESSING ARTICLES")
-    print("=" * 80)
-    preprocessor.process_legal_acts(args.legal_acts, args.output_dir)
+    # # Process articles
+    # print("\n" + "=" * 80)
+    # print("PROCESSING ARTICLES")
+    # print("=" * 80)
+    # preprocessor.process_legal_acts(args.legal_acts, args.output_dir)
 
     # Process citations
     print("\n" + "=" * 80)
     print("PROCESSING CITATIONS")
     print("=" * 80)
-    preprocessor.process_citations(args.citations, args.output_dir)
+    preprocessor.process_citations(args.judgments, args.citations, args.output_dir)
 
     print("\n" + "=" * 80)
     print("✓ PREPROCESSING COMPLETE")
