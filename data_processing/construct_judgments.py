@@ -178,7 +178,7 @@ def construct_judgments_json(
     ):
         judgment_dir = Path(judgments_dir) / celex
 
-        celex_meta = metadata.get(celex, {})
+        celex_meta = metadata.get(celex, {}).get("meta", {})
 
         paragraphs = process_paragraphs(celex, judgment_dir, language_mapping)
 
