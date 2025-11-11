@@ -32,7 +32,7 @@ def build_paragraph_index_from_judgments(
 
     for celex, judgment in tqdm(judgments.items(), desc="Processing judgments"):
         # Get date from meta
-        meta = judgment.get("meta", {}).get("meta", {})
+        meta = judgment.get("meta", {})
         date_str = meta.get("date")
 
         try:

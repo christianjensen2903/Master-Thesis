@@ -137,7 +137,7 @@ class Evaluator:
             celex = match.group(1)
 
             # Get date from meta
-            meta = judgment.get("meta", {}).get("meta", {})
+            meta = judgment.get("meta", {})
             date_str = meta.get("date")
 
             try:
