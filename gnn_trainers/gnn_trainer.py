@@ -72,25 +72,25 @@ class GNNTrainer:
 
         for batch in tqdm(loader, desc="Training batches", leave=False):
             # Get batch data
-            x = batch.x
-            edge_index = batch.edge_index
             batch_size = batch.batch_size
+            edge_index = batch.edge_index
 
-            # Mask edges to prevent leakage: remove edges from anchors to neighbor nodes
-            # Keep edges where: (1) destination is anchor (can receive from neighbors), OR
-            #                   (2) source is neighbor (neighbors can talk to each other)
-            # This removes edges: anchor -> neighbor (which would leak anchor info to positives)
-            src, dst = edge_index
-            edge_mask = (dst < batch_size) | (src >= batch_size)
+            # Create combined feature matrix:
+            # - Anchor nodes (first batch_size nodes) use query embeddings (masked)
+            # - All other nodes (positives, neighbors) use document embeddings
+            x = batch.x
+            if hasattr(batch, "x_query"):
+                x[:batch_size] = batch.x_query[:batch_size]
+
+            # Mask edges to prevent leakage
+            src, tgt = edge_index
+            edge_mask = (src < batch_size) | (tgt < batch_size)
             masked_edge_index = edge_index[:, edge_mask]
 
             # Get embeddings for nodes in this batch with masked edges
             embeddings = model(x, masked_edge_index)
 
             anchor_emb = embeddings[:batch_size]
-
-            # Get positive samples from edges
-            src, dst = edge_index
 
             # Find edges where source is in the input batch
             input_mask = src < batch_size
@@ -99,12 +99,12 @@ class GNNTrainer:
                 continue
 
             batch_src = src[input_mask]
-            batch_dst = dst[input_mask]
+            batch_tgt = tgt[input_mask]
 
             # Sort edges by source for efficient grouping
             sorted_idx = torch.argsort(batch_src)
             src_sorted = batch_src[sorted_idx]
-            dst_sorted = batch_dst[sorted_idx]
+            tgt_sorted = batch_tgt[sorted_idx]
 
             # Find unique sources and their edge counts
             unique_src, counts = torch.unique_consecutive(
@@ -124,7 +124,7 @@ class GNNTrainer:
             positive_indices = torch.arange(
                 batch_size, device=self.device
             )  # Default to self
-            positive_indices[unique_src] = dst_sorted[selected_edges]
+            positive_indices[unique_src] = tgt_sorted[selected_edges]
 
             positive_emb = embeddings[positive_indices]
 
@@ -176,6 +176,7 @@ class GNNTrainer:
             input_nodes=None,  # Sample all nodes
             shuffle=True,
             time_attr="time",
+            subgraph_type="bidirectional",
         )
 
         print(f"\nStarting training for {self.epochs} epochs...")

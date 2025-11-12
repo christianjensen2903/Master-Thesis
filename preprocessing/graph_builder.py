@@ -29,10 +29,25 @@ class BaseGraphBuilder(ABC):
         """
         self.preprocessed_dir = Path(preprocessed_dir)
 
-        # Load paragraph data
-        self.par_embeddings = np.load(
-            self.preprocessed_dir / "paragraph_embeddings.npy"
-        )
+        # Load paragraph data (both document and query embeddings)
+        doc_emb_path = self.preprocessed_dir / "paragraph_embeddings_doc.npy"
+        query_emb_path = self.preprocessed_dir / "paragraph_embeddings_query.npy"
+        legacy_emb_path = self.preprocessed_dir / "paragraph_embeddings.npy"
+
+        if doc_emb_path.exists() and query_emb_path.exists():
+            self.par_embeddings_doc = np.load(doc_emb_path)
+            self.par_embeddings_query = np.load(query_emb_path)
+            print("Loaded separate document and query embeddings")
+        elif legacy_emb_path.exists():
+            # Fallback to legacy format (use same embeddings for both)
+            self.par_embeddings_doc = np.load(legacy_emb_path)
+            self.par_embeddings_query = self.par_embeddings_doc
+            print("Using legacy embeddings (same for doc and query)")
+        else:
+            raise FileNotFoundError(
+                f"Could not find paragraph embeddings in {self.preprocessed_dir}"
+            )
+
         with open(self.preprocessed_dir / "paragraph_metadata.pkl", "rb") as f:
             self.par_metadata = pickle.load(f)
 
@@ -155,7 +170,8 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         # Build node mappings
         node_id_to_idx: dict[str, int] = {}
         idx_to_metadata: dict[int, dict] = {}
-        embeddings_list = []
+        doc_embeddings_list = []
+        query_embeddings_list = []
         node_times = []
         node_ids = []
 
@@ -166,7 +182,8 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
             node_id_to_idx[node_id] = current_idx
             idx_to_metadata[current_idx] = meta
-            embeddings_list.append(self.par_embeddings[par_idx])
+            doc_embeddings_list.append(self.par_embeddings_doc[par_idx])
+            query_embeddings_list.append(self.par_embeddings_query[par_idx])
             node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
 
             # Add timestamp (convert date to Unix timestamp)
@@ -184,7 +201,8 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
                 edge_list.append([tgt_idx, src_idx])
 
         # Create PyTorch Geometric Data
-        x = torch.tensor(np.array(embeddings_list), dtype=torch.float32)
+        x_doc = torch.tensor(np.array(doc_embeddings_list), dtype=torch.float32)
+        x_query = torch.tensor(np.array(query_embeddings_list), dtype=torch.float32)
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -196,15 +214,16 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         node_ids_tensor = torch.stack(node_ids)
 
         graph_data = Data(
-            x=x,
+            x=x_doc,  # Default to document embeddings for backward compatibility
+            x_query=x_query,  # Query embeddings (for citing paragraphs)
             edge_index=edge_index,
-            num_nodes=len(embeddings_list),
+            num_nodes=len(doc_embeddings_list),
             time=node_times_tensor,  # For temporal sampling
             node_id_hash=node_ids_tensor,  # Hashed node IDs
         )
 
         print(
-            f"Built homogeneous graph: {len(embeddings_list)} nodes, {edge_index.shape[1]} edges"
+            f"Built homogeneous graph: {len(doc_embeddings_list)} nodes, {edge_index.shape[1]} edges"
         )
 
         return graph_data
@@ -247,7 +266,8 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         # Build paragraph nodes
         par_node_id_to_idx: dict[str, int] = {}
         par_idx_to_metadata: dict[int, dict] = {}
-        par_embeddings_list = []
+        par_doc_embeddings_list = []
+        par_query_embeddings_list = []
         par_times = []
         case_to_par_indices: dict[str, list[int]] = defaultdict(list)
 
@@ -258,7 +278,8 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
 
             par_node_id_to_idx[node_id] = current_idx
             par_idx_to_metadata[current_idx] = meta
-            par_embeddings_list.append(self.par_embeddings[par_idx])
+            par_doc_embeddings_list.append(self.par_embeddings_doc[par_idx])
+            par_query_embeddings_list.append(self.par_embeddings_query[par_idx])
 
             # Convert date to Unix timestamp
             date_str = meta.get("date")
@@ -300,8 +321,10 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             current_idx = len(case_node_id_to_idx)
             case_node_id_to_idx[f"case:{celex}"] = current_idx
 
-            # Average embeddings of all paragraphs in case
-            case_emb = np.mean([par_embeddings_list[i] for i in par_indices], axis=0)
+            # Average embeddings of all paragraphs in case (use doc embeddings)
+            case_emb = np.mean(
+                [par_doc_embeddings_list[i] for i in par_indices], axis=0
+            )
             case_embeddings_list.append(case_emb)
 
             # Use earliest paragraph's date timestamp
@@ -340,9 +363,11 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             }
 
         # Add node features
-        data["paragraph"].x = torch.tensor(
-            np.array(par_embeddings_list), dtype=torch.float32
-        )
+        x_doc = torch.tensor(np.array(par_doc_embeddings_list), dtype=torch.float32)
+        x_query = torch.tensor(np.array(par_query_embeddings_list), dtype=torch.float32)
+
+        data["paragraph"].x = x_doc  # Default to document embeddings
+        data["paragraph"].x_query = x_query  # Query embeddings
         data["paragraph"].time = torch.tensor(par_times, dtype=torch.long)
 
         data["article"].x = torch.tensor(
@@ -417,7 +442,7 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             data["legal_act", "contains", "article"].edge_index = edge_index.flip([0])
 
         print(f"Built heterogeneous graph:")
-        print(f"  Paragraphs: {len(par_embeddings_list)}")
+        print(f"  Paragraphs: {len(par_doc_embeddings_list)}")
         print(f"  Articles: {len(art_embeddings_list)}")
         print(f"  Cases: {len(case_embeddings_list)}")
         print(f"  Legal acts: {len(act_embeddings_list)}")

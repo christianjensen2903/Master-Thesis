@@ -23,27 +23,46 @@ class EmbeddingPreprocessor:
         self,
         encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         batch_size: int = 32,
+        mask_token: str = "[MASK]",
     ):
         self.encoder_name = encoder_name
         self.batch_size = batch_size
+        self.mask_token = mask_token
         self.encoder = SentenceTransformer(encoder_name)
 
     def process_judgments(
         self,
         judgments_path: str,
+        par_to_par_path: str,
         output_dir: str,
     ) -> None:
         """
-        Process all judgment paragraphs and create unified index.
+        Process all judgment paragraphs and create unified index with both document and query embeddings.
 
         Creates:
-        - paragraph_embeddings.npy: Pre-computed embeddings
+        - paragraph_embeddings_doc.npy: Pre-computed embeddings for documents (cited paragraphs)
+        - paragraph_embeddings_query.npy: Pre-computed masked embeddings for queries (citing paragraphs)
         - paragraph_metadata.pkl: Metadata for each paragraph
         - paragraph_index.json: Human-readable index mapping
         """
         print("Loading judgments...")
         with open(judgments_path) as f:
             judgments = json.load(f)
+
+        # Load par-to-par data to get masked TEXT_FROM
+        print("Loading par-to-par citations...")
+        df = pd.read_csv(par_to_par_path)
+
+        # Create mapping from paragraph ID to TEXT_FROM (masked text)
+        text_from_map: dict[str, str] = {}
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing TEXT_FROM"):
+            par_id = f"par:{row['CELEX_FROM']}:{row['NUMBER_FROM']}"
+            text_from = str(row["TEXT_FROM"])
+            # Use the first occurrence (they should all be the same for a given paragraph)
+            if par_id not in text_from_map:
+                text_from_map[par_id] = text_from
+
+        print(f"Found masked text for {len(text_from_map)} citing paragraphs")
 
         # Collect all paragraphs with metadata
         paragraphs_data = []
@@ -61,11 +80,15 @@ class EmbeddingPreprocessor:
 
             # Extract paragraphs
             for par_num, text in judgment.get("paragraphs", {}).items():
+                par_id = f"par:{celex}:{par_num}"
                 paragraphs_data.append(
                     {
-                        "id": f"par:{celex}:{par_num}",
+                        "id": par_id,
                         "type": "paragraph",
                         "text": text,
+                        "text_from": text_from_map.get(
+                            par_id
+                        ),  # Masked text if available
                         "celex": celex,
                         "paragraph_number": int(par_num),
                         "date": date.isoformat() if date else None,
@@ -76,11 +99,35 @@ class EmbeddingPreprocessor:
 
         print(f"Found {len(paragraphs_data)} paragraphs")
 
-        # Encode all texts
-        print("Encoding paragraphs...")
-        texts = [p["text"] for p in paragraphs_data]
-        embeddings = self.encoder.encode(
-            texts,
+        # Encode document embeddings (full text)
+        print("Encoding document embeddings (full text)...")
+        doc_texts = [p["text"] for p in paragraphs_data]
+        doc_embeddings = self.encoder.encode(
+            doc_texts,
+            batch_size=self.batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+
+        # Encode query embeddings (masked text from TEXT_FROM)
+        print("Encoding query embeddings (masked TEXT_FROM)...")
+        query_texts = []
+        paragraphs_with_masked_text = 0
+        for p in paragraphs_data:
+            if p["text_from"] is not None:
+                # Use masked text from par-to-par
+                query_texts.append(p["text_from"])
+                paragraphs_with_masked_text += 1
+            else:
+                # Fallback: use mask token for paragraphs that never cite
+                query_texts.append(self.mask_token)
+
+        print(
+            f"Using TEXT_FROM for {paragraphs_with_masked_text}/{len(paragraphs_data)} paragraphs"
+        )
+
+        query_embeddings = self.encoder.encode(
+            query_texts,
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
@@ -91,12 +138,14 @@ class EmbeddingPreprocessor:
         output_path.mkdir(parents=True, exist_ok=True)
 
         print("Saving paragraph embeddings...")
-        np.save(output_path / "paragraph_embeddings.npy", embeddings)
+        np.save(output_path / "paragraph_embeddings_doc.npy", doc_embeddings)
+        np.save(output_path / "paragraph_embeddings_query.npy", query_embeddings)
 
         print("Saving paragraph metadata...")
         # Create simplified metadata (without text to reduce size)
         metadata = [
-            {k: v for k, v in p.items() if k != "text"} for p in paragraphs_data
+            {k: v for k, v in p.items() if k not in ["text", "text_from"]}
+            for p in paragraphs_data
         ]
         with open(output_path / "paragraph_metadata.pkl", "wb") as f:
             pickle.dump(metadata, f)
@@ -106,14 +155,16 @@ class EmbeddingPreprocessor:
         index = {
             "encoder_name": self.encoder_name,
             "num_paragraphs": len(paragraphs_data),
-            "embedding_dim": embeddings.shape[1],
+            "embedding_dim": doc_embeddings.shape[1],
             "date_range": self._get_date_range(paragraphs_data),
             "sample_ids": [p["id"] for p in paragraphs_data[:10]],
         }
         with open(output_path / "paragraph_index.json", "w") as f:
             json.dump(index, f, indent=2)
 
-        print(f"✓ Saved {len(paragraphs_data)} paragraph embeddings to {output_path}")
+        print(
+            f"✓ Saved {len(paragraphs_data)} paragraph embeddings (doc + query) to {output_path}"
+        )
 
     def process_legal_acts(
         self,
@@ -256,7 +307,9 @@ class EmbeddingPreprocessor:
         self, paragraphs_data: list[dict[str, Any]]
     ) -> dict[str, str | None]:
         """Get min and max dates from paragraphs."""
-        dates = [p.get("date") for p in paragraphs_data if p.get("date")]
+        dates: list[str] = [
+            str(p["date"]) for p in paragraphs_data if p.get("date") is not None
+        ]
         if not dates:
             return {"min": None, "max": None}
         return {"min": min(dates), "max": max(dates)}
@@ -282,10 +335,16 @@ def main():
         help="Path to legal acts JSON file",
     )
     parser.add_argument(
+        "--par-to-par",
+        type=str,
+        default="data/par-to-par-cleaned.csv",
+        help="Path to paragraph-to-paragraph citations CSV file",
+    )
+    parser.add_argument(
         "--citations",
         type=str,
         default="data/par-to-par-og.csv",
-        help="Path to paragraph-to-paragraph citations JSON file",
+        help="Path to paragraph-to-paragraph citations CSV file (for citation edges)",
     )
     parser.add_argument(
         "--output-dir",
@@ -313,16 +372,16 @@ def main():
     )
 
     # Process paragraphs
-    # print("\n" + "=" * 80)
-    # print("PROCESSING PARAGRAPHS")
-    # print("=" * 80)
-    # preprocessor.process_judgments(args.judgments, args.output_dir)
+    print("\n" + "=" * 80)
+    print("PROCESSING PARAGRAPHS")
+    print("=" * 80)
+    preprocessor.process_judgments(args.judgments, args.par_to_par, args.output_dir)
 
-    # # Process articles
-    # print("\n" + "=" * 80)
-    # print("PROCESSING ARTICLES")
-    # print("=" * 80)
-    # preprocessor.process_legal_acts(args.legal_acts, args.output_dir)
+    # Process articles
+    print("\n" + "=" * 80)
+    print("PROCESSING ARTICLES")
+    print("=" * 80)
+    preprocessor.process_legal_acts(args.legal_acts, args.output_dir)
 
     # Process citations
     print("\n" + "=" * 80)

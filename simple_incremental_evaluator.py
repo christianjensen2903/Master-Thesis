@@ -155,15 +155,29 @@ class SimpleIncrementalEvaluator:
                 num_neighbors=[-1] * self.k_hops,
                 time_attr="time",
                 batch_size=100000,
+                subgraph_type="bidirectional",
             )
             sub: Data = next(iter(loader))
 
-            src, dst = sub.edge_index
-            edge_mask = (dst < num_nodes) | (src >= num_nodes)
+            src, tgt = sub.edge_index
+            edge_mask = (tgt < num_nodes) | (src < num_nodes)
             masked_edge_index = sub.edge_index[:, edge_mask]
 
+            # Create combined feature matrix:
+            # - Query nodes (first num_nodes) use query embeddings (masked)
+            # - Neighbor nodes use document embeddings
+            if hasattr(sub, "x_query") and hasattr(sub, "x_doc"):
+                x = sub.x_doc.clone()
+                x[:num_nodes] = sub.x_query[:num_nodes]
+            else:
+                x = sub.x
+
+            x_input = x.clone()
+            if hasattr(sub, "x_query"):
+                x_input[:num_nodes] = sub.x_query[:num_nodes]
+
             with torch.no_grad():
-                embeddings = self.gnn_model(sub.x, masked_edge_index)
+                embeddings = self.gnn_model(x_input, masked_edge_index)
 
             query_emb = embeddings[:num_nodes]
             sim = torch.matmul(query_emb, cand_emb.T)
@@ -213,6 +227,7 @@ class SimpleIncrementalEvaluator:
                     recall_scores[k].append(recall_at_k)
                 ap_scores.append(ap)
 
+            # Update embeddings with document embeddings (for future queries to cite them)
             with torch.no_grad():
                 embeddings = self.gnn_model(sub.x, sub.edge_index)
                 # Update stored embeddings for the nodes present in this subgraph
