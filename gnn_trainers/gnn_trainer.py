@@ -5,8 +5,9 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.loader import NeighborLoader  # type: ignore
+from torch_geometric.data import Data, HeteroData  # type: ignore
 from tqdm import tqdm  # type: ignore
-from preprocessing.graph_builder import HomogeneousGraphBuilder
+from preprocessing.graph_builder import HomogeneousGraphBuilder, HeterogeneousGraphBuilder
 
 
 def info_nce_loss(anchor, positive, temperature=0.07):
@@ -47,6 +48,7 @@ class GNNTrainer:
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
         num_hops: int = 2,
+        graph_type: str = "heterogeneous",
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -56,12 +58,14 @@ class GNNTrainer:
         self.weight_decay = weight_decay
         self.temperature = temperature
         self.num_hops = num_hops
+        self.graph_type = graph_type
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
         else:
             self.device = torch.device("cpu")
         print(f"Using device: {self.device}")
+        print(f"Using graph type: {self.graph_type}")
 
     def train_epoch(
         self, model: nn.Module, loader: NeighborLoader, optimizer: torch.optim.Optimizer
