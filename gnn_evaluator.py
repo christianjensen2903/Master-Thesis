@@ -372,16 +372,56 @@ class SimpleIncrementalEvaluator:
                 ap_scores.append(ap)
 
             # Update embeddings with document embeddings (for future queries to cite them)
+            # Need to expand subgraph to include k-hop neighborhoods for ALL nodes
+            # so that boundary nodes get correct embeddings
             with torch.no_grad():
                 if self.is_hetero:
-                    # For hetero graphs, use full subgraph with all edges
-                    out = self.gnn_model(sub)
-                    embeddings = out["paragraph"]
-                else:
-                    embeddings = self.gnn_model(sub_x, sub.edge_index)
+                    # Create expanded subgraph that includes k-hop neighborhoods
+                    # for all nodes in the original subgraph
+                    expanded_input_nodes = ("paragraph", sub_n_id)
+                    expanded_loader = NeighborLoader(
+                        data=self.graph_data,
+                        shuffle=False,
+                        input_nodes=expanded_input_nodes,
+                        num_neighbors=[-1] * self.k_hops,
+                        time_attr="time",
+                        batch_size=100000,
+                        subgraph_type="bidirectional",
+                    )
+                    expanded_sub: HeteroData = next(iter(expanded_loader))
 
-                # Update stored embeddings for the nodes present in this subgraph
-                self.embeddings[sub_n_id] = embeddings
+                    # Compute embeddings on expanded subgraph
+                    out = self.gnn_model(expanded_sub)
+                    expanded_embeddings = out["paragraph"]
+
+                    # Only update embeddings for nodes in the original subgraph
+                    # expanded_sub["paragraph"].n_id contains global indices
+                    # The first len(sub_n_id) nodes correspond to our original nodes
+                    original_node_count = len(sub_n_id)
+                    embeddings_to_update = expanded_embeddings[:original_node_count]
+                    self.embeddings[sub_n_id] = embeddings_to_update
+                else:
+                    # Create expanded subgraph for homogeneous graphs
+                    expanded_loader = NeighborLoader(
+                        data=self.graph_data,
+                        shuffle=False,
+                        input_nodes=sub_n_id,
+                        num_neighbors=[-1] * self.k_hops,
+                        time_attr="time",
+                        batch_size=100000,
+                        subgraph_type="bidirectional",
+                    )
+                    expanded_sub: Data = next(iter(expanded_loader))
+
+                    # Compute embeddings on expanded subgraph
+                    expanded_embeddings = self.gnn_model(
+                        expanded_sub.x, expanded_sub.edge_index
+                    )
+
+                    # Only update embeddings for nodes in the original subgraph
+                    original_node_count = len(sub_n_id)
+                    embeddings_to_update = expanded_embeddings[:original_node_count]
+                    self.embeddings[sub_n_id] = embeddings_to_update
 
         map = float(np.mean(ap_scores))
         print(f"MAP: {map}")
@@ -395,44 +435,42 @@ if __name__ == "__main__":
     from sentence_transformers import SentenceTransformer
 
     # Load model
-    encoding_model = "checkpoints/simcse_citation_model"
-    text_encoder = SentenceTransformer(encoding_model)
-    in_channels = text_encoder.get_sentence_embedding_dimension()
+    in_channels = 384  # mE5-Small
 
-    builder = HeterogeneousGraphBuilder("data/preprocessed")
-    sample_graph = builder.build_graph(
-        train_cutoff_year=2018, include_only_citing=False
-    )
-
-    # Extract metadata (node types and edge types)
-    metadata = (
-        list(sample_graph.node_types),
-        list(sample_graph.edge_types),
-    )
-
-    # model = CitationGNN(
-    #     in_channels, hidden_dim=512, output_dim=in_channels, num_layers=2
+    # builder = HeterogeneousGraphBuilder("data/preprocessed")
+    # sample_graph = builder.build_graph(
+    #     train_cutoff_year=2018, include_only_citing=False
     # )
-    model = HeteroGNN(
-        in_channels,
-        hidden_dim=256,
-        output_dim=in_channels,
-        num_layers=3,
-        metadata=metadata,
+
+    # # Extract metadata (node types and edge types)
+    # metadata = (
+    #     list(sample_graph.node_types),
+    #     list(sample_graph.edge_types),
+    # )
+
+    model = CitationGNN(
+        in_channels, hidden_dim=in_channels, output_dim=in_channels, num_layers=2
     )
-    model.load_state_dict(torch.load("checkpoints/hetero_gnn/best_model.pt"))
+    # model = HeteroGNN(
+    #     in_channels,
+    #     hidden_dim=256,
+    #     output_dim=in_channels,
+    #     num_layers=3,
+    #     metadata=metadata,
+    # )
+    model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
 
     # Run evaluation
     evaluator = SimpleIncrementalEvaluator(
         gnn_model=model,
-        # mode="all_paragraphs",
+        mode="all_paragraphs",
         preprocessed_dir="data/preprocessed",
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
         k_hops=2,
         device="cuda" if torch.cuda.is_available() else "cpu",
         top_k=1000,
-        graph_type="heterogeneous",
+        graph_type="homogeneous",
     )
 
     metrics = evaluator.run()

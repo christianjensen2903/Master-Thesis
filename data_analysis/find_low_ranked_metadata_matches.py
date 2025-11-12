@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 from typing import Any
 
 import numpy as np
@@ -75,7 +76,6 @@ def find_low_ranked_metadata_matches(
     max_rank_threshold: int = 100,
     top_k: int | None = 10000,
     min_rank: int = 10,
-    embeddings_cache_path: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Find paragraphs where:
@@ -115,40 +115,55 @@ def find_low_ranked_metadata_matches(
     # Load metadata dict
     metadata_dict = load_metadata_dict(metadata_path)
 
-    # Try to load cached embeddings
-    embeddings: np.ndarray | None = None
-    if embeddings_cache_path and os.path.exists(embeddings_cache_path):
-        print(f"Attempting to load cached embeddings from {embeddings_cache_path}...")
-        try:
-            cached_embeddings = np.load(embeddings_cache_path)
-            if len(cached_embeddings) == len(pid_to_text):
-                embeddings = cached_embeddings
-                print(f"Loaded cached embeddings (shape: {cached_embeddings.shape})")  # type: ignore[union-attr]
-            else:
-                print(
-                    f"Cache size mismatch: {len(cached_embeddings)} vs {len(pid_to_text)}. "
-                    "Regenerating embeddings..."
-                )
-        except Exception as e:
-            print(f"Failed to load cached embeddings: {e}. Regenerating...")
+    # Load preprocessed embeddings and metadata
+    print("Loading preprocessed embeddings...")
+    embeddings_doc = np.load("data/preprocessed/paragraph_embeddings_doc.npy")
+    embeddings_query = np.load("data/preprocessed/paragraph_embeddings_query.npy")
 
-    # Generate embeddings if not loaded from cache
-    if embeddings is None:
-        print("Generating embeddings...")
-        train_mask = paragraph_set == "train"
-        retriever.fit(pid_to_text, mask=train_mask)
-        embeddings = retriever.transform(pid_to_text)
+    with open("data/preprocessed/paragraph_metadata.pkl", "rb") as f:
+        preprocessed_metadata = pickle.load(f)
 
-        # Save to cache if path is provided
-        if embeddings_cache_path:
-            cache_dir = os.path.dirname(embeddings_cache_path)
-            if cache_dir:
-                os.makedirs(cache_dir, exist_ok=True)
-            print(f"Saving embeddings to cache: {embeddings_cache_path}")
-            np.save(embeddings_cache_path, embeddings)
+    print(f"Loaded document embeddings (shape: {embeddings_doc.shape})")
+    print(f"Loaded query embeddings (shape: {embeddings_query.shape})")
+    print(f"Loaded preprocessed metadata ({len(preprocessed_metadata)} paragraphs)")
 
-    # At this point, embeddings should always be set
-    assert embeddings is not None, "Embeddings must be generated or loaded"
+    # Create mapping from (celex, paragraph_number) to embedding index
+    celex_para_to_emb_idx: dict[tuple[str, int], int] = {}
+    for idx, meta in enumerate(preprocessed_metadata):
+        celex = meta["celex"]
+        para_num = meta["paragraph_number"]
+        celex_para_to_emb_idx[(celex, para_num)] = idx
+
+    print(f"Created mapping for {len(celex_para_to_emb_idx)} paragraph-embedding pairs")
+
+    # Create mapping from pid to embedding index
+    pid_to_emb_idx: dict[int, int] = {}
+    missing_embeddings = 0
+    for pid in range(len(pid_to_text)):
+        celex = paragraph_celex[pid]
+        para_num = int(paragraph_number[pid])
+        key = (celex, para_num)
+        if key in celex_para_to_emb_idx:
+            pid_to_emb_idx[pid] = celex_para_to_emb_idx[key]
+        else:
+            missing_embeddings += 1
+
+    print(
+        f"Mapped {len(pid_to_emb_idx)}/{len(pid_to_text)} pids to embeddings "
+        f"({missing_embeddings} missing)"
+    )
+
+    # Create pid-indexed embedding arrays
+    print("Creating pid-indexed embeddings...")
+    embedding_dim = embeddings_doc.shape[1]
+    pid_embeddings_doc = np.zeros((len(pid_to_text), embedding_dim), dtype=np.float32)
+    pid_embeddings_query = np.zeros((len(pid_to_text), embedding_dim), dtype=np.float32)
+
+    for pid, emb_idx in pid_to_emb_idx.items():
+        pid_embeddings_doc[pid] = embeddings_doc[emb_idx]
+        pid_embeddings_query[pid] = embeddings_query[emb_idx]
+
+    print(f"Created pid-indexed embeddings (shape: {pid_embeddings_doc.shape})")
 
     # Prepare temporal index (sort by date)
     sort_idx = np.argsort(paragraph_dates)
@@ -188,10 +203,14 @@ def find_low_ranked_metadata_matches(
         if len(relevant_pids) == 0:
             continue
 
+        # Skip if query embedding is not available
+        if src_pid not in pid_to_emb_idx:
+            continue
+
         # Retrieve and rank
-        query_embedding = embeddings[src_pid]
+        query_embedding = pid_embeddings_query[src_pid]
         ranked_pids = retriever.retrieve(
-            query_embedding, embeddings, cand_pids, top_k=top_k
+            query_embedding, pid_embeddings_doc, cand_pids, top_k=top_k
         )
 
         # Find ranks of relevant paragraphs
@@ -233,11 +252,15 @@ def find_low_ranked_metadata_matches(
                             "rapporteur": src_meta.get("rapporteur"),
                             "advocate_general": src_meta.get("advocate_general"),
                             "authentic_language": src_meta.get("authentic_language"),
+                            "defendant": src_meta.get("defendant"),
+                            "applicant": src_meta.get("applicant"),
                         },
                         "relevant_metadata": {
                             "rapporteur": rel_meta.get("rapporteur"),
                             "advocate_general": rel_meta.get("advocate_general"),
                             "authentic_language": rel_meta.get("authentic_language"),
+                            "defendant": rel_meta.get("defendant"),
+                            "applicant": rel_meta.get("applicant"),
                         },
                     }
                 )
@@ -252,9 +275,6 @@ if __name__ == "__main__":
         max_seq_length=256,
     )
 
-    # Cache path for embeddings (using same format as evaluator)
-    embeddings_cache_path = "artifacts/simcse_embeddings.npy"
-
     # Find examples
     examples = find_low_ranked_metadata_matches(
         retriever=retriever,
@@ -264,7 +284,6 @@ if __name__ == "__main__":
         max_rank_threshold=100,
         top_k=10000,
         min_rank=10,
-        embeddings_cache_path=embeddings_cache_path,
     )
 
     print(f"\nFound {len(examples)} examples")

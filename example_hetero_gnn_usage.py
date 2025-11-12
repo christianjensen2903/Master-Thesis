@@ -1,4 +1,3 @@
-from sentence_transformers import SentenceTransformer  # type: ignore
 from gnn_trainers import GNNTrainer
 from models import HeteroGNN, CitationGNN
 from preprocessing.graph_builder import HeterogeneousGraphBuilder
@@ -10,10 +9,7 @@ def train_hetero_example() -> None:
     print("Training Heterogeneous GNN Model")
     print("=" * 80 + "\n")
 
-    # Initialize text encoder
-    encoding_model = "checkpoints/simcse_citation_model"
-    text_encoder = SentenceTransformer(encoding_model)
-    in_channels = text_encoder.get_sentence_embedding_dimension()
+    in_channels = 384  # mE5-Small
 
     # Build graph to get metadata
     print("Building graph to extract metadata...")
@@ -63,10 +59,7 @@ def train_homo_example() -> None:
     print("Training Homogeneous GNN Model")
     print("=" * 80 + "\n")
 
-    # Initialize text encoder
-    encoding_model = "checkpoints/simcse_citation_model"
-    text_encoder = SentenceTransformer(encoding_model)
-    in_channels = text_encoder.get_sentence_embedding_dimension()
+    in_channels = 384
 
     # Initialize homogeneous GNN
     model = CitationGNN(
@@ -81,7 +74,7 @@ def train_homo_example() -> None:
         preprocessed_dir="data/preprocessed",
         output_path="checkpoints/homo_gnn",
         batch_size=2**10,
-        epochs=400,
+        epochs=200,
         learning_rate=5e-5,
         weight_decay=1e-4,
         temperature=0.07,
@@ -98,7 +91,7 @@ def train_homo_example() -> None:
 
 if __name__ == "__main__":
     # Train heterogeneous GNN (uses all edge types)
-    train_hetero_example()
+    # train_hetero_example()
 
     # Or train homogeneous GNN (citation edges only)
-    # train_homo_example()
+    train_homo_example()
