@@ -136,8 +136,6 @@ class SimpleIncrementalEvaluator:
             date_str = date.normalize().strftime("%Y-%m-%d")
             date_normalized = datetime.fromisoformat(date_str)
             time = int(date_normalized.timestamp())
-
-            # Try exact match first
             mask = self.graph_data.time == time
 
             cand_mask = self.graph_data.time < time
@@ -146,12 +144,22 @@ class SimpleIncrementalEvaluator:
 
             cand_emb = self.embeddings[cand_indices]
 
-            num_nodes = mask.sum()
+            nodes_at_time = mask.nonzero(as_tuple=True)[0]
+
+            # Get unique source nodes (nodes with outgoing edges)
+            source_nodes = self.graph_data.edge_index[0]
+
+            # Find which nodes_at_time have outgoing edges
+            nodes_with_out_edges = nodes_at_time[
+                torch.isin(nodes_at_time, source_nodes)
+            ]
+
+            num_nodes = nodes_with_out_edges.size(0)
 
             loader = NeighborLoader(
                 data=self.graph_data,
                 shuffle=False,
-                input_nodes=mask.nonzero(as_tuple=True)[0],
+                input_nodes=nodes_with_out_edges,
                 num_neighbors=[-1] * self.k_hops,
                 time_attr="time",
                 batch_size=100000,
@@ -257,6 +265,7 @@ if __name__ == "__main__":
     # Run evaluation
     evaluator = SimpleIncrementalEvaluator(
         gnn_model=model,
+        mode="all_paragraphs",
         preprocessed_dir="data/preprocessed",
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
