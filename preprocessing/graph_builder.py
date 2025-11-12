@@ -269,6 +269,7 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         par_doc_embeddings_list = []
         par_query_embeddings_list = []
         par_times = []
+        par_node_ids = []
         case_to_par_indices: dict[str, list[int]] = defaultdict(list)
 
         for par_idx in selected_pars:
@@ -280,6 +281,7 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             par_idx_to_metadata[current_idx] = meta
             par_doc_embeddings_list.append(self.par_embeddings_doc[par_idx])
             par_query_embeddings_list.append(self.par_embeddings_query[par_idx])
+            par_node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
 
             # Convert date to Unix timestamp
             date_str = meta.get("date")
@@ -365,10 +367,12 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         # Add node features
         x_doc = torch.tensor(np.array(par_doc_embeddings_list), dtype=torch.float32)
         x_query = torch.tensor(np.array(par_query_embeddings_list), dtype=torch.float32)
+        par_node_ids_tensor = torch.stack(par_node_ids)
 
         data["paragraph"].x = x_doc  # Default to document embeddings
         data["paragraph"].x_query = x_query  # Query embeddings
         data["paragraph"].time = torch.tensor(par_times, dtype=torch.long)
+        data["paragraph"].node_id_hash = par_node_ids_tensor  # Hashed node IDs
 
         data["article"].x = torch.tensor(
             np.array(art_embeddings_list), dtype=torch.float32

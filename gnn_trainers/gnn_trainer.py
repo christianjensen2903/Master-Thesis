@@ -7,7 +7,10 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.loader import NeighborLoader  # type: ignore
 from torch_geometric.data import Data, HeteroData  # type: ignore
 from tqdm import tqdm  # type: ignore
-from preprocessing.graph_builder import HomogeneousGraphBuilder, HeterogeneousGraphBuilder
+from preprocessing.graph_builder import (
+    HomogeneousGraphBuilder,
+    HeterogeneousGraphBuilder,
+)
 
 
 def info_nce_loss(anchor, positive, temperature=0.07):
@@ -68,35 +71,102 @@ class GNNTrainer:
         print(f"Using graph type: {self.graph_type}")
 
     def train_epoch(
-        self, model: nn.Module, loader: NeighborLoader, optimizer: torch.optim.Optimizer
+        self,
+        model: nn.Module,
+        loader: NeighborLoader,
+        optimizer: torch.optim.Optimizer,
+        is_hetero: bool,
     ) -> float:
         model.train()
         total_loss = 0
         num_batches = 0
 
         for batch in tqdm(loader, desc="Training batches", leave=False):
-            # Get batch data
-            batch_size = batch.batch_size
-            edge_index = batch.edge_index
+            # Handle heterogeneous vs homogeneous graphs
+            if is_hetero:
+                # For heterogeneous graphs, work with paragraph nodes
+                batch_size = batch["paragraph"].batch_size
+                x = batch["paragraph"].x.clone()
 
-            # Create combined feature matrix:
-            # - Anchor nodes (first batch_size nodes) use query embeddings (masked)
-            # - All other nodes (positives, neighbors) use document embeddings
-            x = batch.x
-            if hasattr(batch, "x_query"):
-                x[:batch_size] = batch.x_query[:batch_size]
+                # Use query embeddings for anchor nodes
+                if hasattr(batch["paragraph"], "x_query"):
+                    x[:batch_size] = batch["paragraph"].x_query[:batch_size]
 
-            # Mask edges to prevent leakage
-            src, tgt = edge_index
-            edge_mask = (src < batch_size) | (tgt < batch_size)
-            masked_edge_index = edge_index[:, edge_mask]
+                # Get citation edges (for positive sampling)
+                if ("paragraph", "cites", "paragraph") in batch.edge_types:
+                    cite_edge_index = batch[
+                        "paragraph", "cites", "paragraph"
+                    ].edge_index
+                else:
+                    # No citation edges in this batch, skip
+                    continue
 
-            # Get embeddings for nodes in this batch with masked edges
-            embeddings = model(x, masked_edge_index)
+                # Mask citation edges to prevent leakage
+                # 1. Identify paragraphs in the same case as anchor nodes (batch_size)
+                # Get belongs_to edges to find which cases the anchor paragraphs belong to
+                if ("paragraph", "belongs_to", "case") in batch.edge_types:
+                    par_to_case = batch["paragraph", "belongs_to", "case"].edge_index
+                    case_to_par = batch["case", "contains", "paragraph"].edge_index
+
+                    # Find cases that anchor paragraphs belong to
+                    anchor_mask = par_to_case[0] < batch_size
+                    anchor_cases = par_to_case[1, anchor_mask].unique()
+
+                    # Find all paragraphs in those cases
+                    case_mask = torch.isin(case_to_par[0], anchor_cases)
+                    paragraphs_in_anchor_cases = case_to_par[1, case_mask].unique()
+                else:
+                    # If no case structure, only mask anchor paragraphs
+                    paragraphs_in_anchor_cases = torch.arange(
+                        batch_size, device=self.device
+                    )
+
+                # 2. Mask citation edges where src or tgt involve anchor cases
+                cite_src, cite_tgt = cite_edge_index
+                # Mask edges where source AND target are in anchor cases
+                leakage_mask = torch.isin(
+                    cite_src, paragraphs_in_anchor_cases
+                ) | torch.isin(cite_tgt, paragraphs_in_anchor_cases)
+                masked_cite_edges = cite_edge_index[:, ~leakage_mask]
+
+                # Create modified batch with masked citation edges and updated features
+                modified_batch = batch.clone()
+                modified_batch["paragraph", "cites", "paragraph"].edge_index = (
+                    masked_cite_edges
+                )
+                modified_batch["paragraph"].x = x
+
+                # Get embeddings using modified batch (all edge types, but masked citations)
+                out = model(modified_batch)
+                # Extract paragraph embeddings (hetero models return dict)
+                embeddings = out["paragraph"] if isinstance(out, dict) else out
+                edge_index = cite_edge_index  # Use original for positive sampling
+
+            else:
+                # For homogeneous graphs
+                batch_size = batch.batch_size
+                x = batch.x.clone()
+
+                # Use query embeddings for anchor nodes
+                if hasattr(batch, "x_query"):
+                    x[:batch_size] = batch.x_query[:batch_size]
+
+                edge_index = batch.edge_index
+
+                # Mask edges to prevent leakage
+                # Remove edges where BOTH src and tgt are in anchor batch
+                src, tgt = edge_index
+                leakage_mask = (src < batch_size) & (tgt < batch_size)
+                masked_edge_index = edge_index[:, ~leakage_mask]
+
+                # Get embeddings with masked edges
+                out = model(x, masked_edge_index)
+                embeddings = out["paragraph"] if isinstance(out, dict) else out
 
             anchor_emb = embeddings[:batch_size]
 
-            # Find edges where source is in the input batch
+            # Find edges where source is in the input batch (for positive sampling)
+            src, tgt = edge_index
             input_mask = src < batch_size
             if input_mask.sum() == 0:
                 # No edges for this batch, skip
@@ -151,14 +221,30 @@ class GNNTrainer:
         os.makedirs(self.output_path, exist_ok=True)
 
         print("\n" + "=" * 80)
-        print("Training GNN with Graph Builder")
+        print(f"Training GNN with {self.graph_type.capitalize()} Graph Builder")
         print("=" * 80)
 
-        builder = HomogeneousGraphBuilder(self.preprocessed_dir)
-        graph_data = builder.build_graph(
-            train_cutoff_year=cutoff_year,
-            include_only_citing=True,
-        ).to(self.device)
+        # Build graph based on type
+        is_hetero = self.graph_type == "heterogeneous"
+
+        # Type declarations
+        graph_data: Data | HeteroData
+        input_nodes: tuple[str, None] | None
+
+        if is_hetero:
+            hetero_builder = HeterogeneousGraphBuilder(self.preprocessed_dir)
+            graph_data = hetero_builder.build_graph(
+                train_cutoff_year=cutoff_year,
+                include_only_citing=True,
+            ).to(self.device)
+            input_nodes = ("paragraph", None)
+        else:
+            homo_builder = HomogeneousGraphBuilder(self.preprocessed_dir)
+            graph_data = homo_builder.build_graph(
+                train_cutoff_year=cutoff_year,
+                include_only_citing=True,
+            ).to(self.device)
+            input_nodes = None
 
         # Initialize model
         print("\nInitializing GNN model...")
@@ -177,7 +263,7 @@ class GNNTrainer:
             graph_data,
             num_neighbors=[-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1],
             batch_size=self.batch_size,
-            input_nodes=None,  # Sample all nodes
+            input_nodes=input_nodes,
             shuffle=True,
             time_attr="time",
             subgraph_type="bidirectional",
@@ -188,13 +274,12 @@ class GNNTrainer:
         best_loss = float("inf")
 
         for epoch in range(self.epochs):
-            train_loss = self.train_epoch(model, loader, optimizer)
+            train_loss = self.train_epoch(model, loader, optimizer, is_hetero)
 
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
             if train_loss < best_loss:
-
                 torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
                 print(f"New best loss: {best_loss:.4f} -> {train_loss:.4f}")
                 best_loss = train_loss

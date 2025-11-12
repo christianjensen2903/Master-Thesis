@@ -35,8 +35,8 @@ class CitationGNN(nn.Module):
             x_new = self.dropout(x_new)
             x = x + x_new
 
-        alpha = torch.sigmoid(self.residual_weight)
-        x = alpha * x_orig + (1 - alpha) * x
+        # alpha = torch.sigmoid(self.residual_weight)
+        # x = alpha * x_orig + (1 - alpha) * x
 
         # Normalize embeddings
         x = F.normalize(x, p=2, dim=1)
