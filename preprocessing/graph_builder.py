@@ -1,11 +1,3 @@
-"""
-Graph builders for GNN training and evaluation.
-
-Provides two graph builders:
-- HomogeneousGraphBuilder: Simple citation graph with Data
-- HeterogeneousGraphBuilder: Rich graph with case/act nodes using HeteroData
-"""
-
 import pickle
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -15,6 +7,7 @@ import re
 import numpy as np
 import torch
 from torch_geometric.data import Data, HeteroData  # type: ignore
+from torch_geometric.utils import add_self_loops  # type: ignore
 
 
 class BaseGraphBuilder(ABC):
@@ -153,6 +146,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         self,
         train_cutoff_year: int | None = None,
         include_only_citing: bool = True,
+        include_self_loops: bool = False,
     ) -> Data:
         """
         Build homogeneous citation graph.
@@ -160,6 +154,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         Args:
             train_cutoff_year: Only include paragraphs before this year
             include_only_citing: Only include paragraphs involved in citations
+            include_self_loops: Whether to add self loops to all nodes
 
         Returns:
             graph_data: PyTorch Geometric Data object
@@ -208,6 +203,12 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        # Add self loops if requested
+        if include_self_loops:
+            edge_index, _ = add_self_loops(
+                edge_index, num_nodes=len(doc_embeddings_list)
+            )
 
         node_times_tensor = torch.tensor(node_times, dtype=torch.long)
 
