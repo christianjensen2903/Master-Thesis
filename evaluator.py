@@ -141,6 +141,8 @@ class Evaluator:
 
         self.map_score: float | None = None
         self.recall_scores: dict[int, float] | None = None
+        self.map_ci: tuple[float, float] | None = None
+        self.recall_cis: dict[int, tuple[float, float]] | None = None
 
     def load_and_prepare(self) -> None:
         """Load all data and prepare for evaluation."""
@@ -360,7 +362,10 @@ class Evaluator:
         print(f"Query embeddings shape: {query_embeddings.shape}")
 
     def evaluate_map_and_recall(
-        self, k_values: list[int] = [5, 10, 50, 100]
+        self,
+        k_values: list[int] = [5, 10, 50, 100],
+        confidence: float = 0.95,
+        n_bootstrap: int = 1000,
     ) -> tuple[float, dict[int, float]]:
         """Combined MAP and Recall evaluation using numba for speed."""
         assert self.embeddings is not None
@@ -460,10 +465,42 @@ class Evaluator:
         )
 
         self.map_score = float(np.mean(avg_precs))
+        self.map_ci = self._bootstrap_confidence_interval(
+            avg_precs, confidence=confidence, n_bootstrap=n_bootstrap
+        )
         self.recall_scores = {
             k: float(np.mean(recall_matrix[:, idx])) for idx, k in enumerate(k_values)
         }
+        self.recall_cis = {
+            k: self._bootstrap_confidence_interval(
+                recall_matrix[:, idx], confidence=confidence, n_bootstrap=n_bootstrap
+            )
+            for idx, k in enumerate(k_values)
+        }
         return self.map_score, self.recall_scores
+
+    def _bootstrap_confidence_interval(
+        self,
+        values: NDArray,
+        confidence: float = 0.95,
+        n_bootstrap: int = 1000,
+    ) -> tuple[float, float]:
+        if len(values) == 0:
+            return 0.0, 0.0
+
+        rng = np.random.default_rng()
+        means = np.empty(n_bootstrap, dtype=np.float64)
+        n = len(values)
+
+        for i in range(n_bootstrap):
+            indices = rng.integers(0, n, size=n)
+            sample = values[indices]
+            means[i] = float(np.mean(sample))
+
+        alpha = 1.0 - confidence
+        lower = float(np.quantile(means, alpha / 2.0))
+        upper = float(np.quantile(means, 1.0 - alpha / 2.0))
+        return lower, upper
 
     def load_embeddings(self, path: str | None = None) -> NDArray | None:
         """Load embeddings from disk using numpy's load format."""
@@ -551,19 +588,24 @@ class Evaluator:
         self._embed_queries()
 
         metric_name = f"MAP@{self.top_k}" if self.top_k else "MAP"
-        print(f"\nComputing {metric_name} and Recall@k...")
+        print(f"\nComputing {metric_name} and Recall@k with confidence intervals...")
         score, recall_scores = self.evaluate_map_and_recall([5, 10, 100])
 
-        print(f"\n{metric_name}: {score:.3f}")
+        map_ci = self.map_ci if self.map_ci is not None else (score, score)
+        print(
+            f"\n{metric_name}: {score:.3f} "
+            f"(95% CI [{map_ci[0]:.3f}, {map_ci[1]:.3f}])"
+        )
+
         for k, recall in sorted(recall_scores.items()):
-            print(f"Recall@{k}: {recall:.3f}")
+            ci = self.recall_cis[k] if self.recall_cis is not None else (recall, recall)
+            print(f"Recall@{k}: {recall:.3f} (95% CI [{ci[0]:.3f}, {ci[1]:.3f}])")
 
         return score
 
 
 if __name__ == "__main__":
     from retrievers import DenseRetriever, GNNRetriever, TfidfRetriever, BOWRetriever
-    from example_gnn_usage import CitationGNN
     import torch
     from sentence_transformers import SentenceTransformer
 
@@ -603,7 +645,7 @@ if __name__ == "__main__":
 
     evaluator = Evaluator(
         retriever=retriever,
-        # mode="all_paragraphs",
+        mode="all_paragraphs",
         judgments_path="data/judgments_cleaned.json",
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
