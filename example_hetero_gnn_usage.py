@@ -84,7 +84,7 @@ def train_homo_example() -> None:
 
     # Train on paragraph pairs
     cutoff_year = 2018
-    trainer.train(model, cutoff_year)
+    trainer.train(model, cutoff_year, 2021)
 
     print("\nTraining complete!")
 
