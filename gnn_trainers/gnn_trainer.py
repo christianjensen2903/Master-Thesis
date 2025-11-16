@@ -7,37 +7,49 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.loader import NeighborLoader  # type: ignore
 from torch_geometric.data import Data, HeteroData  # type: ignore
 from tqdm import tqdm  # type: ignore
+from collections import defaultdict
+import hashlib
+import pickle
+from pathlib import Path
 from preprocessing.graph_builder import (
     HomogeneousGraphBuilder,
     HeterogeneousGraphBuilder,
 )
 
 
-def info_nce_loss(anchor, positive, temperature=0.07):
+def info_nce_loss_fast(anchor, positive, negatives, temperature=0.07):
     """
-    In-batch negative contrastive loss.
+    Optimized contrastive loss with explicit hard negatives.
 
-    anchor: [batch_size, dim] - query embeddings
-    positive: [batch_size, dim] - positive document embeddings
+    Args:
+        anchor: [batch_size, dim]
+        positive: [batch_size, dim]
+        negatives: [batch_size, num_negatives, dim]
+        temperature: temperature parameter
 
-    For each anchor_i, positive_i is the target, and all other positives
-    in the batch are used as negatives.
+    Returns:
+        loss: scalar
     """
-    # Normalize embeddings
+    batch_size = anchor.size(0)
+
+    # Normalize once
     anchor = F.normalize(anchor, dim=-1)
     positive = F.normalize(positive, dim=-1)
+    negatives = F.normalize(negatives, dim=-1)
 
-    # Compute similarity matrix: [batch_size, batch_size]
-    # sim_matrix[i, j] = similarity between anchor_i and positive_j
-    sim_matrix = torch.mm(anchor, positive.t()) / temperature
+    # Positive similarities: [batch_size, 1]
+    pos_sim = (anchor * positive).sum(dim=-1, keepdim=True) / temperature
 
-    # Labels: for each anchor_i, the positive is at position i (diagonal)
-    labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
+    # Negative similarities: [batch_size, num_neg]
+    neg_sim = (anchor.unsqueeze(1) * negatives).sum(dim=-1) / temperature
 
-    # Cross entropy loss treats each row as logits where correct class is on diagonal
-    loss = F.cross_entropy(sim_matrix, labels)
+    # Concatenate: [batch_size, 1 + num_neg]
+    logits = torch.cat([pos_sim, neg_sim], dim=1)
 
-    return loss
+    # Labels: positive at index 0
+    labels = torch.zeros(batch_size, dtype=torch.long, device=anchor.device)
+
+    return F.cross_entropy(logits, labels)
 
 
 class GNNTrainer:
@@ -52,7 +64,10 @@ class GNNTrainer:
         temperature: float = 0.07,
         num_hops: int = 2,
         graph_type: str = "heterogeneous",
-        patience: int = 3,  # Early stopping patience
+        patience: int = 3,
+        num_hard_negatives: int = 5,
+        hard_negative_pool_size: int = 100,
+        include_only_citing: bool = True,  # Add option to control this
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -64,6 +79,9 @@ class GNNTrainer:
         self.num_hops = num_hops
         self.graph_type = graph_type
         self.patience = patience
+        self.num_hard_negatives = num_hard_negatives
+        self.hard_negative_pool_size = hard_negative_pool_size
+        self.include_only_citing = include_only_citing
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -71,63 +89,131 @@ class GNNTrainer:
             self.device = torch.device("cpu")
         print(f"Using device: {self.device}")
         print(f"Using graph type: {self.graph_type}")
+        print(
+            f"Hard negatives: {num_hard_negatives} from pool of {hard_negative_pool_size}"
+        )
+        print(f"Include only citing: {include_only_citing}")
 
-    def _process_batch(
-        self,
-        batch,
-        is_hetero: bool,
+    def _get_hard_negatives_cache_path(
+        self, num_nodes, train_cutoff_year, include_only_citing
     ):
-        """Process a batch and extract necessary components."""
-        # Handle heterogeneous vs homogeneous graphs
+        """Generate cache path for hard negatives based on configuration."""
+        # Create cache directory
+        cache_dir = Path(self.preprocessed_dir) / "hard_negatives_cache"
+        cache_dir.mkdir(exist_ok=True)
+
+        # Create unique hash based on configuration
+        config_str = f"{num_nodes}_{train_cutoff_year}_{include_only_citing}_{self.hard_negative_pool_size}_{self.graph_type}"
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+
+        cache_file = cache_dir / f"hard_neg_{config_hash}.pt"
+        return cache_file
+
+    def _compute_hard_negatives(
+        self, embeddings, edge_index=None, train_cutoff_year=None
+    ):
+        """
+        Pre-compute hard negatives based on initial embeddings.
+        Uses caching to avoid recomputation.
+        """
+        num_nodes = embeddings.shape[0]
+
+        # Check cache first
+        cache_path = self._get_hard_negatives_cache_path(
+            num_nodes, train_cutoff_year, self.include_only_citing
+        )
+
+        if cache_path.exists():
+            print(f"\nLoading cached hard negatives from {cache_path}")
+            hard_negatives = torch.load(cache_path, map_location=self.device)
+            print(f"Loaded hard negatives: {hard_negatives.shape}")
+            return hard_negatives
+
+        print(f"\nComputing hard negatives (will cache to {cache_path})...")
+        embeddings = embeddings.to(self.device)
+        embeddings_norm = F.normalize(embeddings, dim=-1)
+
+        # Build set of positive pairs (citations)
+        positive_pairs = set()
+        if edge_index is not None:
+            edge_index = edge_index.to(self.device)
+            # Convert to set of tuples for fast lookup
+            edges = edge_index.t().cpu().numpy()
+            positive_pairs = set(map(tuple, edges))
+
+        # Compute hard negatives in batches
+        hard_neg_list = []
+        batch_size = 1000
+
+        for start_idx in tqdm(
+            range(0, num_nodes, batch_size), desc="Computing similarity"
+        ):
+            end_idx = min(start_idx + batch_size, num_nodes)
+            batch_emb = embeddings_norm[start_idx:end_idx]
+
+            # Compute similarity with all nodes
+            sim = torch.mm(batch_emb, embeddings_norm.t())
+
+            # Mask out self and positives efficiently
+            for i in range(batch_emb.shape[0]):
+                node_idx = start_idx + i
+                sim[i, node_idx] = -1e9  # Self
+
+                # Mask positives - check both directions
+                for j in range(num_nodes):
+                    if (node_idx, j) in positive_pairs or (
+                        j,
+                        node_idx,
+                    ) in positive_pairs:
+                        sim[i, j] = -1e9
+
+            # Get top-k
+            _, topk_indices = torch.topk(
+                sim, k=min(self.hard_negative_pool_size, num_nodes - 1), dim=-1
+            )
+            hard_neg_list.append(topk_indices)
+
+        hard_negatives = torch.cat(hard_neg_list, dim=0)
+        print(f"Computed hard negatives: {hard_negatives.shape}")
+
+        # Cache to disk
+        print(f"Caching hard negatives to {cache_path}")
+        torch.save(hard_negatives, cache_path)
+
+        return hard_negatives  # Keep on GPU
+
+    def _process_batch(self, batch, is_hetero, hard_negatives_tensor):
+        """Process batch - optimized version."""
         if is_hetero:
-            # For heterogeneous graphs, work with paragraph nodes
             batch_size = batch["paragraph"].batch_size
             x = batch["paragraph"].x.clone()
 
-            # Use query embeddings for anchor nodes
             if hasattr(batch["paragraph"], "x_query"):
                 x[:batch_size] = batch["paragraph"].x_query[:batch_size]
 
-            # Get citation edges (for positive sampling)
-            if ("paragraph", "cites", "paragraph") in batch.edge_types:
-                cite_edge_index = batch["paragraph", "cites", "paragraph"].edge_index
-            else:
-                # No citation edges in this batch, skip
-                return None
-
-            # Mask citation edges to prevent leakage
-            # 1. Identify paragraphs in the same case as anchor nodes (batch_size)
-            # Get belongs_to edges to find which cases the anchor paragraphs belong to
-            if ("paragraph", "belongs_to", "case") in batch.edge_types:
-                par_to_case = batch["paragraph", "belongs_to", "case"].edge_index
-                case_to_par = batch["case", "contains", "paragraph"].edge_index
-
-                # Find cases that anchor paragraphs belong to
-                anchor_mask = par_to_case[0] < batch_size
-                anchor_cases = par_to_case[1, anchor_mask].unique()
-
-                # Find all paragraphs in those cases
-                case_mask = torch.isin(case_to_par[0], anchor_cases)
-                paragraphs_in_anchor_cases = case_to_par[1, case_mask].unique()
-            else:
-                # If no case structure, only mask anchor paragraphs
-                paragraphs_in_anchor_cases = torch.arange(
-                    batch_size, device=self.device
-                )
-
-            # 2. Mask citation edges where src or tgt involve anchor cases
-            cite_src, cite_tgt = cite_edge_index
-            # Mask edges where source AND target are in anchor cases
-            leakage_mask = torch.isin(
-                cite_src, paragraphs_in_anchor_cases
-            ) | torch.isin(cite_tgt, paragraphs_in_anchor_cases)
-            masked_cite_edges = cite_edge_index[:, ~leakage_mask]
-
-            # Create modified batch with masked citation edges and updated features
-            modified_batch = batch.clone()
-            modified_batch["paragraph", "cites", "paragraph"].edge_index = (
-                masked_cite_edges
+            node_ids = (
+                batch["paragraph"].n_id if hasattr(batch["paragraph"], "n_id") else None
             )
+            cite_edge_index = batch.get(("paragraph", "cites", "paragraph"), {}).get(
+                "edge_index", None
+            )
+
+            # Simplified masking
+            masked_cite_edges = None
+            if cite_edge_index is not None:
+                src, tgt = cite_edge_index
+                # Only mask edges between anchor nodes
+                leakage_mask = (src < batch_size) & (tgt < batch_size)
+                masked_cite_edges = cite_edge_index[:, ~leakage_mask]
+
+            modified_batch = batch.clone()
+            if (
+                masked_cite_edges is not None
+                and ("paragraph", "cites", "paragraph") in batch.edge_types
+            ):
+                modified_batch["paragraph", "cites", "paragraph"].edge_index = (
+                    masked_cite_edges
+                )
             modified_batch["paragraph"].x = x
 
             return {
@@ -135,21 +221,19 @@ class GNNTrainer:
                 "modified_batch": modified_batch,
                 "edge_index": cite_edge_index,
                 "x": x,
+                "node_ids": node_ids,
             }
-
         else:
-            # For homogeneous graphs
             batch_size = batch.batch_size
             x = batch.x.clone()
 
-            # Use query embeddings for anchor nodes
             if hasattr(batch, "x_query"):
                 x[:batch_size] = batch.x_query[:batch_size]
 
+            node_ids = batch.n_id if hasattr(batch, "n_id") else None
             edge_index = batch.edge_index
 
-            # Mask edges to prevent leakage
-            # Remove edges where BOTH src and tgt are in anchor batch
+            # Mask edges
             src, tgt = edge_index
             leakage_mask = (src < batch_size) & (tgt < batch_size)
             masked_edge_index = edge_index[:, ~leakage_mask]
@@ -160,17 +244,14 @@ class GNNTrainer:
                 "edge_index": edge_index,
                 "x": x,
                 "masked_edge_index": masked_edge_index,
+                "node_ids": node_ids,
             }
 
-    def _compute_loss(
-        self,
-        model: nn.Module,
-        batch_data: dict,
-        is_hetero: bool,
-    ):
-        """Compute loss for a processed batch."""
+    def _compute_loss(self, model, batch_data, is_hetero, hard_negatives_tensor):
+        """Optimized loss computation."""
         batch_size = batch_data["batch_size"]
         edge_index = batch_data["edge_index"]
+        node_ids = batch_data["node_ids"]
 
         # Get embeddings
         if is_hetero:
@@ -182,69 +263,135 @@ class GNNTrainer:
 
         anchor_emb = embeddings[:batch_size]
 
-        # Find edges where source is in the input batch (for positive sampling)
-        src, tgt = edge_index
-        input_mask = src < batch_size
-        if input_mask.sum() == 0:
-            # No edges for this batch, skip
-            return None
+        # Get positive samples efficiently
+        positive_indices = torch.arange(batch_size, device=self.device)
 
-        batch_src = src[input_mask]
-        batch_tgt = tgt[input_mask]
+        if edge_index is not None and edge_index.numel() > 0:
+            src, tgt = edge_index
+            input_mask = src < batch_size
 
-        # Sort edges by source for efficient grouping
-        sorted_idx = torch.argsort(batch_src)
-        src_sorted = batch_src[sorted_idx]
-        tgt_sorted = batch_tgt[sorted_idx]
+            if input_mask.sum() > 0:
+                batch_src = src[input_mask]
+                batch_tgt = tgt[input_mask]
 
-        # Find unique sources and their edge counts
-        unique_src, counts = torch.unique_consecutive(src_sorted, return_counts=True)
+                # Use scatter to efficiently select one positive per anchor
+                # Group by source and take first occurrence
+                unique_src, inverse = torch.unique(batch_src, return_inverse=True)
 
-        # Random sampling: generate random offset for each unique source
-        random_offsets = (torch.rand_like(counts.float()) * counts.float()).long()
+                # For each unique source, find first target
+                first_occurrence = torch.zeros_like(unique_src)
+                for i, src_idx in enumerate(unique_src):
+                    mask = batch_src == src_idx
+                    first_occurrence[i] = batch_tgt[mask][0]
 
-        # Compute cumulative positions
-        cumsum = torch.cat(
-            [torch.tensor([0], device=self.device), counts.cumsum(0)[:-1]]
-        )
-        selected_edges = cumsum + random_offsets
-
-        # Get positive samples
-        positive_indices = torch.arange(
-            batch_size, device=self.device
-        )  # Default to self
-        positive_indices[unique_src] = tgt_sorted[selected_edges]
+                positive_indices[unique_src] = first_occurrence
 
         positive_emb = embeddings[positive_indices]
 
-        # Compute loss with in-batch negatives
-        loss = info_nce_loss(anchor_emb, positive_emb, self.temperature)
+        # Optimized hard negative sampling
+        if node_ids is not None and hard_negatives_tensor is not None:
+            anchor_global_ids = node_ids[:batch_size]
 
+            # Vectorized lookup of hard negatives
+            # Sample indices efficiently
+            num_to_sample = min(self.num_hard_negatives, hard_negatives_tensor.size(1))
+
+            # Random sampling from pool for all anchors at once
+            random_indices = torch.randint(
+                0,
+                hard_negatives_tensor.size(1),
+                (batch_size, num_to_sample),
+                device=self.device,
+            )
+
+            # Gather hard negative global IDs
+            hard_neg_global_ids = torch.gather(
+                hard_negatives_tensor[anchor_global_ids], 1, random_indices
+            )  # [batch_size, num_hard_negatives]
+
+            # Create mapping from global ID to batch position (vectorized)
+            # This is the key optimization - use broadcasting instead of loops
+            batch_positions = torch.arange(embeddings.size(0), device=self.device)
+
+            # For each hard negative, find its position in the batch
+            # Use broadcasting: [batch_size, num_hard_neg, 1] vs [1, 1, num_nodes_in_batch]
+            matches = hard_neg_global_ids.unsqueeze(-1) == node_ids.unsqueeze(
+                0
+            ).unsqueeze(0)
+
+            # Get first match for each (should only be one)
+            hard_neg_batch_indices = matches.long().argmax(dim=-1)
+
+            # Handle cases where hard negative is not in batch (use random fallback)
+            not_found = ~matches.any(dim=-1)
+            if not_found.any():
+                # Use random nodes from the batch as fallback
+                # Fix: Handle case when batch_size >= embeddings.shape[0]
+                if embeddings.size(0) > batch_size:
+                    # Sample from nodes outside the anchor batch
+                    random_fallback = torch.randint(
+                        batch_size,
+                        embeddings.size(0),
+                        (not_found.sum(),),
+                        device=self.device,
+                    )
+                else:
+                    # All nodes are anchors, sample from any node
+                    random_fallback = torch.randint(
+                        0, embeddings.size(0), (not_found.sum(),), device=self.device
+                    )
+                hard_neg_batch_indices[not_found] = random_fallback
+
+            # Gather hard negative embeddings
+            hard_neg_emb = embeddings[hard_neg_batch_indices]
+        else:
+            # Fallback: random negatives
+            # Fix: Handle case when batch_size >= embeddings.shape[0]
+            if embeddings.size(0) > batch_size:
+                # Sample from nodes outside anchor batch
+                random_indices = torch.randint(
+                    batch_size,
+                    embeddings.size(0),
+                    (batch_size, self.num_hard_negatives),
+                    device=self.device,
+                )
+            else:
+                # Sample from any nodes (including anchors)
+                random_indices = torch.randint(
+                    0,
+                    embeddings.size(0),
+                    (batch_size, self.num_hard_negatives),
+                    device=self.device,
+                )
+            hard_neg_emb = embeddings[random_indices]
+
+        # Compute loss
+        loss = info_nce_loss_fast(
+            anchor_emb, positive_emb, hard_neg_emb, self.temperature
+        )
         return loss
 
-    def train_epoch(
-        self,
-        model: nn.Module,
-        loader: NeighborLoader,
-        optimizer: torch.optim.Optimizer,
-        is_hetero: bool,
-    ) -> float:
+    def train_epoch(self, model, loader, optimizer, is_hetero, hard_negatives_tensor):
         """Train for one epoch."""
         model.train()
         total_loss = 0
         num_batches = 0
 
-        for batch in tqdm(loader, desc="Training batches", leave=False):
-            batch_data = self._process_batch(batch, is_hetero)
+        for batch in tqdm(loader, desc="Training", leave=False):
+            batch = batch.to(self.device)
+            batch_data = self._process_batch(batch, is_hetero, hard_negatives_tensor)
             if batch_data is None:
                 continue
 
-            loss = self._compute_loss(model, batch_data, is_hetero)
+            loss = self._compute_loss(
+                model, batch_data, is_hetero, hard_negatives_tensor
+            )
             if loss is None:
                 continue
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
             optimizer.step()
 
             total_loss += loss.item()
@@ -253,23 +400,21 @@ class GNNTrainer:
         return total_loss / num_batches if num_batches > 0 else 0.0
 
     @torch.no_grad()
-    def validate(
-        self,
-        model: nn.Module,
-        loader: NeighborLoader,
-        is_hetero: bool,
-    ) -> float:
+    def validate(self, model, loader, is_hetero, hard_negatives_tensor):
         """Validate the model."""
         model.eval()
         total_loss = 0
         num_batches = 0
 
-        for batch in tqdm(loader, desc="Validation batches", leave=False):
-            batch_data = self._process_batch(batch, is_hetero)
+        for batch in tqdm(loader, desc="Validation", leave=False):
+            batch = batch.to(self.device)
+            batch_data = self._process_batch(batch, is_hetero, hard_negatives_tensor)
             if batch_data is None:
                 continue
 
-            loss = self._compute_loss(model, batch_data, is_hetero)
+            loss = self._compute_loss(
+                model, batch_data, is_hetero, hard_negatives_tensor
+            )
             if loss is None:
                 continue
 
@@ -284,74 +429,96 @@ class GNNTrainer:
         train_cutoff_year: int | None = None,
         val_cutoff_year: int | None = None,
     ) -> torch.nn.Module:
-        """
-        Train GNN model using preprocessed data from graph builder.
-
-        Args:
-            gnn_model: The GNN model to train
-            train_cutoff_year: Cutoff year for training data (e.g., 2018)
-            val_cutoff_year: Cutoff year for validation data (e.g., 2019)
-                            Should be after train_cutoff_year. If None, no validation.
-        """
+        """Train GNN model."""
         os.makedirs(self.output_path, exist_ok=True)
 
         print("\n" + "=" * 80)
-        print(f"Training GNN with {self.graph_type.capitalize()} Graph Builder")
+        print(f"Training GNN with {self.graph_type.capitalize()} Graph")
+        print(f"Include only citing: {self.include_only_citing}")
+        print(f"Hard negatives: {self.num_hard_negatives}")
         print("=" * 80)
 
-        # Build graph based on type
         is_hetero = self.graph_type == "heterogeneous"
 
-        # Type declarations
-        train_graph_data: Data | HeteroData
-        val_graph_data: Data | HeteroData | None
-        input_nodes: tuple[str, None] | None
-
+        # Build graphs
         if is_hetero:
-            hetero_builder = HeterogeneousGraphBuilder(self.preprocessed_dir)
-            train_graph_data = hetero_builder.build_graph(
+            builder = HeterogeneousGraphBuilder(self.preprocessed_dir)
+            train_graph_data = builder.build_graph(
                 train_cutoff_year=train_cutoff_year,
-                include_only_citing=True,
-            ).to(self.device)
+                include_only_citing=self.include_only_citing,
+            )
 
-            # Build validation graph if cutoff provided
+            # Compute hard negatives
+            train_hard_negatives = self._compute_hard_negatives(
+                train_graph_data["paragraph"].x,
+                train_graph_data.get(("paragraph", "cites", "paragraph"), {}).get(
+                    "edge_index", None
+                ),
+                train_cutoff_year,
+            )
+
+            train_graph_data = train_graph_data.to(self.device)
+
             if val_cutoff_year is not None:
-                print(
-                    f"\nBuilding validation graph (cutoff year: {val_cutoff_year})..."
-                )
-                val_graph_data = hetero_builder.build_graph(
+                val_graph_data = builder.build_graph(
                     train_cutoff_year=val_cutoff_year,
-                    include_only_citing=True,
-                ).to(self.device)
+                    include_only_citing=self.include_only_citing,
+                )
+                val_hard_negatives = self._compute_hard_negatives(
+                    val_graph_data["paragraph"].x,
+                    val_graph_data.get(("paragraph", "cites", "paragraph"), {}).get(
+                        "edge_index", None
+                    ),
+                    val_cutoff_year,
+                )
+                val_graph_data = val_graph_data.to(self.device)
             else:
                 val_graph_data = None
-                print("\nNo validation set - training without validation")
+                val_hard_negatives = None
 
             input_nodes = ("paragraph", None)
         else:
-            homo_builder = HomogeneousGraphBuilder(self.preprocessed_dir)
-            train_graph_data = homo_builder.build_graph(
+            builder = HomogeneousGraphBuilder(self.preprocessed_dir)
+            train_graph_data = builder.build_graph(
                 train_cutoff_year=train_cutoff_year,
-                include_only_citing=True,
-            ).to(self.device)
+                include_only_citing=self.include_only_citing,
+            )
 
-            # Build validation graph if cutoff provided
+            train_hard_negatives = self._compute_hard_negatives(
+                train_graph_data.x,
+                (
+                    train_graph_data.edge_index
+                    if train_graph_data.edge_index.numel() > 0
+                    else None
+                ),
+                train_cutoff_year,
+            )
+
+            train_graph_data = train_graph_data.to(self.device)
+
             if val_cutoff_year is not None:
-                print(
-                    f"\nBuilding validation graph (cutoff year: {val_cutoff_year})..."
-                )
-                val_graph_data = homo_builder.build_graph(
+                val_graph_data = builder.build_graph(
                     train_cutoff_year=val_cutoff_year,
-                    include_only_citing=True,
-                ).to(self.device)
+                    include_only_citing=self.include_only_citing,
+                )
+                val_hard_negatives = self._compute_hard_negatives(
+                    val_graph_data.x,
+                    (
+                        val_graph_data.edge_index
+                        if val_graph_data.edge_index.numel() > 0
+                        else None
+                    ),
+                    val_cutoff_year,
+                )
+                val_graph_data = val_graph_data.to(self.device)
             else:
                 val_graph_data = None
-                print("\nNo validation set - training without validation")
+                val_hard_negatives = None
 
             input_nodes = None
 
         # Initialize model
-        print("\nInitializing GNN model...")
+        print("\nInitializing model...")
         model = gnn_model.to(self.device)
 
         optimizer = AdamW(
@@ -361,7 +528,7 @@ class GNNTrainer:
         )
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
-        # Create data loaders
+        # Create loaders
         num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
 
         train_loader = NeighborLoader(
@@ -372,6 +539,7 @@ class GNNTrainer:
             shuffle=True,
             time_attr="time",
             subgraph_type="bidirectional",
+            num_workers=0,  # Set to 0 to avoid multiprocessing overhead
         )
 
         val_loader = None
@@ -384,31 +552,32 @@ class GNNTrainer:
                 shuffle=False,
                 time_attr="time",
                 subgraph_type="bidirectional",
+                num_workers=0,
             )
 
-        print(f"\nStarting training for {self.epochs} epochs...")
+        print(f"\nTraining for {self.epochs} epochs...")
 
         best_val_loss = float("inf")
         epochs_without_improvement = 0
 
         for epoch in range(self.epochs):
-            train_loss = self.train_epoch(model, train_loader, optimizer, is_hetero)
+            train_loss = self.train_epoch(
+                model, train_loader, optimizer, is_hetero, train_hard_negatives
+            )
 
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
-            # Validate if validation set is available
             if val_loader is not None:
-                val_loss = self.validate(model, val_loader, is_hetero)
+                val_loss = self.validate(
+                    model, val_loader, is_hetero, val_hard_negatives
+                )
                 print(f"  Val Loss:   {val_loss:.4f}")
 
-                # Save best model based on validation loss
                 if val_loss < best_val_loss:
                     improvement = best_val_loss - val_loss
                     torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                    print(
-                        f"  ✓ New best validation loss! (improved by {improvement:.4f})"
-                    )
+                    print(f"  ✓ Improved by {improvement:.4f}")
                     best_val_loss = val_loss
                     epochs_without_improvement = 0
                 else:
@@ -417,30 +586,19 @@ class GNNTrainer:
                         f"  ✗ No improvement ({epochs_without_improvement}/{self.patience})"
                     )
 
-                # Early stopping
                 if epochs_without_improvement >= self.patience:
-                    print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                    print(f"\nEarly stopping at epoch {epoch + 1}")
                     break
             else:
-                # No validation set - save based on training loss
                 if train_loss < best_val_loss:
                     torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                    print(
-                        f"  ✓ New best training loss: {best_val_loss:.4f} -> {train_loss:.4f}"
-                    )
+                    print(f"  ✓ New best: {train_loss:.4f}")
                     best_val_loss = train_loss
 
             scheduler.step()
 
-        # Save final model
         torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
-
-        # Load best model
-        print(f"\nLoading best model (val loss: {best_val_loss:.4f})...")
         model.load_state_dict(torch.load(f"{self.output_path}/best_model.pt"))
 
-        print(
-            f"Training complete! Best model saved to {self.output_path}/best_model.pt"
-        )
-
+        print(f"\nTraining complete! Best loss: {best_val_loss:.4f}")
         return model

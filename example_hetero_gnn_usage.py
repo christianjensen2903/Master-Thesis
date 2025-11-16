@@ -74,12 +74,15 @@ def train_homo_example() -> None:
         preprocessed_dir="data/preprocessed",
         output_path="checkpoints/homo_gnn",
         batch_size=2**10,
-        epochs=200,
+        epochs=400,
         learning_rate=5e-5,
         weight_decay=1e-4,
         temperature=0.07,
         num_hops=2,
         graph_type="homogeneous",  # Use homogeneous graph
+        num_hard_negatives=5,
+        hard_negative_pool_size=20,
+        patience=10,
     )
 
     # Train on paragraph pairs
