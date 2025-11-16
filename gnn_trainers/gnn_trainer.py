@@ -66,8 +66,10 @@ class GNNTrainer:
         graph_type: str = "heterogeneous",
         patience: int = 3,
         num_hard_negatives: int = 5,
-        hard_negative_pool_size: int = 100,
-        include_only_citing: bool = True,  # Add option to control this
+        hard_negative_pool_size: int = 300,  # Increased to accommodate range
+        hard_negative_start_rank: int = 100,  # Start sampling from rank 100
+        hard_negative_end_rank: int = 300,  # End sampling at rank 300
+        include_only_citing: bool = True,
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -81,16 +83,31 @@ class GNNTrainer:
         self.patience = patience
         self.num_hard_negatives = num_hard_negatives
         self.hard_negative_pool_size = hard_negative_pool_size
+        self.hard_negative_start_rank = hard_negative_start_rank
+        self.hard_negative_end_rank = hard_negative_end_rank or hard_negative_pool_size
         self.include_only_citing = include_only_citing
+
+        # Validate parameters
+        if self.hard_negative_start_rank >= self.hard_negative_end_rank:
+            raise ValueError(
+                "hard_negative_start_rank must be less than hard_negative_end_rank"
+            )
+        if self.hard_negative_end_rank > self.hard_negative_pool_size:
+            raise ValueError(
+                "hard_negative_end_rank cannot exceed hard_negative_pool_size"
+            )
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
         else:
             self.device = torch.device("cpu")
+
         print(f"Using device: {self.device}")
         print(f"Using graph type: {self.graph_type}")
         print(
-            f"Hard negatives: {num_hard_negatives} from pool of {hard_negative_pool_size}"
+            f"Hard negatives: sampling {num_hard_negatives} from ranks "
+            f"{hard_negative_start_rank}-{self.hard_negative_end_rank} "
+            f"(pool size: {hard_negative_pool_size})"
         )
         print(f"Include only citing: {include_only_citing}")
 
@@ -167,7 +184,7 @@ class GNNTrainer:
                     ) in positive_pairs:
                         sim[i, j] = -1e9
 
-            # Get top-k
+            # Get top-k (need full pool size to sample from range)
             _, topk_indices = torch.topk(
                 sim, k=min(self.hard_negative_pool_size, num_nodes - 1), dim=-1
             )
@@ -248,7 +265,7 @@ class GNNTrainer:
             }
 
     def _compute_loss(self, model, batch_data, is_hetero, hard_negatives_tensor):
-        """Optimized loss computation."""
+        """Optimized loss computation with configurable hard negative sampling range."""
         batch_size = batch_data["batch_size"]
         edge_index = batch_data["edge_index"]
         node_ids = batch_data["node_ids"]
@@ -288,67 +305,86 @@ class GNNTrainer:
 
         positive_emb = embeddings[positive_indices]
 
-        # Optimized hard negative sampling
+        # Optimized hard negative sampling with configurable range
         if node_ids is not None and hard_negatives_tensor is not None:
             anchor_global_ids = node_ids[:batch_size]
 
-            # Vectorized lookup of hard negatives
-            # Sample indices efficiently
-            num_to_sample = min(self.num_hard_negatives, hard_negatives_tensor.size(1))
+            # Calculate the valid sampling range
+            start_idx = self.hard_negative_start_rank
+            end_idx = min(self.hard_negative_end_rank, hard_negatives_tensor.size(1))
+            sampling_range = end_idx - start_idx
 
-            # Random sampling from pool for all anchors at once
-            random_indices = torch.randint(
-                0,
-                hard_negatives_tensor.size(1),
-                (batch_size, num_to_sample),
-                device=self.device,
-            )
-
-            # Gather hard negative global IDs
-            hard_neg_global_ids = torch.gather(
-                hard_negatives_tensor[anchor_global_ids], 1, random_indices
-            )  # [batch_size, num_hard_negatives]
-
-            # Create mapping from global ID to batch position (vectorized)
-            # This is the key optimization - use broadcasting instead of loops
-            batch_positions = torch.arange(embeddings.size(0), device=self.device)
-
-            # For each hard negative, find its position in the batch
-            # Use broadcasting: [batch_size, num_hard_neg, 1] vs [1, 1, num_nodes_in_batch]
-            matches = hard_neg_global_ids.unsqueeze(-1) == node_ids.unsqueeze(
-                0
-            ).unsqueeze(0)
-
-            # Get first match for each (should only be one)
-            hard_neg_batch_indices = matches.long().argmax(dim=-1)
-
-            # Handle cases where hard negative is not in batch (use random fallback)
-            not_found = ~matches.any(dim=-1)
-            if not_found.any():
-                # Use random nodes from the batch as fallback
-                # Fix: Handle case when batch_size >= embeddings.shape[0]
+            if sampling_range <= 0:
+                # Fallback to random negatives if range is invalid
+                print("Warning: Invalid sampling range, using random negatives")
                 if embeddings.size(0) > batch_size:
-                    # Sample from nodes outside the anchor batch
-                    random_fallback = torch.randint(
+                    random_indices = torch.randint(
                         batch_size,
                         embeddings.size(0),
-                        (not_found.sum(),),
+                        (batch_size, self.num_hard_negatives),
                         device=self.device,
                     )
                 else:
-                    # All nodes are anchors, sample from any node
-                    random_fallback = torch.randint(
-                        0, embeddings.size(0), (not_found.sum(),), device=self.device
+                    random_indices = torch.randint(
+                        0,
+                        embeddings.size(0),
+                        (batch_size, self.num_hard_negatives),
+                        device=self.device,
                     )
-                hard_neg_batch_indices[not_found] = random_fallback
+                hard_neg_emb = embeddings[random_indices]
+            else:
+                # Sample from the specified rank range (e.g., ranks 100-300)
+                num_to_sample = min(self.num_hard_negatives, sampling_range)
 
-            # Gather hard negative embeddings
-            hard_neg_emb = embeddings[hard_neg_batch_indices]
+                # Random sampling from the specified range for all anchors at once
+                random_indices = torch.randint(
+                    start_idx,
+                    end_idx,
+                    (batch_size, num_to_sample),
+                    device=self.device,
+                )
+
+                # Gather hard negative global IDs from the specified range
+                hard_neg_global_ids = torch.gather(
+                    hard_negatives_tensor[anchor_global_ids], 1, random_indices
+                )  # [batch_size, num_hard_negatives]
+
+                # Create mapping from global ID to batch position (vectorized)
+                batch_positions = torch.arange(embeddings.size(0), device=self.device)
+
+                # For each hard negative, find its position in the batch
+                matches = hard_neg_global_ids.unsqueeze(-1) == node_ids.unsqueeze(
+                    0
+                ).unsqueeze(0)
+
+                # Get first match for each (should only be one)
+                hard_neg_batch_indices = matches.long().argmax(dim=-1)
+
+                # Handle cases where hard negative is not in batch (use random fallback)
+                not_found = ~matches.any(dim=-1)
+                if not_found.any():
+                    # Use random nodes from the batch as fallback
+                    if embeddings.size(0) > batch_size:
+                        random_fallback = torch.randint(
+                            batch_size,
+                            embeddings.size(0),
+                            (not_found.sum(),),
+                            device=self.device,
+                        )
+                    else:
+                        random_fallback = torch.randint(
+                            0,
+                            embeddings.size(0),
+                            (not_found.sum(),),
+                            device=self.device,
+                        )
+                    hard_neg_batch_indices[not_found] = random_fallback
+
+                # Gather hard negative embeddings
+                hard_neg_emb = embeddings[hard_neg_batch_indices]
         else:
             # Fallback: random negatives
-            # Fix: Handle case when batch_size >= embeddings.shape[0]
             if embeddings.size(0) > batch_size:
-                # Sample from nodes outside anchor batch
                 random_indices = torch.randint(
                     batch_size,
                     embeddings.size(0),
@@ -356,7 +392,6 @@ class GNNTrainer:
                     device=self.device,
                 )
             else:
-                # Sample from any nodes (including anchors)
                 random_indices = torch.randint(
                     0,
                     embeddings.size(0),
@@ -435,7 +470,10 @@ class GNNTrainer:
         print("\n" + "=" * 80)
         print(f"Training GNN with {self.graph_type.capitalize()} Graph")
         print(f"Include only citing: {self.include_only_citing}")
-        print(f"Hard negatives: {self.num_hard_negatives}")
+        print(
+            f"Hard negatives: {self.num_hard_negatives} sampled from ranks "
+            f"{self.hard_negative_start_rank}-{self.hard_negative_end_rank}"
+        )
         print("=" * 80)
 
         is_hetero = self.graph_type == "heterogeneous"

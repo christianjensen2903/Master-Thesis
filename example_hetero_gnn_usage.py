@@ -80,8 +80,6 @@ def train_homo_example() -> None:
         temperature=0.07,
         num_hops=2,
         graph_type="homogeneous",  # Use homogeneous graph
-        num_hard_negatives=5,
-        hard_negative_pool_size=20,
         patience=10,
     )
 
