@@ -119,20 +119,27 @@ class GNNTrainer:
         cache_dir = Path(self.preprocessed_dir) / "hard_negatives_cache"
         cache_dir.mkdir(exist_ok=True)
 
-        # Create unique hash based on configuration
-        config_str = f"{num_nodes}_{train_cutoff_year}_{include_only_citing}_{self.hard_negative_pool_size}_{self.graph_type}"
+        # Create unique hash based on configuration (now includes temporal flag)
+        config_str = f"{num_nodes}_{train_cutoff_year}_{include_only_citing}_{self.hard_negative_pool_size}_{self.graph_type}_temporal"
         config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
 
         cache_file = cache_dir / f"hard_neg_{config_hash}.pt"
         return cache_file
 
     def _compute_hard_negatives(
-        self, embeddings, edge_index=None, train_cutoff_year=None
+        self, embeddings, edge_index=None, train_cutoff_year=None, time_attr=None
     ):
         """
         Pre-compute hard negatives based on initial embeddings.
         Uses caching to avoid recomputation.
         Optimized for large graphs with vectorized operations.
+        Now includes temporal filtering: only papers published BEFORE the anchor can be negatives.
+
+        Args:
+            embeddings: Node embeddings
+            edge_index: Graph edges (for positive pair filtering)
+            train_cutoff_year: Training cutoff year
+            time_attr: Tensor of timestamps/years for each node (required for temporal filtering)
         """
         num_nodes = embeddings.shape[0]
 
@@ -149,8 +156,15 @@ class GNNTrainer:
 
         print(f"\nComputing hard negatives (will cache to {cache_path})...")
         print(f"Number of nodes: {num_nodes}")
+        print(
+            f"Temporal filtering: {'ENABLED' if time_attr is not None else 'DISABLED'}"
+        )
         embeddings = embeddings.to(self.device)
         embeddings_norm = F.normalize(embeddings, dim=-1)
+
+        # Move time attributes to device if provided
+        if time_attr is not None:
+            time_attr = time_attr.to(self.device)
 
         # Build positive edge lookup (dict for fast access)
         positive_edges = None
@@ -208,6 +222,19 @@ class GNNTrainer:
                 -1e9
             )
 
+            # TEMPORAL FILTERING: Mask out papers published AFTER the anchor
+            if time_attr is not None:
+                # Get times for current batch of anchors
+                batch_times = time_attr[start_idx:end_idx]  # [batch_size]
+
+                # Compare with all node times
+                # Only keep candidates where candidate_time <= anchor_time
+                # Shape: [batch_size, num_nodes]
+                temporal_mask = time_attr.unsqueeze(0) > batch_times.unsqueeze(1)
+
+                # Mask out future papers (set their similarity to very low)
+                sim[temporal_mask] = -1e9
+
             # Mask out positive pairs efficiently using dictionary lookup
             if positive_edges is not None:
                 for i in range(current_batch_size):
@@ -238,8 +265,93 @@ class GNNTrainer:
         hard_negatives = hard_negatives.to(self.device)
         return hard_negatives
 
-    def _process_batch(self, batch, is_hetero, hard_negatives_tensor):
-        """Process batch - optimized version."""
+    def _sample_random_negatives_with_temporal_filter(
+        self, embeddings, batch_size, node_ids, time_attr
+    ):
+        """
+        Sample random negatives with temporal filtering.
+        Only samples nodes published before each anchor.
+
+        Args:
+            embeddings: All node embeddings in the batch
+            batch_size: Number of anchor nodes
+            node_ids: Global node IDs for all nodes in batch
+            time_attr: Global time attributes for all nodes
+
+        Returns:
+            hard_neg_emb: [batch_size, num_hard_negatives, dim]
+        """
+        hard_neg_indices = torch.zeros(
+            (batch_size, self.num_hard_negatives), dtype=torch.long, device=self.device
+        )
+
+        if time_attr is not None and node_ids is not None:
+            # Sample with temporal filtering
+            anchor_global_ids = node_ids[:batch_size]
+            anchor_times = time_attr[anchor_global_ids]
+            batch_node_times = time_attr[node_ids]
+
+            for i in range(batch_size):
+                # Find nodes published before this anchor
+                valid_mask = batch_node_times <= anchor_times[i]
+                valid_mask[i] = False  # Exclude self
+
+                # Prefer non-anchor nodes if available
+                if embeddings.size(0) > batch_size:
+                    valid_mask[:batch_size] = False
+
+                valid_indices = torch.where(valid_mask)[0]
+
+                if len(valid_indices) >= self.num_hard_negatives:
+                    # Enough valid candidates
+                    selected = valid_indices[
+                        torch.randperm(len(valid_indices))[: self.num_hard_negatives]
+                    ]
+                    hard_neg_indices[i] = selected
+                elif len(valid_indices) > 0:
+                    # Some valid candidates, sample with replacement
+                    hard_neg_indices[i] = valid_indices[
+                        torch.randint(0, len(valid_indices), (self.num_hard_negatives,))
+                    ]
+                else:
+                    # No valid candidates (edge case), fall back to any non-self
+                    fallback_mask = torch.ones(
+                        embeddings.size(0), dtype=torch.bool, device=self.device
+                    )
+                    fallback_mask[i] = False
+                    fallback_indices = torch.where(fallback_mask)[0]
+                    if len(fallback_indices) > 0:
+                        hard_neg_indices[i] = fallback_indices[
+                            torch.randint(
+                                0, len(fallback_indices), (self.num_hard_negatives,)
+                            )
+                        ]
+                    else:
+                        # Absolute fallback (single node case)
+                        hard_neg_indices[i] = 0
+        else:
+            # No temporal filtering, use original random sampling
+            if embeddings.size(0) > batch_size:
+                hard_neg_indices = torch.randint(
+                    batch_size,
+                    embeddings.size(0),
+                    (batch_size, self.num_hard_negatives),
+                    device=self.device,
+                )
+            else:
+                hard_neg_indices = torch.randint(
+                    0,
+                    embeddings.size(0),
+                    (batch_size, self.num_hard_negatives),
+                    device=self.device,
+                )
+
+        return embeddings[hard_neg_indices]
+
+    def _process_batch(
+        self, batch, is_hetero, hard_negatives_tensor, graph_time_attr=None
+    ):
+        """Process batch - optimized version with temporal info extraction."""
         if is_hetero:
             batch_size = batch["paragraph"].batch_size
             x = batch["paragraph"].x.clone()
@@ -303,8 +415,10 @@ class GNNTrainer:
                 "node_ids": node_ids,
             }
 
-    def _compute_loss(self, model, batch_data, is_hetero, hard_negatives_tensor):
-        """Optimized loss computation with configurable hard negative sampling range."""
+    def _compute_loss(
+        self, model, batch_data, is_hetero, hard_negatives_tensor, time_attr=None
+    ):
+        """Optimized loss computation with configurable hard negative sampling range and temporal filtering."""
         batch_size = batch_data["batch_size"]
         edge_index = batch_data["edge_index"]
         node_ids = batch_data["node_ids"]
@@ -344,7 +458,7 @@ class GNNTrainer:
 
         positive_emb = embeddings[positive_indices]
 
-        # Optimized hard negative sampling with configurable range
+        # Optimized hard negative sampling with configurable range and temporal filtering
         if node_ids is not None and hard_negatives_tensor is not None:
             anchor_global_ids = node_ids[:batch_size]
 
@@ -356,21 +470,9 @@ class GNNTrainer:
             if sampling_range <= 0:
                 # Fallback to random negatives if range is invalid
                 print("Warning: Invalid sampling range, using random negatives")
-                if embeddings.size(0) > batch_size:
-                    random_indices = torch.randint(
-                        batch_size,
-                        embeddings.size(0),
-                        (batch_size, self.num_hard_negatives),
-                        device=self.device,
-                    )
-                else:
-                    random_indices = torch.randint(
-                        0,
-                        embeddings.size(0),
-                        (batch_size, self.num_hard_negatives),
-                        device=self.device,
-                    )
-                hard_neg_emb = embeddings[random_indices]
+                hard_neg_emb = self._sample_random_negatives_with_temporal_filter(
+                    embeddings, batch_size, node_ids, time_attr
+                )
             else:
                 # Sample from the specified rank range (e.g., ranks 100-300)
                 num_to_sample = min(self.num_hard_negatives, sampling_range)
@@ -388,6 +490,92 @@ class GNNTrainer:
                     hard_negatives_tensor[anchor_global_ids], 1, random_indices
                 )  # [batch_size, num_hard_negatives]
 
+                # TEMPORAL FILTERING: Only keep hard negatives published before anchor
+                if time_attr is not None and node_ids is not None:
+                    # Get anchor times
+                    anchor_times = time_attr[anchor_global_ids]  # [batch_size]
+
+                    # Get hard negative times
+                    hard_neg_times = time_attr[
+                        hard_neg_global_ids
+                    ]  # [batch_size, num_hard_negatives]
+
+                    # Mask: keep only negatives where neg_time <= anchor_time
+                    temporal_valid = hard_neg_times <= anchor_times.unsqueeze(
+                        1
+                    )  # [batch_size, num_hard_negatives]
+
+                    # For invalid (future) negatives, we'll need to replace them
+                    # Count valid negatives per anchor
+                    num_valid = temporal_valid.sum(dim=1)  # [batch_size]
+
+                    # If some anchors don't have enough valid negatives, we need to handle this
+                    min_valid = num_valid.min().item()
+                    if min_valid == 0:
+                        # Some anchors have no valid hard negatives from the precomputed list
+                        # Fall back to sampling from in-batch negatives with temporal filter
+                        hard_neg_emb = (
+                            self._sample_random_negatives_with_temporal_filter(
+                                embeddings, batch_size, node_ids, time_attr
+                            )
+                        )
+                    else:
+                        # We have at least some valid negatives for each anchor
+                        # For simplicity, take the first k valid ones
+                        # Create a list to store final hard negative IDs
+                        final_hard_neg_ids = torch.zeros(
+                            (batch_size, num_to_sample),
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+
+                        for i in range(batch_size):
+                            valid_mask = temporal_valid[i]
+                            valid_ids = hard_neg_global_ids[i][valid_mask]
+
+                            if len(valid_ids) >= num_to_sample:
+                                # We have enough valid negatives
+                                final_hard_neg_ids[i] = valid_ids[:num_to_sample]
+                            else:
+                                # Not enough valid negatives, use what we have and pad with in-batch
+                                final_hard_neg_ids[i, : len(valid_ids)] = valid_ids
+
+                                # Fill remaining with random in-batch negatives (with temporal filter)
+                                num_needed = num_to_sample - len(valid_ids)
+                                anchor_time = anchor_times[i]
+
+                                # Find in-batch nodes published before this anchor
+                                batch_node_times = time_attr[node_ids]
+                                valid_batch_mask = batch_node_times <= anchor_time
+
+                                # Exclude the anchor itself and positives
+                                valid_batch_mask[i] = False  # Exclude self
+                                if edge_index is not None and edge_index.numel() > 0:
+                                    # Also exclude positive samples (rough approximation)
+                                    valid_batch_mask[:batch_size] = False
+
+                                valid_batch_indices = torch.where(valid_batch_mask)[0]
+
+                                if len(valid_batch_indices) >= num_needed:
+                                    random_fill = valid_batch_indices[
+                                        torch.randperm(len(valid_batch_indices))[
+                                            :num_needed
+                                        ]
+                                    ]
+                                    final_hard_neg_ids[i, len(valid_ids) :] = node_ids[
+                                        random_fill
+                                    ]
+                                else:
+                                    # Not enough valid in-batch either, use what we have
+                                    if len(valid_batch_indices) > 0:
+                                        final_hard_neg_ids[
+                                            i,
+                                            len(valid_ids) : len(valid_ids)
+                                            + len(valid_batch_indices),
+                                        ] = node_ids[valid_batch_indices]
+
+                        hard_neg_global_ids = final_hard_neg_ids
+
                 # Create mapping from global ID to batch position (vectorized)
                 batch_positions = torch.arange(embeddings.size(0), device=self.device)
 
@@ -399,45 +587,62 @@ class GNNTrainer:
                 # Get first match for each (should only be one)
                 hard_neg_batch_indices = matches.long().argmax(dim=-1)
 
-                # Handle cases where hard negative is not in batch (use random fallback)
+                # Handle cases where hard negative is not in batch (use random fallback with temporal filter)
                 not_found = ~matches.any(dim=-1)
                 if not_found.any():
-                    # Use random nodes from the batch as fallback
-                    if embeddings.size(0) > batch_size:
-                        random_fallback = torch.randint(
-                            batch_size,
-                            embeddings.size(0),
-                            (not_found.sum(),),
-                            device=self.device,
-                        )
+                    # Use temporally valid random nodes from the batch as fallback
+                    if time_attr is not None and node_ids is not None:
+                        for i in range(batch_size):
+                            for j in range(num_to_sample):
+                                if not_found[i, j]:
+                                    # Find valid candidates for this anchor
+                                    anchor_time = time_attr[anchor_global_ids[i]]
+                                    batch_node_times = time_attr[node_ids]
+                                    valid_mask = batch_node_times <= anchor_time
+                                    valid_mask[i] = False  # Exclude self
+                                    if embeddings.size(0) > batch_size:
+                                        valid_mask[:batch_size] = (
+                                            False  # Prefer non-anchor nodes
+                                        )
+
+                                    valid_indices = torch.where(valid_mask)[0]
+                                    if len(valid_indices) > 0:
+                                        hard_neg_batch_indices[i, j] = valid_indices[
+                                            torch.randint(0, len(valid_indices), (1,))
+                                        ].item()
+                                    else:
+                                        # Absolute fallback: any non-self node
+                                        fallback_idx = (
+                                            (i + 1) % embeddings.size(0)
+                                            if embeddings.size(0) > 1
+                                            else 0
+                                        )
+                                        hard_neg_batch_indices[i, j] = fallback_idx
                     else:
-                        random_fallback = torch.randint(
-                            0,
-                            embeddings.size(0),
-                            (not_found.sum(),),
-                            device=self.device,
-                        )
-                    hard_neg_batch_indices[not_found] = random_fallback
+                        # No temporal info, use original random fallback
+                        if embeddings.size(0) > batch_size:
+                            random_fallback = torch.randint(
+                                batch_size,
+                                embeddings.size(0),
+                                (not_found.sum(),),
+                                device=self.device,
+                            )
+                        else:
+                            random_fallback = torch.randint(
+                                0,
+                                embeddings.size(0),
+                                (not_found.sum(),),
+                                device=self.device,
+                            )
+                        hard_neg_batch_indices[not_found] = random_fallback
 
                 # Gather hard negative embeddings
                 hard_neg_emb = embeddings[hard_neg_batch_indices]
         else:
-            # Fallback: random negatives
-            if embeddings.size(0) > batch_size:
-                random_indices = torch.randint(
-                    batch_size,
-                    embeddings.size(0),
-                    (batch_size, self.num_hard_negatives),
-                    device=self.device,
-                )
-            else:
-                random_indices = torch.randint(
-                    0,
-                    embeddings.size(0),
-                    (batch_size, self.num_hard_negatives),
-                    device=self.device,
-                )
-            hard_neg_emb = embeddings[random_indices]
+            # Fallback: random negatives with temporal filtering if available
+            hard_neg_emb = self._sample_random_negatives_with_temporal_filter(
+                embeddings, batch_size, node_ids, time_attr
+            )
 
         # Compute loss
         loss = info_nce_loss_fast(
@@ -445,7 +650,9 @@ class GNNTrainer:
         )
         return loss
 
-    def train_epoch(self, model, loader, optimizer, is_hetero, hard_negatives_tensor):
+    def train_epoch(
+        self, model, loader, optimizer, is_hetero, hard_negatives_tensor, time_attr=None
+    ):
         """Train for one epoch."""
         model.train()
         total_loss = 0
@@ -453,12 +660,14 @@ class GNNTrainer:
 
         for batch in tqdm(loader, desc="Training", leave=False):
             batch = batch.to(self.device)
-            batch_data = self._process_batch(batch, is_hetero, hard_negatives_tensor)
+            batch_data = self._process_batch(
+                batch, is_hetero, hard_negatives_tensor, time_attr
+            )
             if batch_data is None:
                 continue
 
             loss = self._compute_loss(
-                model, batch_data, is_hetero, hard_negatives_tensor
+                model, batch_data, is_hetero, hard_negatives_tensor, time_attr
             )
             if loss is None:
                 continue
@@ -474,7 +683,7 @@ class GNNTrainer:
         return total_loss / num_batches if num_batches > 0 else 0.0
 
     @torch.no_grad()
-    def validate(self, model, loader, is_hetero, hard_negatives_tensor):
+    def validate(self, model, loader, is_hetero, hard_negatives_tensor, time_attr=None):
         """Validate the model."""
         model.eval()
         total_loss = 0
@@ -482,12 +691,14 @@ class GNNTrainer:
 
         for batch in tqdm(loader, desc="Validation", leave=False):
             batch = batch.to(self.device)
-            batch_data = self._process_batch(batch, is_hetero, hard_negatives_tensor)
+            batch_data = self._process_batch(
+                batch, is_hetero, hard_negatives_tensor, time_attr
+            )
             if batch_data is None:
                 continue
 
             loss = self._compute_loss(
-                model, batch_data, is_hetero, hard_negatives_tensor
+                model, batch_data, is_hetero, hard_negatives_tensor, time_attr
             )
             if loss is None:
                 continue
@@ -509,6 +720,7 @@ class GNNTrainer:
         print("\n" + "=" * 80)
         print(f"Training GNN with {self.graph_type.capitalize()} Graph")
         print(f"Include only citing: {self.include_only_citing}")
+        print(f"Temporal filtering for hard negatives: ENABLED")
         print(
             f"Hard negatives: {self.num_hard_negatives} sampled from ranks "
             f"{self.hard_negative_start_rank}-{self.hard_negative_end_rank}"
@@ -525,13 +737,21 @@ class GNNTrainer:
                 include_only_citing=self.include_only_citing,
             )
 
-            # Compute hard negatives
+            # Extract time attribute for temporal filtering
+            time_attr = (
+                train_graph_data["paragraph"].time
+                if hasattr(train_graph_data["paragraph"], "time")
+                else None
+            )
+
+            # Compute hard negatives WITH temporal filtering
             train_hard_negatives = self._compute_hard_negatives(
                 train_graph_data["paragraph"].x,
                 train_graph_data.get(("paragraph", "cites", "paragraph"), {}).get(
                     "edge_index", None
                 ),
                 train_cutoff_year,
+                time_attr=time_attr,
             )
 
             train_graph_data = train_graph_data.to(self.device)
@@ -541,17 +761,24 @@ class GNNTrainer:
                     train_cutoff_year=val_cutoff_year,
                     include_only_citing=self.include_only_citing,
                 )
+                val_time_attr = (
+                    val_graph_data["paragraph"].time
+                    if hasattr(val_graph_data["paragraph"], "time")
+                    else None
+                )
                 val_hard_negatives = self._compute_hard_negatives(
                     val_graph_data["paragraph"].x,
                     val_graph_data.get(("paragraph", "cites", "paragraph"), {}).get(
                         "edge_index", None
                     ),
                     val_cutoff_year,
+                    time_attr=val_time_attr,
                 )
                 val_graph_data = val_graph_data.to(self.device)
             else:
                 val_graph_data = None
                 val_hard_negatives = None
+                val_time_attr = None
 
             input_nodes = ("paragraph", None)
         else:
@@ -559,6 +786,11 @@ class GNNTrainer:
             train_graph_data = builder.build_graph(
                 train_cutoff_year=train_cutoff_year,
                 include_only_citing=self.include_only_citing,
+            )
+
+            # Extract time attribute for temporal filtering
+            time_attr = (
+                train_graph_data.time if hasattr(train_graph_data, "time") else None
             )
 
             train_hard_negatives = self._compute_hard_negatives(
@@ -569,6 +801,7 @@ class GNNTrainer:
                     else None
                 ),
                 train_cutoff_year,
+                time_attr=time_attr,
             )
 
             train_graph_data = train_graph_data.to(self.device)
@@ -578,6 +811,9 @@ class GNNTrainer:
                     train_cutoff_year=val_cutoff_year,
                     include_only_citing=self.include_only_citing,
                 )
+                val_time_attr = (
+                    val_graph_data.time if hasattr(val_graph_data, "time") else None
+                )
                 val_hard_negatives = self._compute_hard_negatives(
                     val_graph_data.x,
                     (
@@ -586,11 +822,13 @@ class GNNTrainer:
                         else None
                     ),
                     val_cutoff_year,
+                    time_attr=val_time_attr,
                 )
                 val_graph_data = val_graph_data.to(self.device)
             else:
                 val_graph_data = None
                 val_hard_negatives = None
+                val_time_attr = None
 
             input_nodes = None
 
@@ -639,7 +877,12 @@ class GNNTrainer:
 
         for epoch in range(self.epochs):
             train_loss = self.train_epoch(
-                model, train_loader, optimizer, is_hetero, train_hard_negatives
+                model,
+                train_loader,
+                optimizer,
+                is_hetero,
+                train_hard_negatives,
+                time_attr,
             )
 
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
@@ -647,7 +890,7 @@ class GNNTrainer:
 
             if val_loader is not None:
                 val_loss = self.validate(
-                    model, val_loader, is_hetero, val_hard_negatives
+                    model, val_loader, is_hetero, val_hard_negatives, val_time_attr
                 )
                 print(f"  Val Loss:   {val_loss:.4f}")
 
