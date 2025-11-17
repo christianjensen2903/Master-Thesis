@@ -42,6 +42,9 @@ class EmbeddingPreprocessor:
         Creates:
         - paragraph_embeddings_doc.npy: Pre-computed embeddings for documents (cited paragraphs)
         - paragraph_embeddings_query.npy: Pre-computed masked embeddings for queries (citing paragraphs)
+        - paragraph_embeddings_subject_matter.npy: Pre-computed embeddings for subject matter metadata
+        - paragraph_embeddings_keywords.npy: Pre-computed embeddings for keywords metadata
+        - paragraph_embeddings_case_law_about.npy: Pre-computed embeddings for case law about metadata
         - paragraph_metadata.pkl: Metadata for each paragraph
         - paragraph_index.json: Human-readable index mapping
         """
@@ -133,6 +136,45 @@ class EmbeddingPreprocessor:
             convert_to_numpy=True,
         )
 
+        # Extract and format metadata fields for embeddings
+        print("Extracting metadata fields...")
+        subject_matter_texts = []
+        keywords_texts = []
+        case_law_about_texts = []
+
+        for p in paragraphs_data:
+            meta = p.get("meta", {})
+            subject_matter_texts.append(self._format_list(meta.get("subject_matter")))
+            keywords_texts.append(self._format_list(meta.get("keywords")))
+            case_law_about_texts.append(
+                self._format_case_law_about(meta.get("case_law_about"))
+            )
+
+        # Encode metadata embeddings
+        print("Encoding subject matter embeddings...")
+        subject_matter_embeddings = self.encoder.encode(
+            subject_matter_texts,
+            batch_size=self.batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+
+        print("Encoding keywords embeddings...")
+        keywords_embeddings = self.encoder.encode(
+            keywords_texts,
+            batch_size=self.batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+
+        print("Encoding case law about embeddings...")
+        case_law_about_embeddings = self.encoder.encode(
+            case_law_about_texts,
+            batch_size=self.batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+
         # Save outputs
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -140,6 +182,15 @@ class EmbeddingPreprocessor:
         print("Saving paragraph embeddings...")
         np.save(output_path / "paragraph_embeddings_doc.npy", doc_embeddings)
         np.save(output_path / "paragraph_embeddings_query.npy", query_embeddings)
+        np.save(
+            output_path / "paragraph_embeddings_subject_matter.npy",
+            subject_matter_embeddings,
+        )
+        np.save(output_path / "paragraph_embeddings_keywords.npy", keywords_embeddings)
+        np.save(
+            output_path / "paragraph_embeddings_case_law_about.npy",
+            case_law_about_embeddings,
+        )
 
         print("Saving paragraph metadata...")
         # Create simplified metadata (without text to reduce size)
@@ -163,7 +214,7 @@ class EmbeddingPreprocessor:
             json.dump(index, f, indent=2)
 
         print(
-            f"✓ Saved {len(paragraphs_data)} paragraph embeddings (doc + query) to {output_path}"
+            f"✓ Saved {len(paragraphs_data)} paragraph embeddings (doc + query + subject_matter + keywords + case_law_about) to {output_path}"
         )
 
     def process_legal_acts(
@@ -302,6 +353,19 @@ class EmbeddingPreprocessor:
             pickle.dump(citations, f)
 
         print(f"✓ Saved {len(citations)} citation edges to {output_path}")
+
+    def _format_list(self, items: list[str] | None) -> str:
+        """Format a list of strings by joining with '. '."""
+        if not items:
+            return ""
+        return ". ".join(str(item) for item in items if item)
+
+    def _format_case_law_about(self, case_law_about: dict[str, Any] | None) -> str:
+        """Format case law about dict by extracting values and joining with '. '."""
+        if not case_law_about:
+            return ""
+        values = [str(v) for v in case_law_about.values() if v]
+        return ". ".join(values)
 
     def _get_date_range(
         self, paragraphs_data: list[dict[str, Any]]
