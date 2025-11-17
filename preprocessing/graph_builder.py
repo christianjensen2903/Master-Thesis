@@ -79,6 +79,60 @@ class BaseGraphBuilder(ABC):
         except (ValueError, AttributeError):
             return 0
 
+    def _extract_date_features(self, date_str: str | None) -> np.ndarray:
+        """Extract date feature: normalized days since 1954-01-01 (max 2025-12-31)."""
+        if not date_str:
+            # Return zero for missing dates
+            return np.array([0.0], dtype=np.float32)
+        try:
+            dt = datetime.fromisoformat(date_str)
+            # Calculate days since 1954-01-01
+            base_date = datetime(1954, 1, 1)
+            max_date = datetime(2025, 12, 31)
+            days_since_base = (dt - base_date).days
+            max_days = (max_date - base_date).days
+
+            # Normalize to [0, 1] range, clamping values outside range
+            time_norm = max(0.0, min(1.0, days_since_base / max_days))
+            return np.array([time_norm], dtype=np.float32)
+        except (ValueError, AttributeError):
+            return np.array([0.0], dtype=np.float32)
+
+    def _compute_relative_positions(self, selected_pars: list[int]) -> dict[int, float]:
+        """Compute relative paragraph positions within each case.
+
+        Positions are computed relative to ALL paragraphs in each case,
+        not just the selected/filtered ones.
+        """
+        # First, collect ALL paragraphs for each case to get total counts
+        case_to_all_pars: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for par_idx, meta in enumerate(self.par_metadata):
+            celex = meta["celex"]
+            par_num = meta.get("paragraph_number", 0)
+            case_to_all_pars[celex].append((par_idx, par_num))
+
+        # Build mapping from paragraph index to its position in the full case
+        par_idx_to_position: dict[int, float] = {}
+        for celex, all_pars in case_to_all_pars.items():
+            # Sort all paragraphs by paragraph number
+            sorted_pars = sorted(all_pars, key=lambda x: x[1])
+            total_pars = len(sorted_pars)
+
+            if total_pars == 1:
+                # Single paragraph case
+                par_idx_to_position[sorted_pars[0][0]] = 0.5
+            else:
+                # Normalize position to [0, 1] based on position in full case
+                for i, (par_idx, _) in enumerate(sorted_pars):
+                    par_idx_to_position[par_idx] = i / (total_pars - 1)
+
+        # Return positions only for selected paragraphs
+        relative_positions: dict[int, float] = {}
+        for par_idx in selected_pars:
+            relative_positions[par_idx] = par_idx_to_position.get(par_idx, 0.5)
+
+        return relative_positions
+
     def _filter_paragraphs(
         self, include_only_citing: bool, train_cutoff_year: int | None
     ) -> list[int]:
@@ -162,6 +216,9 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         # Filter paragraphs
         selected_pars = self._filter_paragraphs(include_only_citing, train_cutoff_year)
 
+        # Compute relative paragraph positions
+        relative_positions = self._compute_relative_positions(selected_pars)
+
         # Build node mappings
         node_id_to_idx: dict[str, int] = {}
         idx_to_metadata: dict[int, dict] = {}
@@ -169,6 +226,8 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         query_embeddings_list = []
         node_times = []
         node_ids = []
+        date_features_list = []
+        position_features_list = []
 
         for par_idx in selected_pars:
             meta = self.par_metadata[par_idx]
@@ -185,6 +244,13 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             date_str = meta.get("date")
             node_times.append(self._date_to_timestamp(date_str))
 
+            # Extract date features
+            date_features_list.append(self._extract_date_features(date_str))
+
+            # Add relative position feature
+            rel_pos = relative_positions.get(par_idx, 0.5)
+            position_features_list.append(np.array([rel_pos], dtype=np.float32))
+
         # Build citation edges (bidirectional)
         edge_list = []
         for src_id, tgt_id in self.citations:
@@ -196,8 +262,26 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
                 edge_list.append([tgt_idx, src_idx])
 
         # Create PyTorch Geometric Data
-        x_doc = torch.tensor(np.array(doc_embeddings_list), dtype=torch.float32)
-        x_query = torch.tensor(np.array(query_embeddings_list), dtype=torch.float32)
+        # Concatenate embeddings with date and position features
+        date_features_tensor = torch.tensor(
+            np.array(date_features_list), dtype=torch.float32
+        )
+        position_features_tensor = torch.tensor(
+            np.array(position_features_list), dtype=torch.float32
+        )
+
+        # Concatenate: [embeddings, date_features, position_features]
+        x_doc_base = torch.tensor(np.array(doc_embeddings_list), dtype=torch.float32)
+        x_query_base = torch.tensor(
+            np.array(query_embeddings_list), dtype=torch.float32
+        )
+
+        x_doc = torch.cat(
+            [x_doc_base, date_features_tensor, position_features_tensor], dim=1
+        )
+        x_query = torch.cat(
+            [x_query_base, date_features_tensor, position_features_tensor], dim=1
+        )
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
