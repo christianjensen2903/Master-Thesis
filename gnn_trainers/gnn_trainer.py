@@ -132,6 +132,7 @@ class GNNTrainer:
         """
         Pre-compute hard negatives based on initial embeddings.
         Uses caching to avoid recomputation.
+        Optimized for large graphs with vectorized operations.
         """
         num_nodes = embeddings.shape[0]
 
@@ -147,49 +148,85 @@ class GNNTrainer:
             return hard_negatives
 
         print(f"\nComputing hard negatives (will cache to {cache_path})...")
+        print(f"Number of nodes: {num_nodes}")
         embeddings = embeddings.to(self.device)
         embeddings_norm = F.normalize(embeddings, dim=-1)
 
-        # Build set of positive pairs (citations)
-        positive_pairs = set()
-        if edge_index is not None:
+        # Build positive edge lookup (dict for fast access)
+        positive_edges = None
+        if edge_index is not None and edge_index.numel() > 0:
+            print("Building positive pairs index...")
             edge_index = edge_index.to(self.device)
-            # Convert to set of tuples for fast lookup
-            edges = edge_index.t().cpu().numpy()
-            positive_pairs = set(map(tuple, edges))
+
+            num_edges = edge_index.size(1)
+
+            # Create bidirectional edge dictionary for O(1) lookup
+            # Key: source node, Value: tensor of target nodes
+            positive_edges = {}
+
+            src = edge_index[0].cpu()
+            tgt = edge_index[1].cpu()
+
+            # Forward edges
+            for s, t in zip(src.tolist(), tgt.tolist()):
+                if s not in positive_edges:
+                    positive_edges[s] = []
+                positive_edges[s].append(t)
+
+            # Backward edges (make bidirectional)
+            for s, t in zip(src.tolist(), tgt.tolist()):
+                if t not in positive_edges:
+                    positive_edges[t] = []
+                positive_edges[t].append(s)
+
+            # Convert lists to tensors for faster operations
+            for node in positive_edges:
+                positive_edges[node] = torch.tensor(
+                    list(set(positive_edges[node])), device=self.device
+                )
+
+            print(f"Positive pairs: {num_edges} edges (bidirectional index built)")
 
         # Compute hard negatives in batches
         hard_neg_list = []
-        batch_size = 1000
+        batch_size = 500  # Smaller batches for memory efficiency
 
+        print("Computing similarity and selecting hard negatives...")
         for start_idx in tqdm(
-            range(0, num_nodes, batch_size), desc="Computing similarity"
+            range(0, num_nodes, batch_size), desc="Processing batches"
         ):
             end_idx = min(start_idx + batch_size, num_nodes)
+            current_batch_size = end_idx - start_idx
             batch_emb = embeddings_norm[start_idx:end_idx]
 
             # Compute similarity with all nodes
-            sim = torch.mm(batch_emb, embeddings_norm.t())
+            sim = torch.mm(batch_emb, embeddings_norm.t())  # [batch_size, num_nodes]
 
-            # Mask out self and positives efficiently
-            for i in range(batch_emb.shape[0]):
-                node_idx = start_idx + i
-                sim[i, node_idx] = -1e9  # Self
+            # Mask out self-connections (diagonal for this batch)
+            batch_indices = torch.arange(start_idx, end_idx, device=self.device)
+            sim[torch.arange(current_batch_size, device=self.device), batch_indices] = (
+                -1e9
+            )
 
-                # Mask positives - check both directions
-                for j in range(num_nodes):
-                    if (node_idx, j) in positive_pairs or (
-                        j,
-                        node_idx,
-                    ) in positive_pairs:
-                        sim[i, j] = -1e9
+            # Mask out positive pairs efficiently using dictionary lookup
+            if positive_edges is not None:
+                for i in range(current_batch_size):
+                    node_idx = start_idx + i
+                    if node_idx in positive_edges:
+                        # Mask all positive neighbors for this node
+                        positive_neighbors = positive_edges[node_idx]
+                        sim[i, positive_neighbors] = -1e9
 
             # Get top-k (need full pool size to sample from range)
-            _, topk_indices = torch.topk(
-                sim, k=min(self.hard_negative_pool_size, num_nodes - 1), dim=-1
-            )
-            hard_neg_list.append(topk_indices)
+            k = min(self.hard_negative_pool_size, num_nodes - 1)
+            _, topk_indices = torch.topk(sim, k=k, dim=-1)
+            hard_neg_list.append(topk_indices.cpu())  # Move to CPU to save GPU memory
 
+            # Clear cache periodically
+            if (start_idx // batch_size) % 10 == 0:
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        print("Concatenating results...")
         hard_negatives = torch.cat(hard_neg_list, dim=0)
         print(f"Computed hard negatives: {hard_negatives.shape}")
 
@@ -197,7 +234,9 @@ class GNNTrainer:
         print(f"Caching hard negatives to {cache_path}")
         torch.save(hard_negatives, cache_path)
 
-        return hard_negatives  # Keep on GPU
+        # Move back to device
+        hard_negatives = hard_negatives.to(self.device)
+        return hard_negatives
 
     def _process_batch(self, batch, is_hetero, hard_negatives_tensor):
         """Process batch - optimized version."""
