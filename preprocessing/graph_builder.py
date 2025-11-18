@@ -276,12 +276,8 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             np.array(query_embeddings_list), dtype=torch.float32
         )
 
-        x_doc = torch.cat(
-            [x_doc_base, date_features_tensor, position_features_tensor], dim=1
-        )
-        x_query = torch.cat(
-            [x_query_base, date_features_tensor, position_features_tensor], dim=1
-        )
+        x_doc = torch.cat([x_doc_base], dim=1)
+        x_query = torch.cat([x_query_base], dim=1)
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()

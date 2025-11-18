@@ -435,7 +435,8 @@ if __name__ == "__main__":
     from sentence_transformers import SentenceTransformer
 
     # Load model
-    in_channels = 384  # mE5-Small
+    in_channels = 384  # + 2  # mE5-Small
+    out_channels = 384
 
     # builder = HeterogeneousGraphBuilder("data/preprocessed")
     # sample_graph = builder.build_graph(
@@ -449,7 +450,7 @@ if __name__ == "__main__":
     # )
 
     model = CitationGNN(
-        in_channels, hidden_dim=in_channels, output_dim=in_channels, num_layers=2
+        in_channels, hidden_dim=in_channels, output_dim=out_channels, num_layers=2
     )
     # model = HeteroGNN(
     #     in_channels,
@@ -463,7 +464,7 @@ if __name__ == "__main__":
     # Run evaluation
     evaluator = SimpleIncrementalEvaluator(
         gnn_model=model,
-        mode="all_paragraphs",
+        # mode="all_paragraphs",
         preprocessed_dir="data/preprocessed",
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,

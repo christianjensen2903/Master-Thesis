@@ -59,13 +59,14 @@ def train_homo_example() -> None:
     print("Training Homogeneous GNN Model")
     print("=" * 80 + "\n")
 
-    in_channels = 384
+    in_channels = 384  # + 2
+    out_channels = 384
 
     # Initialize homogeneous GNN
     model = CitationGNN(
         input_dim=in_channels,
         hidden_dim=in_channels,
-        output_dim=in_channels,
+        output_dim=out_channels,
         num_layers=2,
     )
 
@@ -80,7 +81,7 @@ def train_homo_example() -> None:
         temperature=0.07,
         num_hops=2,
         graph_type="homogeneous",  # Use homogeneous graph
-        patience=10,
+        patience=5,
     )
 
     # Train on paragraph pairs
