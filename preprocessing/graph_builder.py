@@ -154,40 +154,6 @@ class BaseGraphBuilder(ABC):
         except (ValueError, AttributeError):
             return 0
 
-    def _compute_normalized_time_diff(
-        self,
-        date_str: str | None,
-        application_date_str: str | None,
-        max_years: float = 5.0,
-    ) -> float:
-        """Compute normalized time difference between date and application_date.
-
-        Args:
-            date_str: Document date (ISO format)
-            application_date_str: Application date (ISO format)
-            max_years: Maximum years for normalization (default 5.0)
-
-        Returns:
-            Normalized time difference in [0, 1], or 0.0 if dates are missing/invalid
-        """
-        if not date_str or not application_date_str:
-            return 0.0
-
-        try:
-            date = datetime.fromisoformat(date_str)
-            app_date = datetime.fromisoformat(application_date_str)
-
-            # Calculate difference in days
-            diff_days = (date - app_date).days
-
-            # Normalize: clamp to [0, max_years * 365] and divide by max
-            max_days = max_years * 365.0
-            normalized = max(0.0, min(diff_days / max_days, 1.0))
-
-            return normalized
-        except (ValueError, AttributeError):
-            return 0.0
-
     def _filter_paragraphs(
         self, include_only_citing: bool, train_cutoff_year: int | None
     ) -> list[int]:
@@ -291,18 +257,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             doc_emb = self.par_embeddings_doc[par_idx]
             query_emb = self.par_embeddings_query[par_idx]
 
-            # Compute normalized time difference between date and application_date
-            date_str = meta.get("date")
-            case_meta = meta.get("meta", {})
-            application_date_str = case_meta.get("application_date")
-            time_diff = self._compute_normalized_time_diff(
-                date_str, application_date_str
-            )
-
-            # Concatenate time difference as a node feature
-            doc_emb = np.concatenate([doc_emb, np.array([time_diff])])
-            query_emb = np.concatenate([query_emb, np.array([time_diff])])
-
             # Concatenate case metadata if available and requested
             # if self.has_case_metadata:
             #     metadata_emb = self._get_case_metadata_embedding(meta["celex"])
@@ -324,6 +278,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
 
             # Add timestamp (convert date to Unix timestamp)
+            date_str = meta.get("date")
             node_times.append(self._date_to_timestamp(date_str))
 
         # Build citation edges (bidirectional)
