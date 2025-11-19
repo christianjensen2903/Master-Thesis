@@ -309,6 +309,7 @@ class GNNTrainer:
         self,
         gnn_model: nn.Module,
         train_cutoff_year: int | None = None,
+        languages: list[str] | None = None,
     ) -> torch.nn.Module:
         """
         Train GNN model using preprocessed data from graph builder.
@@ -333,7 +334,9 @@ class GNNTrainer:
         input_nodes: tuple[str, None] | None
 
         if is_hetero:
-            hetero_builder = HeterogeneousGraphBuilder(self.preprocessed_dir)
+            hetero_builder = HeterogeneousGraphBuilder(
+                self.preprocessed_dir, languages=languages
+            )
             train_graph_data = hetero_builder.build_graph(
                 train_cutoff_year=train_cutoff_year,
                 include_only_citing=True,
@@ -341,7 +344,9 @@ class GNNTrainer:
 
             input_nodes = ("paragraph", None)
         else:
-            homo_builder = HomogeneousGraphBuilder(self.preprocessed_dir)
+            homo_builder = HomogeneousGraphBuilder(
+                self.preprocessed_dir, languages=languages
+            )
             train_graph_data = homo_builder.build_graph(
                 train_cutoff_year=train_cutoff_year,
                 include_only_citing=True,

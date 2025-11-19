@@ -59,7 +59,7 @@ def train_homo_example() -> None:
     print("Training Homogeneous GNN Model")
     print("=" * 80 + "\n")
 
-    in_channels = 384 + 1
+    in_channels = 384 + 10
     out_channels = 384
 
     # Initialize homogeneous GNN
