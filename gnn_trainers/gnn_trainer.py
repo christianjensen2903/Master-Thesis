@@ -3,14 +3,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.loader import NeighborLoader  # type: ignore
 from torch_geometric.data import Data, HeteroData  # type: ignore
 from tqdm import tqdm  # type: ignore
+import wandb  # type: ignore
 from preprocessing.graph_builder import (
     HomogeneousGraphBuilder,
     HeterogeneousGraphBuilder,
 )
+import math
+from torch.optim.lr_scheduler import LambdaLR
 
 
 def info_nce_loss(
@@ -67,12 +69,15 @@ class GNNTrainer:
         output_path: str = "output/gnn",
         batch_size: int = 16,
         epochs: int = 5,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 3e-3,
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
         num_hops: int = 2,
         graph_type: str = "heterogeneous",
         checkpoint_interval: int = 25,  # Save checkpoint every N epochs
+        wandb_project: str | None = "gnn-training",
+        wandb_name: str | None = None,
+        warmup_epochs: int = 3,
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -84,6 +89,9 @@ class GNNTrainer:
         self.num_hops = num_hops
         self.graph_type = graph_type
         self.checkpoint_interval = checkpoint_interval
+        self.wandb_project = wandb_project
+        self.wandb_name = wandb_name
+        self.warmup_epochs = warmup_epochs
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -280,14 +288,20 @@ class GNNTrainer:
         model: nn.Module,
         loader: NeighborLoader,
         optimizer: torch.optim.Optimizer,
+        scheduler: LambdaLR,
         is_hetero: bool,
-    ) -> float:
+        epoch: int = 0,
+        global_batch_counter: int = 0,
+    ) -> tuple[float, int]:
         """Train for one epoch."""
         model.train()
         total_loss = 0
         num_batches = 0
+        batch_counter = global_batch_counter
 
-        for batch in tqdm(loader, desc="Training batches", leave=False):
+        for batch_idx, batch in enumerate(
+            tqdm(loader, desc="Training batches", leave=False)
+        ):
             batch_data = self._process_batch(batch, is_hetero)
             if batch_data is None:
                 continue
@@ -298,12 +312,27 @@ class GNNTrainer:
 
             optimizer.zero_grad()
             loss.backward()
+
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
             num_batches += 1
+            batch_counter += 1
 
-        return total_loss / num_batches if num_batches > 0 else 0.0
+            # Log batch-level metrics to wandb
+            if self.wandb_project is not None and batch_idx % 100 == 0:
+                wandb.log(
+                    {
+                        "train/batch_loss": loss.item(),
+                        "train/learning_rate": optimizer.param_groups[0]["lr"],
+                        "train/batch": batch_counter,
+                        "train/learning_rate": scheduler.get_last_lr()[0],
+                    }
+                )
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        return avg_loss, batch_counter
 
     def train(
         self,
@@ -349,16 +378,49 @@ class GNNTrainer:
 
             input_nodes = None
 
+        # Initialize wandb
+        if self.wandb_project is not None:
+            wandb.init(
+                project=self.wandb_project,
+                name=self.wandb_name,
+                config={
+                    "batch_size": self.batch_size,
+                    "epochs": self.epochs,
+                    "learning_rate": self.learning_rate,
+                    "weight_decay": self.weight_decay,
+                    "temperature": self.temperature,
+                    "num_hops": self.num_hops,
+                    "graph_type": self.graph_type,
+                    "checkpoint_interval": self.checkpoint_interval,
+                    "train_cutoff_year": train_cutoff_year,
+                    "device": str(self.device),
+                },
+            )
+
         # Initialize model
         print("\nInitializing GNN model...")
         model = gnn_model.to(self.device)
+
+        # Log model architecture to wandb
+        if self.wandb_project is not None:
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            wandb.config.update(
+                {
+                    "model/total_parameters": total_params,
+                    "model/trainable_parameters": trainable_params,
+                }
+            )
+            # Log model architecture
+            wandb.watch(model, log="all", log_freq=100)
 
         optimizer = AdamW(
             model.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
         # Create data loaders
         num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
@@ -373,16 +435,49 @@ class GNNTrainer:
             subgraph_type="bidirectional",
         )
 
+        # Calculate steps
+        steps_per_epoch = len(train_loader)
+        total_steps = self.epochs * steps_per_epoch
+        warmup_steps = self.warmup_epochs * steps_per_epoch
+
+        # Simple warmup + cosine decay
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return current_step / warmup_steps
+
+            progress = (current_step - warmup_steps) / (total_steps - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+
+        scheduler = LambdaLR(optimizer, lr_lambda)
+
         print(f"\nStarting training for {self.epochs} epochs...")
         print(f"Checkpoints will be saved every {self.checkpoint_interval} epochs")
 
         best_loss = float("inf")
+        global_batch_counter = 0
 
         for epoch in range(self.epochs):
-            train_loss = self.train_epoch(model, train_loader, optimizer, is_hetero)
+            train_loss, global_batch_counter = self.train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scheduler,
+                is_hetero,
+                epoch,
+                global_batch_counter,
+            )
 
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
+
+            # Log epoch-level metrics to wandb
+            if self.wandb_project is not None:
+                wandb.log(
+                    {
+                        "train/epoch_loss": train_loss,
+                        "epoch": epoch + 1,
+                    }
+                )
 
             # Track best model
             if train_loss < best_loss:
@@ -391,6 +486,10 @@ class GNNTrainer:
                     f"  ✓ New best training loss: {best_loss:.4f} -> {train_loss:.4f}"
                 )
                 best_loss = train_loss
+
+                # Log best loss to wandb
+                if self.wandb_project is not None:
+                    wandb.run.summary["best_train_loss"] = best_loss
 
             # Save checkpoint at specified intervals
             if (epoch + 1) % self.checkpoint_interval == 0:
@@ -401,7 +500,9 @@ class GNNTrainer:
                 )
                 print(f"  ✓ Checkpoint saved: {checkpoint_path}")
 
-            scheduler.step()
+                # Log checkpoint to wandb
+                if self.wandb_project is not None:
+                    wandb.save(checkpoint_path)
 
         # Save final model
         torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
@@ -414,5 +515,9 @@ class GNNTrainer:
             f"Training complete! Best model saved to {self.output_path}/best_model.pt"
         )
         print(f"Checkpoints saved to {checkpoint_dir}/")
+
+        # Finish wandb run
+        if self.wandb_project is not None:
+            wandb.finish()
 
         return model
