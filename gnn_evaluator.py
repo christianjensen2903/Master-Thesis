@@ -74,7 +74,6 @@ class SimpleIncrementalEvaluator:
         mode: EvaluatorMode = "citation_pairs",
         top_k: int = 10000,
         graph_type: str = "homogeneous",
-        languages: list[str] | None = None,
     ):
         self.gnn_model = gnn_model
         self.preprocessed_dir = preprocessed_dir
@@ -85,7 +84,7 @@ class SimpleIncrementalEvaluator:
         self.top_k = top_k
         self.graph_type = graph_type
         self.is_hetero = graph_type == "heterogeneous"
-        self.languages = languages
+
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -103,9 +102,9 @@ class SimpleIncrementalEvaluator:
                 include_only_citing=False
             )
         else:
-            graph_data = HomogeneousGraphBuilder(
-                preprocessed_dir, languages=self.languages
-            ).build_graph(include_only_citing=(self.mode == "citation_pairs"))
+            graph_data = HomogeneousGraphBuilder(preprocessed_dir).build_graph(
+                include_only_citing=(self.mode == "citation_pairs")
+            )
         self.graph_data = graph_data
 
         self.embeddings = self._compute_initial_embeddings(
@@ -436,7 +435,7 @@ if __name__ == "__main__":
     from sentence_transformers import SentenceTransformer
 
     # Load model
-    in_channels = 384 + 10  # + 2  # mE5-Small
+    in_channels = 384 * 4  # + 2  # mE5-Small
     out_channels = 384
 
     # builder = HeterogeneousGraphBuilder("data/preprocessed")
@@ -460,21 +459,19 @@ if __name__ == "__main__":
     #     num_layers=3,
     #     metadata=metadata,
     # )
-    # model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
-    model.load_state_dict(torch.load("checkpoints/homo_gnn/checkpoints/epoch_125.pt"))
+    model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
 
     # Run evaluation
     evaluator = SimpleIncrementalEvaluator(
         gnn_model=model,
         # mode="all_paragraphs",
-        preprocessed_dir="data/preprocessed-masked",
-        par_to_par_path="data/par-to-par-cleaned-masked.csv",
+        preprocessed_dir="data/preprocessed",
+        par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
         k_hops=2,
         device="cuda" if torch.cuda.is_available() else "cpu",
         top_k=1000,
         graph_type="homogeneous",
-        languages=["DAN", "DEU", "ELL", "ENG", "FRA", "ITA", "NLD", "POR", "SPA"],
     )
 
     metrics = evaluator.run()

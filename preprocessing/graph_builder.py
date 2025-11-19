@@ -251,67 +251,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
     Returns PyTorch Geometric Data object.
     """
 
-    def __init__(self, preprocessed_dir: str, languages: list[str] | None = None):
-        """
-        Initialize graph builder with preprocessed data.
-
-        Args:
-            preprocessed_dir: Directory containing preprocessed embeddings and metadata
-            languages: List of language codes to use for one-hot encoding.
-                      Any language not in this list will be mapped to "OTHER".
-                      If None, no language features will be added.
-        """
-        super().__init__(preprocessed_dir)
-
-        # Set up language mapping from provided list
-        if languages:
-            # Create sorted list with OTHER at the end
-            self.languages = sorted(languages) + ["OTHER"]
-            self.lang_to_idx = {lang: i for i, lang in enumerate(self.languages)}
-            print(f"Language encoding: {len(self.languages)} categories")
-            print(f"  Languages: {self.languages}")
-        else:
-            self.languages = []
-            self.lang_to_idx = {}
-            print("No language encoding")
-
-    def _create_language_one_hot(
-        self,
-        authentic_langs: list[str] | str | None,
-    ) -> np.ndarray:
-        """Create one-hot encoding for authentic languages.
-
-        Args:
-            authentic_langs: List of language codes or single language code
-
-        Returns:
-            One-hot encoded vector
-        """
-        num_classes = len(self.lang_to_idx)
-        one_hot = np.zeros(num_classes, dtype=np.float32)
-
-        if not authentic_langs:
-            return one_hot
-
-        # Handle both list and single value
-        langs_to_process = (
-            authentic_langs if isinstance(authentic_langs, list) else [authentic_langs]
-        )
-
-        for lang in langs_to_process:
-            if not lang:
-                continue
-            # Map to language or OTHER if not in list
-            if lang in self.lang_to_idx:
-                idx = self.lang_to_idx[lang]
-            else:
-                idx = self.lang_to_idx.get("OTHER")
-
-            if idx is not None:
-                one_hot[idx] = 1.0
-
-        return one_hot
-
     def build_graph(
         self,
         train_cutoff_year: int | None = None,
@@ -361,8 +300,8 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             )
 
             # Concatenate time difference as a node feature
-            # doc_emb = np.concatenate([doc_emb, np.array([time_diff])])
-            # query_emb = np.concatenate([query_emb, np.array([time_diff])])
+            doc_emb = np.concatenate([doc_emb, np.array([time_diff])])
+            query_emb = np.concatenate([query_emb, np.array([time_diff])])
 
             # Concatenate case metadata if available and requested
             # if self.has_case_metadata:
@@ -379,13 +318,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             #         )
             #         doc_emb = np.concatenate([doc_emb, zero_pad])
             #         query_emb = np.concatenate([query_emb, zero_pad])
-
-            # Add one-hot encoding for authentic languages
-            if self.lang_to_idx:
-                authentic_langs = case_meta.get("authentic_language", [])
-                lang_one_hot = self._create_language_one_hot(authentic_langs)
-                doc_emb = np.concatenate([doc_emb, lang_one_hot])
-                query_emb = np.concatenate([query_emb, lang_one_hot])
 
             doc_embeddings_list.append(doc_emb)
             query_embeddings_list.append(query_emb)
@@ -433,21 +365,16 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         )
 
         # Report embedding dimensions
-        base_dim = self.par_embeddings_doc.shape[1]
-        lang_dim = len(self.lang_to_idx) if self.lang_to_idx else 0
-
-        dim_parts = [f"{base_dim} (base)"]
-        if lang_dim > 0:
-            dim_parts.append(f"{lang_dim} (language one-hot)")
         if self.has_case_metadata:
+            base_dim = self.par_embeddings_doc.shape[1]
             metadata_dim = (
                 self.case_embeddings_subject_matter.shape[1]
                 + self.case_embeddings_keywords.shape[1]
                 + self.case_embeddings_case_law_about.shape[1]
             )
-            dim_parts.append(f"{metadata_dim} (metadata)")
-
-        print(f"Node embedding dim: {' + '.join(dim_parts)} = {x_doc.shape[1]}")
+            print(
+                f"Node embedding dim: {base_dim} (base) + {metadata_dim} (metadata) = {x_doc.shape[1]}"
+            )
 
         print(
             f"Built homogeneous graph: {len(doc_embeddings_list)} nodes, {edge_index.shape[1]} edges"
