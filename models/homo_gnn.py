@@ -8,7 +8,6 @@ class CitationGNN(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 256,
         output_dim: int | None = None,
         num_layers: int = 3,
     ):
@@ -24,18 +23,16 @@ class CitationGNN(nn.Module):
             self.convs.append(SAGEConv(input_dim, input_dim))
             self.norms.append(nn.LayerNorm(input_dim))
 
-        # Learnable residual weight
-        self.residual_weight = nn.Parameter(torch.tensor(0.5))
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        x_orig = x
 
         for i, conv in enumerate(self.convs):
             x_new = conv(x, edge_index)
             x_new = self.norms[i](x_new)
-            x_new = F.relu(x_new)
-            x_new = self.dropout(x_new)
+            if i < len(self.convs) - 1:
+                x_new = F.gelu(x_new)
+                x_new = self.dropout(x_new)
             x = x + x_new
 
         # Normalize embeddings
