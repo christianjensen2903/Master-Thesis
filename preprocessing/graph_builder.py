@@ -251,32 +251,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
     Returns PyTorch Geometric Data object.
     """
 
-    def _get_all_procedure_types(self) -> list[str]:
-        """Collect all unique procedure types from all paragraphs, sorted alphabetically."""
-        procedure_types_set = set()
-        for meta in self.par_metadata:
-            case_meta = meta.get("meta", {})
-            procedure_type_list = case_meta.get("procedure_type", [])
-            if procedure_type_list:
-                for proc_dict in procedure_type_list:
-                    proc_type = proc_dict.get("type")
-                    if proc_type:
-                        procedure_types_set.add(proc_type)
-        return sorted(list(procedure_types_set))
-
-    def _encode_procedure_types(
-        self, procedure_type_list: list[dict] | None, procedure_type_vocab: list[str]
-    ) -> np.ndarray:
-        """Encode procedure types as multi-hot vector."""
-        encoding = np.zeros(len(procedure_type_vocab), dtype=np.float32)
-        if procedure_type_list:
-            for proc_dict in procedure_type_list:
-                proc_type = proc_dict.get("type")
-                if proc_type and proc_type in procedure_type_vocab:
-                    idx = procedure_type_vocab.index(proc_type)
-                    encoding[idx] = 1.0
-        return encoding
-
     def build_graph(
         self,
         train_cutoff_year: int | None = None,
@@ -294,10 +268,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         Returns:
             graph_data: PyTorch Geometric Data object
         """
-        # Get procedure type vocabulary (alphabetically sorted for consistency)
-        procedure_type_vocab = self._get_all_procedure_types()
-        print(f"Found {len(procedure_type_vocab)} unique procedure types")
-
         # Filter paragraphs
         selected_pars = self._filter_paragraphs(include_only_citing, train_cutoff_year)
 
@@ -329,19 +299,9 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
                 date_str, application_date_str
             )
 
-            # Encode procedure types as multi-hot
-            procedure_type_list = case_meta.get("procedure_type")
-            procedure_encoding = self._encode_procedure_types(
-                procedure_type_list, procedure_type_vocab
-            )
-
-            # Concatenate procedure type encoding to embeddings
-            doc_emb = np.concatenate([doc_emb, procedure_encoding])
-            query_emb = np.concatenate([query_emb, procedure_encoding])
-
             # Concatenate time difference as a node feature
-            # doc_emb = np.concatenate([doc_emb, np.array([time_diff])])
-            # query_emb = np.concatenate([query_emb, np.array([time_diff])])
+            doc_emb = np.concatenate([doc_emb, np.array([time_diff])])
+            query_emb = np.concatenate([query_emb, np.array([time_diff])])
 
             # Concatenate case metadata if available and requested
             # if self.has_case_metadata:
