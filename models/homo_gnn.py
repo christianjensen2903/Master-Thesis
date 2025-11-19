@@ -10,6 +10,7 @@ class CitationGNN(nn.Module):
         input_dim: int,
         output_dim: int | None = None,
         num_layers: int = 3,
+        dropout: float = 0.5,
     ):
         super().__init__()
         if output_dim is None:
@@ -23,7 +24,7 @@ class CitationGNN(nn.Module):
             self.convs.append(SAGEConv(input_dim, input_dim))
             self.norms.append(nn.LayerNorm(input_dim))
 
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
 
