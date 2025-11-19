@@ -136,40 +136,39 @@ class EmbeddingPreprocessor:
             convert_to_numpy=True,
         )
 
-        # Extract and format metadata fields for embeddings
-        print("Extracting metadata fields...")
-        subject_matter_texts = []
-        keywords_texts = []
-        case_law_about_texts = []
-
-        for p in paragraphs_data:
-            meta = p.get("meta", {})
-            subject_matter_texts.append(self._format_list(meta.get("subject_matter")))
-            keywords_texts.append(self._format_list(meta.get("keywords")))
-            case_law_about_texts.append(
-                self._format_case_law_about(meta.get("case_law_about"))
+        # Process case-level metadata separately
+        case_metadata_data = []
+        for celex, judgment in judgments.items():
+            meta = judgment.get("meta", {})
+            case_metadata_data.append(
+                {
+                    "id": f"case:{celex}",
+                    "celex": celex,
+                    "subject_matter_text": self._format_list(
+                        meta.get("subject_matter")
+                    ),
+                    "keywords_text": self._format_list(meta.get("keywords")),
+                    "case_law_about_text": self._format_case_law_about(
+                        meta.get("case_law_about")
+                    ),
+                }
             )
 
-        # Encode metadata embeddings
-        print("Encoding subject matter embeddings...")
+        # Encode case-level metadata
         subject_matter_embeddings = self.encoder.encode(
-            subject_matter_texts,
+            [c["subject_matter_text"] for c in case_metadata_data],
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
         )
-
-        print("Encoding keywords embeddings...")
         keywords_embeddings = self.encoder.encode(
-            keywords_texts,
+            [c["keywords_text"] for c in case_metadata_data],
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
         )
-
-        print("Encoding case law about embeddings...")
         case_law_about_embeddings = self.encoder.encode(
-            case_law_about_texts,
+            [c["case_law_about_text"] for c in case_metadata_data],
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
@@ -182,15 +181,6 @@ class EmbeddingPreprocessor:
         print("Saving paragraph embeddings...")
         np.save(output_path / "paragraph_embeddings_doc.npy", doc_embeddings)
         np.save(output_path / "paragraph_embeddings_query.npy", query_embeddings)
-        np.save(
-            output_path / "paragraph_embeddings_subject_matter.npy",
-            subject_matter_embeddings,
-        )
-        np.save(output_path / "paragraph_embeddings_keywords.npy", keywords_embeddings)
-        np.save(
-            output_path / "paragraph_embeddings_case_law_about.npy",
-            case_law_about_embeddings,
-        )
 
         print("Saving paragraph metadata...")
         # Create simplified metadata (without text to reduce size)
@@ -200,6 +190,21 @@ class EmbeddingPreprocessor:
         ]
         with open(output_path / "paragraph_metadata.pkl", "wb") as f:
             pickle.dump(metadata, f)
+
+        # Save case-level files
+        np.save(
+            output_path / "case_embeddings_subject_matter.npy",
+            subject_matter_embeddings,
+        )
+        np.save(output_path / "case_embeddings_keywords.npy", keywords_embeddings)
+        np.save(
+            output_path / "case_embeddings_case_law_about.npy",
+            case_law_about_embeddings,
+        )
+
+        # Save case metadata with celex->index mapping
+        with open(output_path / "case_metadata.pkl", "wb") as f:
+            pickle.dump(case_metadata_data, f)
 
         # Create human-readable index
         print("Saving paragraph index...")

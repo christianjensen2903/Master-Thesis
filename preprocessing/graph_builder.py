@@ -53,6 +53,9 @@ class BaseGraphBuilder(ABC):
         with open(self.preprocessed_dir / "citations.pkl", "rb") as f:
             self.citations = pickle.load(f)
 
+        # Load case-level metadata embeddings
+        self._load_case_metadata_embeddings()
+
         # Create ID mappings
         self.par_id_to_idx = {m["id"]: i for i, m in enumerate(self.par_metadata)}
         self.art_id_to_idx = {m["id"]: i for i, m in enumerate(self.art_metadata)}
@@ -61,6 +64,78 @@ class BaseGraphBuilder(ABC):
             f"Loaded {len(self.par_metadata)} paragraphs, {len(self.art_metadata)} articles"
         )
         print(f"Loaded {len(self.citations)} citation edges")
+
+    def _load_case_metadata_embeddings(self):
+        """Load case-level metadata embeddings and create CELEX mapping."""
+        # Check if case metadata embeddings exist
+        subject_matter_path = (
+            self.preprocessed_dir / "case_embeddings_subject_matter.npy"
+        )
+        keywords_path = self.preprocessed_dir / "case_embeddings_keywords.npy"
+        case_law_about_path = (
+            self.preprocessed_dir / "case_embeddings_case_law_about.npy"
+        )
+        case_metadata_path = self.preprocessed_dir / "case_metadata.pkl"
+
+        if all(
+            p.exists()
+            for p in [
+                subject_matter_path,
+                keywords_path,
+                case_law_about_path,
+                case_metadata_path,
+            ]
+        ):
+            self.case_embeddings_subject_matter = np.load(subject_matter_path)
+            self.case_embeddings_keywords = np.load(keywords_path)
+            self.case_embeddings_case_law_about = np.load(case_law_about_path)
+
+            with open(case_metadata_path, "rb") as f:
+                case_metadata = pickle.load(f)
+
+            # Create CELEX to case index mapping
+            self.celex_to_case_idx = {
+                m["celex"]: i for i, m in enumerate(case_metadata)
+            }
+
+            self.has_case_metadata = True
+            print(
+                f"Loaded case metadata embeddings for {len(self.celex_to_case_idx)} cases"
+            )
+            print(
+                f"  - Subject matter embedding dim: {self.case_embeddings_subject_matter.shape[1]}"
+            )
+            print(
+                f"  - Keywords embedding dim: {self.case_embeddings_keywords.shape[1]}"
+            )
+            print(
+                f"  - Case law about embedding dim: {self.case_embeddings_case_law_about.shape[1]}"
+            )
+        else:
+            self.has_case_metadata = False
+            self.celex_to_case_idx = {}
+            print("Case metadata embeddings not found, skipping metadata concatenation")
+
+    def _get_case_metadata_embedding(self, celex: str) -> np.ndarray | None:
+        """Get concatenated case metadata embedding for a CELEX."""
+        if not self.has_case_metadata:
+            return None
+
+        if celex not in self.celex_to_case_idx:
+            return None
+
+        case_idx = self.celex_to_case_idx[celex]
+
+        # Concatenate all three metadata embeddings
+        metadata_emb = np.concatenate(
+            [
+                self.case_embeddings_subject_matter[case_idx],
+                self.case_embeddings_keywords[case_idx],
+                self.case_embeddings_case_law_about[case_idx],
+            ]
+        )
+
+        return metadata_emb
 
     @abstractmethod
     def build_graph(
@@ -177,8 +252,29 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
             node_id_to_idx[node_id] = current_idx
             idx_to_metadata[current_idx] = meta
-            doc_embeddings_list.append(self.par_embeddings_doc[par_idx])
-            query_embeddings_list.append(self.par_embeddings_query[par_idx])
+
+            # Get base embeddings
+            doc_emb = self.par_embeddings_doc[par_idx]
+            query_emb = self.par_embeddings_query[par_idx]
+
+            # Concatenate case metadata if available and requested
+            # if self.has_case_metadata:
+            #     metadata_emb = self._get_case_metadata_embedding(meta["celex"])
+            #     if metadata_emb is not None:
+            #         doc_emb = np.concatenate([doc_emb, metadata_emb])
+            #         query_emb = np.concatenate([query_emb, metadata_emb])
+            #     else:
+            #         # Pad with zeros if case not found (shouldn't happen normally)
+            #         zero_pad = np.zeros(
+            #             self.case_embeddings_subject_matter.shape[1]
+            #             + self.case_embeddings_keywords.shape[1]
+            #             + self.case_embeddings_case_law_about.shape[1]
+            #         )
+            #         doc_emb = np.concatenate([doc_emb, zero_pad])
+            #         query_emb = np.concatenate([query_emb, zero_pad])
+
+            doc_embeddings_list.append(doc_emb)
+            query_embeddings_list.append(query_emb)
             node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
 
             # Add timestamp (convert date to Unix timestamp)
@@ -222,6 +318,18 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             time=node_times_tensor,  # For temporal sampling
             node_id_hash=node_ids_tensor,  # Hashed node IDs
         )
+
+        # Report embedding dimensions
+        if self.has_case_metadata:
+            base_dim = self.par_embeddings_doc.shape[1]
+            metadata_dim = (
+                self.case_embeddings_subject_matter.shape[1]
+                + self.case_embeddings_keywords.shape[1]
+                + self.case_embeddings_case_law_about.shape[1]
+            )
+            print(
+                f"Node embedding dim: {base_dim} (base) + {metadata_dim} (metadata) = {x_doc.shape[1]}"
+            )
 
         print(
             f"Built homogeneous graph: {len(doc_embeddings_list)} nodes, {edge_index.shape[1]} edges"

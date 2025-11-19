@@ -435,7 +435,7 @@ if __name__ == "__main__":
     from sentence_transformers import SentenceTransformer
 
     # Load model
-    in_channels = 384  # + 2  # mE5-Small
+    in_channels = 384 * 4  # + 2  # mE5-Small
     out_channels = 384
 
     # builder = HeterogeneousGraphBuilder("data/preprocessed")
