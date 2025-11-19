@@ -72,7 +72,7 @@ class GNNTrainer:
         temperature: float = 0.07,
         num_hops: int = 2,
         graph_type: str = "heterogeneous",
-        patience: int = 3,  # Early stopping patience
+        checkpoint_interval: int = 25,  # Save checkpoint every N epochs
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -83,7 +83,7 @@ class GNNTrainer:
         self.temperature = temperature
         self.num_hops = num_hops
         self.graph_type = graph_type
-        self.patience = patience
+        self.checkpoint_interval = checkpoint_interval
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -305,37 +305,10 @@ class GNNTrainer:
 
         return total_loss / num_batches if num_batches > 0 else 0.0
 
-    @torch.no_grad()
-    def validate(
-        self,
-        model: nn.Module,
-        loader: NeighborLoader,
-        is_hetero: bool,
-    ) -> float:
-        """Validate the model."""
-        model.eval()
-        total_loss = 0
-        num_batches = 0
-
-        for batch in tqdm(loader, desc="Validation batches", leave=False):
-            batch_data = self._process_batch(batch, is_hetero)
-            if batch_data is None:
-                continue
-
-            loss = self._compute_loss(model, batch_data, is_hetero)
-            if loss is None:
-                continue
-
-            total_loss += loss.item()
-            num_batches += 1
-
-        return total_loss / num_batches if num_batches > 0 else 0.0
-
     def train(
         self,
         gnn_model: nn.Module,
         train_cutoff_year: int | None = None,
-        val_cutoff_year: int | None = None,
     ) -> torch.nn.Module:
         """
         Train GNN model using preprocessed data from graph builder.
@@ -343,10 +316,10 @@ class GNNTrainer:
         Args:
             gnn_model: The GNN model to train
             train_cutoff_year: Cutoff year for training data (e.g., 2018)
-            val_cutoff_year: Cutoff year for validation data (e.g., 2019)
-                            Should be after train_cutoff_year. If None, no validation.
         """
         os.makedirs(self.output_path, exist_ok=True)
+        checkpoint_dir = os.path.join(self.output_path, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
         print("\n" + "=" * 80)
         print(f"Training GNN with {self.graph_type.capitalize()} Graph Builder")
@@ -357,7 +330,6 @@ class GNNTrainer:
 
         # Type declarations
         train_graph_data: Data | HeteroData
-        val_graph_data: Data | HeteroData | None
         input_nodes: tuple[str, None] | None
 
         if is_hetero:
@@ -367,19 +339,6 @@ class GNNTrainer:
                 include_only_citing=True,
             ).to(self.device)
 
-            # Build validation graph if cutoff provided
-            if val_cutoff_year is not None:
-                print(
-                    f"\nBuilding validation graph (cutoff year: {val_cutoff_year})..."
-                )
-                val_graph_data = hetero_builder.build_graph(
-                    train_cutoff_year=val_cutoff_year,
-                    include_only_citing=True,
-                ).to(self.device)
-            else:
-                val_graph_data = None
-                print("\nNo validation set - training without validation")
-
             input_nodes = ("paragraph", None)
         else:
             homo_builder = HomogeneousGraphBuilder(self.preprocessed_dir)
@@ -387,19 +346,6 @@ class GNNTrainer:
                 train_cutoff_year=train_cutoff_year,
                 include_only_citing=True,
             ).to(self.device)
-
-            # Build validation graph if cutoff provided
-            if val_cutoff_year is not None:
-                print(
-                    f"\nBuilding validation graph (cutoff year: {val_cutoff_year})..."
-                )
-                val_graph_data = homo_builder.build_graph(
-                    train_cutoff_year=val_cutoff_year,
-                    include_only_citing=True,
-                ).to(self.device)
-            else:
-                val_graph_data = None
-                print("\nNo validation set - training without validation")
 
             input_nodes = None
 
@@ -427,22 +373,10 @@ class GNNTrainer:
             subgraph_type="bidirectional",
         )
 
-        val_loader = None
-        if val_graph_data is not None:
-            val_loader = NeighborLoader(
-                val_graph_data,
-                num_neighbors=num_neighbors,
-                batch_size=self.batch_size,
-                input_nodes=input_nodes,
-                shuffle=False,
-                time_attr="time",
-                subgraph_type="bidirectional",
-            )
-
         print(f"\nStarting training for {self.epochs} epochs...")
+        print(f"Checkpoints will be saved every {self.checkpoint_interval} epochs")
 
-        best_val_loss = float("inf")
-        epochs_without_improvement = 0
+        best_loss = float("inf")
 
         for epoch in range(self.epochs):
             train_loss = self.train_epoch(model, train_loader, optimizer, is_hetero)
@@ -450,38 +384,22 @@ class GNNTrainer:
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
-            # Validate if validation set is available
-            if val_loader is not None:
-                val_loss = self.validate(model, val_loader, is_hetero)
-                print(f"  Val Loss:   {val_loss:.4f}")
+            # Track best model
+            if train_loss < best_loss:
+                torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
+                print(
+                    f"  ✓ New best training loss: {best_loss:.4f} -> {train_loss:.4f}"
+                )
+                best_loss = train_loss
 
-                # Save best model based on validation loss
-                if val_loss < best_val_loss:
-                    improvement = best_val_loss - val_loss
-                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                    print(
-                        f"  ✓ New best validation loss! (improved by {improvement:.4f})"
-                    )
-                    best_val_loss = val_loss
-                    epochs_without_improvement = 0
-                else:
-                    epochs_without_improvement += 1
-                    print(
-                        f"  ✗ No improvement ({epochs_without_improvement}/{self.patience})"
-                    )
-
-                # Early stopping
-                if epochs_without_improvement >= self.patience:
-                    print(f"\nEarly stopping triggered after {epoch + 1} epochs")
-                    break
-            else:
-                # No validation set - save based on training loss
-                if train_loss < best_val_loss:
-                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                    print(
-                        f"  ✓ New best training loss: {best_val_loss:.4f} -> {train_loss:.4f}"
-                    )
-                    best_val_loss = train_loss
+            # Save checkpoint at specified intervals
+            if (epoch + 1) % self.checkpoint_interval == 0:
+                checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}.pt")
+                torch.save(
+                    model.state_dict(),
+                    checkpoint_path,
+                )
+                print(f"  ✓ Checkpoint saved: {checkpoint_path}")
 
             scheduler.step()
 
@@ -489,11 +407,12 @@ class GNNTrainer:
         torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
 
         # Load best model
-        print(f"\nLoading best model (val loss: {best_val_loss:.4f})...")
+        print(f"\nLoading best model (train loss: {best_loss:.4f})...")
         model.load_state_dict(torch.load(f"{self.output_path}/best_model.pt"))
 
         print(
             f"Training complete! Best model saved to {self.output_path}/best_model.pt"
         )
+        print(f"Checkpoints saved to {checkpoint_dir}/")
 
         return model

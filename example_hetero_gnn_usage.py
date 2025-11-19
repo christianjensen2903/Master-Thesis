@@ -59,7 +59,7 @@ def train_homo_example() -> None:
     print("Training Homogeneous GNN Model")
     print("=" * 80 + "\n")
 
-    in_channels = 384  # + 2
+    in_channels = 384 + 1
     out_channels = 384
 
     # Initialize homogeneous GNN
@@ -72,21 +72,20 @@ def train_homo_example() -> None:
 
     # Initialize trainer with homogeneous graph type
     trainer = GNNTrainer(
-        preprocessed_dir="data/preprocessed",
+        preprocessed_dir="data/preprocessed-masked",
         output_path="checkpoints/homo_gnn",
         batch_size=2**10,
-        epochs=400,
+        epochs=150,
         learning_rate=5e-5,
         weight_decay=1e-4,
         temperature=0.07,
         num_hops=2,
         graph_type="homogeneous",  # Use homogeneous graph
-        patience=5,
     )
 
     # Train on paragraph pairs
     cutoff_year = 2018
-    trainer.train(model, cutoff_year, 2021)
+    trainer.train(model, cutoff_year)
 
     print("\nTraining complete!")
 
