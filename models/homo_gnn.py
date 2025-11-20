@@ -21,7 +21,7 @@ class CitationGNN(nn.Module):
         self.norms = nn.ModuleList()
 
         for _ in range(num_layers):
-            self.convs.append(SAGEConv(input_dim, input_dim))
+            self.convs.append(SAGEConv(input_dim, input_dim, aggr="sum"))
             self.norms.append(nn.LayerNorm(input_dim))
 
         self.dropout = nn.Dropout(dropout)
@@ -34,7 +34,7 @@ class CitationGNN(nn.Module):
             if i < len(self.convs) - 1:
                 x_new = F.gelu(x_new)
                 x_new = self.dropout(x_new)
-            x = x + x_new
+            x = F.layer_norm(x, [x.size(-1)]) + x_new
 
         # Normalize embeddings
         x = F.normalize(x, p=2, dim=1)
