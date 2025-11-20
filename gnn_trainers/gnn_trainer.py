@@ -210,8 +210,8 @@ class GNNTrainer:
             # Mask edges to prevent leakage
             # Remove edges where BOTH src and tgt are in anchor batch
             src, tgt = edge_index
-            leakage_mask = (src < batch_size) & (tgt < batch_size)
-            masked_edge_index = edge_index[:, ~leakage_mask]
+            leakage_mask = ~((src < batch_size) | (tgt < batch_size))
+            masked_edge_index = edge_index[:, leakage_mask]
 
             return {
                 "batch_size": batch_size,

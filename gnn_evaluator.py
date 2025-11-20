@@ -277,7 +277,7 @@ class SimpleIncrementalEvaluator:
                 # For hetero graphs, work with paragraph nodes
                 cite_edge_index = sub["paragraph", "cites", "paragraph"].edge_index
                 src, tgt = cite_edge_index
-                edge_mask = (tgt < num_nodes) | (src < num_nodes)
+                edge_mask = ~((src < num_nodes) & (tgt >= num_nodes))
                 masked_cite_edges = cite_edge_index[:, edge_mask]
 
                 # Create modified batch with masked edges
@@ -300,12 +300,11 @@ class SimpleIncrementalEvaluator:
                 query_emb = embeddings[:num_nodes]
                 sub_node_id_hash = sub["paragraph"].node_id_hash
                 sub_n_id = sub["paragraph"].n_id
-                sub_x = sub["paragraph"].x
 
             else:
                 # For homogeneous graphs
                 src, tgt = sub.edge_index
-                edge_mask = (tgt < num_nodes) | (src < num_nodes)
+                edge_mask = ~((src < num_nodes) | (tgt < num_nodes))
                 masked_edge_index = sub.edge_index[:, edge_mask]
 
                 # Create combined feature matrix
@@ -322,7 +321,6 @@ class SimpleIncrementalEvaluator:
                 query_emb = embeddings[:num_nodes]
                 sub_node_id_hash = sub.node_id_hash
                 sub_n_id = sub.n_id
-                sub_x = sub.x
 
             sim = torch.matmul(query_emb, cand_emb.T)
 
@@ -432,10 +430,10 @@ class SimpleIncrementalEvaluator:
 
 if __name__ == "__main__":
     from models import CitationGNN, HeteroGNN
-    from sentence_transformers import SentenceTransformer
 
     # Load model
-    in_channels = 384 * 4  # + 2  # mE5-Small
+    in_channels = 384
+    hidden_dim = 384
     out_channels = 384
 
     # builder = HeterogeneousGraphBuilder("data/preprocessed")
@@ -449,9 +447,7 @@ if __name__ == "__main__":
     #     list(sample_graph.edge_types),
     # )
 
-    model = CitationGNN(
-        in_channels, hidden_dim=in_channels, output_dim=out_channels, num_layers=2
-    )
+    model = CitationGNN(in_channels, output_dim=out_channels, num_layers=2)
     # model = HeteroGNN(
     #     in_channels,
     #     hidden_dim=256,
