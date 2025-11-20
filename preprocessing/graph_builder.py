@@ -181,6 +181,60 @@ class BaseGraphBuilder(ABC):
 
         return selected_pars
 
+    def _extract_date_features(self, date_str: str | None) -> np.ndarray:
+        """Extract date feature: normalized days since 1954-01-01 (max 2025-12-31)."""
+        if not date_str:
+            # Return zero for missing dates
+            return np.array([0.0], dtype=np.float32)
+        try:
+            dt = datetime.fromisoformat(date_str)
+            # Calculate days since 1954-01-01
+            base_date = datetime(1954, 1, 1)
+            max_date = datetime(2025, 12, 31)
+            days_since_base = (dt - base_date).days
+            max_days = (max_date - base_date).days
+
+            # Normalize to [0, 1] range, clamping values outside range
+            time_norm = max(0.0, min(1.0, days_since_base / max_days))
+            return np.array([time_norm], dtype=np.float32)
+        except (ValueError, AttributeError):
+            return np.array([0.0], dtype=np.float32)
+
+    def _compute_relative_positions(self, selected_pars: list[int]) -> dict[int, float]:
+        """Compute relative paragraph positions within each case.
+
+        Positions are computed relative to ALL paragraphs in each case,
+        not just the selected/filtered ones.
+        """
+        # First, collect ALL paragraphs for each case to get total counts
+        case_to_all_pars: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for par_idx, meta in enumerate(self.par_metadata):
+            celex = meta["celex"]
+            par_num = meta.get("paragraph_number", 0)
+            case_to_all_pars[celex].append((par_idx, par_num))
+
+        # Build mapping from paragraph index to its position in the full case
+        par_idx_to_position: dict[int, float] = {}
+        for celex, all_pars in case_to_all_pars.items():
+            # Sort all paragraphs by paragraph number
+            sorted_pars = sorted(all_pars, key=lambda x: x[1])
+            total_pars = len(sorted_pars)
+
+            if total_pars == 1:
+                # Single paragraph case
+                par_idx_to_position[sorted_pars[0][0]] = 0.5
+            else:
+                # Normalize position to [0, 1] based on position in full case
+                for i, (par_idx, _) in enumerate(sorted_pars):
+                    par_idx_to_position[par_idx] = i / (total_pars - 1)
+
+        # Return positions only for selected paragraphs
+        relative_positions: dict[int, float] = {}
+        for par_idx in selected_pars:
+            relative_positions[par_idx] = par_idx_to_position.get(par_idx, 0.5)
+
+        return relative_positions
+
 
 def parse_celex(celex):
     """Parse CELEX into components (CJ only)"""
@@ -237,6 +291,8 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         # Filter paragraphs
         selected_pars = self._filter_paragraphs(include_only_citing, train_cutoff_year)
 
+        relative_positions = self._compute_relative_positions(selected_pars)
+
         # Build node mappings
         node_id_to_idx: dict[str, int] = {}
         idx_to_metadata: dict[int, dict] = {}
@@ -272,6 +328,15 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             #         )
             #         doc_emb = np.concatenate([doc_emb, zero_pad])
             #         query_emb = np.concatenate([query_emb, zero_pad])
+
+            # relative_position = relative_positions[par_idx]
+
+            # doc_emb = np.concatenate([doc_emb, [relative_position]])
+            # query_emb = np.concatenate([query_emb, [relative_position]])
+
+            # date_feature = self._extract_date_features(meta.get("date"))
+            # doc_emb = np.concatenate([doc_emb, date_feature])
+            # query_emb = np.concatenate([query_emb, date_feature])
 
             doc_embeddings_list.append(doc_emb)
             query_embeddings_list.append(query_emb)
