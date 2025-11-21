@@ -10,6 +10,7 @@ from torch_geometric.data import Data, HeteroData  # type: ignore
 from torch_geometric.utils import k_hop_subgraph  # type: ignore
 from torch_geometric.loader import NeighborLoader  # type: ignore
 from tqdm import tqdm  # type: ignore
+from torch_geometric.transforms import ToUndirected
 
 from preprocessing.graph_builder import (
     HomogeneousGraphBuilder,
@@ -105,7 +106,7 @@ class SimpleIncrementalEvaluator:
             graph_data = HomogeneousGraphBuilder(preprocessed_dir).build_graph(
                 include_only_citing=(self.mode == "citation_pairs")
             )
-        self.graph_data = graph_data
+        self.graph_data = ToUndirected()(graph_data)
 
         self.embeddings = self._compute_initial_embeddings(
             self.graph_data, self.train_cutoff_year
@@ -456,6 +457,7 @@ if __name__ == "__main__":
     #     metadata=metadata,
     # )
     model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
+    # model.load_state_dict(torch.load("checkpoints/homo_gnn/checkpoints/epoch_30.pt"))
 
     # Run evaluation
     evaluator = SimpleIncrementalEvaluator(

@@ -13,6 +13,7 @@ from preprocessing.graph_builder import (
 )
 import math
 from torch.optim.lr_scheduler import LambdaLR
+from torch_geometric.transforms import ToUndirected
 
 
 def info_nce_loss(
@@ -352,7 +353,7 @@ class GNNTrainer:
 
         # Type declarations
         train_graph_data: Data | HeteroData
-        input_nodes: tuple[str, None] | None
+        input_nodes: tuple[str, torch.Tensor] | torch.Tensor | None
 
         if is_hetero:
             hetero_builder = HeterogeneousGraphBuilder(self.preprocessed_dir)
@@ -360,8 +361,6 @@ class GNNTrainer:
                 train_cutoff_year=train_cutoff_year,
                 include_only_citing=True,
             ).to(self.device)
-
-            input_nodes = ("paragraph", None)
         else:
             homo_builder = HomogeneousGraphBuilder(self.preprocessed_dir)
             train_graph_data = homo_builder.build_graph(
@@ -369,7 +368,29 @@ class GNNTrainer:
                 include_only_citing=True,
             ).to(self.device)
 
-            input_nodes = None
+        # Filter to only sample nodes with at least one positive (citation) edge
+        print("\nFiltering nodes with positive examples...")
+        if is_hetero:
+            # Get citation edge index
+            cite_edge_index = train_graph_data[
+                "paragraph", "cites", "paragraph"
+            ].edge_index
+            # Find unique source nodes (nodes that cite others)
+            nodes_with_positives = cite_edge_index[0].unique()
+            print(
+                f"  Paragraph nodes with citations: {len(nodes_with_positives)} / {train_graph_data['paragraph'].num_nodes}"
+            )
+            input_nodes = ("paragraph", nodes_with_positives)
+        else:
+            # For homogeneous graphs, find nodes with outgoing edges
+            edge_index = train_graph_data.edge_index
+            nodes_with_positives = edge_index[0].unique()
+            print(
+                f"  Nodes with citations: {len(nodes_with_positives)} / {train_graph_data.num_nodes}"
+            )
+            input_nodes = nodes_with_positives
+
+        train_graph_data = ToUndirected()(train_graph_data)
 
         # Initialize wandb
         if self.wandb_project is not None:
@@ -387,6 +408,7 @@ class GNNTrainer:
                     "checkpoint_interval": self.checkpoint_interval,
                     "train_cutoff_year": train_cutoff_year,
                     "device": str(self.device),
+                    "num_nodes_with_positives": len(nodes_with_positives),
                 },
             )
 

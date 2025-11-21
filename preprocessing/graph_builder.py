@@ -315,19 +315,19 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
             # Concatenate case metadata if available and requested
             # if self.has_case_metadata:
-            #     metadata_emb = self._get_case_metadata_embedding(meta["celex"])
-            #     if metadata_emb is not None:
-            #         doc_emb = np.concatenate([doc_emb, metadata_emb])
-            #         query_emb = np.concatenate([query_emb, metadata_emb])
-            #     else:
-            #         # Pad with zeros if case not found (shouldn't happen normally)
-            #         zero_pad = np.zeros(
-            #             self.case_embeddings_subject_matter.shape[1]
-            #             + self.case_embeddings_keywords.shape[1]
-            #             + self.case_embeddings_case_law_about.shape[1]
-            #         )
-            #         doc_emb = np.concatenate([doc_emb, zero_pad])
-            #         query_emb = np.concatenate([query_emb, zero_pad])
+            # metadata_emb = self._get_case_metadata_embedding(meta["celex"])
+            # if metadata_emb is not None:
+            #     doc_emb = np.concatenate([doc_emb, metadata_emb])
+            #     query_emb = np.concatenate([query_emb, metadata_emb])
+            # else:
+            #     # Pad with zeros if case not found (shouldn't happen normally)
+            #     zero_pad = np.zeros(
+            #         self.case_embeddings_subject_matter.shape[1]
+            #         + self.case_embeddings_keywords.shape[1]
+            #         + self.case_embeddings_case_law_about.shape[1]
+            #     )
+            #     doc_emb = np.concatenate([doc_emb, zero_pad])
+            #     query_emb = np.concatenate([query_emb, zero_pad])
 
             # relative_position = relative_positions[par_idx]
 
@@ -354,7 +354,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
                 tgt_idx = node_id_to_idx[tgt_id]
                 # Add both directions
                 edge_list.append([src_idx, tgt_idx])
-                edge_list.append([tgt_idx, src_idx])
+                # edge_list.append([tgt_idx, src_idx])
 
         # Create PyTorch Geometric Data
         x_doc = torch.tensor(np.array(doc_embeddings_list), dtype=torch.float32)
