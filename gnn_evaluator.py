@@ -1,3 +1,6 @@
+from typing import Hashable
+from pandas.core.frame import DataFrame
+from pandas.core.series import Series
 import pandas as pd
 from evaluator import EvaluatorMode
 from datetime import datetime
@@ -197,7 +200,11 @@ class SimpleIncrementalEvaluator:
             edge_index_cutoff = graph_data.edge_index[:, edge_mask]
 
             with torch.no_grad():
-                return self.gnn_model(graph_data.x, edge_index_cutoff)
+                return self.gnn_model(
+                    graph_data.x,
+                    edge_index_cutoff,
+                    date_feature=graph_data.date_feature,
+                )
 
     def run(self, k_values: list[int] = [5, 10, 100]) -> float:
         """Run full incremental evaluation."""
@@ -317,7 +324,9 @@ class SimpleIncrementalEvaluator:
                     x_input[:num_nodes] = sub.x_query[:num_nodes]
 
                 with torch.no_grad():
-                    embeddings = self.gnn_model(x_input, masked_edge_index)
+                    embeddings = self.gnn_model(
+                        x_input, masked_edge_index, date_feature=sub.date_feature
+                    )
 
                 query_emb = embeddings[:num_nodes]
                 sub_node_id_hash = sub.node_id_hash
@@ -414,7 +423,9 @@ class SimpleIncrementalEvaluator:
 
                     # Compute embeddings on expanded subgraph
                     expanded_embeddings = self.gnn_model(
-                        expanded_sub.x, expanded_sub.edge_index
+                        expanded_sub.x,
+                        expanded_sub.edge_index,
+                        date_feature=expanded_sub.date_feature,
                     )
 
                     # Only update embeddings for nodes in the original subgraph

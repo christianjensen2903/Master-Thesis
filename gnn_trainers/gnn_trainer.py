@@ -17,38 +17,62 @@ from torch_geometric.transforms import ToUndirected
 
 
 def info_nce_loss(
-    anchor, positive, temperature=0.07, anchor_times=None, positive_times=None
+    anchor,
+    positive,
+    temperature=0.07,
+    anchor_times=None,
+    positive_times=None,
+    anchor_indices=None,
+    positive_indices=None,  # ADDED: To detect target collisions
 ):
     """
-    In-batch negative contrastive loss with temporal filtering.
+    In-batch negative contrastive loss with temporal filtering and False Negative masking.
 
-    anchor: [batch_size, dim] - query embeddings
-    positive: [batch_size, dim] - positive document embeddings
-    anchor_times: [batch_size] - timestamps for anchor nodes (optional)
-    positive_times: [batch_size] - timestamps for positive nodes (optional)
-
-    For each anchor_i, positive_i is the target, and only positives that come
-    BEFORE anchor_i in time are used as negatives.
+    anchor: [batch_size, dim]
+    positive: [batch_size, dim]
+    anchor_indices: [batch_size] - IDs of source nodes
+    positive_indices: [batch_size] - IDs of target nodes
     """
     # Normalize embeddings
     anchor = F.normalize(anchor, dim=-1)
     positive = F.normalize(positive, dim=-1)
 
     # Compute similarity matrix: [batch_size, batch_size]
-    # sim_matrix[i, j] = similarity between anchor_i and positive_j
     sim_matrix = torch.mm(anchor, positive.t()) / temperature
+
+    batch_size = sim_matrix.size(0)
+    diagonal_mask = torch.eye(batch_size, dtype=torch.bool, device=sim_matrix.device)
+
+    # Initialize mask for False Negatives (True = mask out/ignore)
+    # We start with False everywhere except potentially the diagonal handling later
+    false_negative_mask = torch.zeros_like(sim_matrix, dtype=torch.bool)
+
+    # 1. Handle "Same Anchor" (One-to-Many)
+    # This ensures that if Node A cites B and C, C is not treated as a negative for (A->B).
+    if anchor_indices is not None:
+        same_anchor = anchor_indices.unsqueeze(1) == anchor_indices.unsqueeze(0)
+        false_negative_mask = false_negative_mask | same_anchor
+
+    # 2. Handle "Same Target" (Many-to-One)
+    # This ensures that if Node A cites B and Node D cites B,
+    # we don't penalize A for being close to B (from D's row).
+    if positive_indices is not None:
+        same_target = positive_indices.unsqueeze(1) == positive_indices.unsqueeze(0)
+        false_negative_mask = false_negative_mask | same_target
+
+    # Ensure diagonal is NOT masked out by the logic above (we need diagonal for the loss)
+    # We want to mask: (SameAnchor OR SameTarget) AND (NOT Diagonal)
+    final_mask = false_negative_mask & ~diagonal_mask
+
+    # Apply mask: set false negatives to -inf so Softmax ignores them
+    sim_matrix = sim_matrix.masked_fill(final_mask, float("-inf"))
 
     # Apply temporal masking if time information is provided
     if anchor_times is not None and positive_times is not None:
-        # Create mask: positive_j is valid negative for anchor_i only if positive_time_j < anchor_time_i
-        # Shape: [batch_size_anchor, batch_size_positive]
+        # positive_j is valid negative for anchor_i only if positive_time_j < anchor_time_i
         time_mask = positive_times.unsqueeze(0) < anchor_times.unsqueeze(1)
 
         # Ensure diagonal (positive pairs) are always valid
-        batch_size = sim_matrix.size(0)
-        diagonal_mask = torch.eye(
-            batch_size, dtype=torch.bool, device=sim_matrix.device
-        )
         time_mask = time_mask | diagonal_mask
 
         # Apply mask: set invalid negatives to very low value
@@ -57,7 +81,6 @@ def info_nce_loss(
     # Labels: for each anchor_i, the positive is at position i (diagonal)
     labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
 
-    # Cross entropy loss treats each row as logits where correct class is on diagonal
     loss = F.cross_entropy(sim_matrix, labels)
 
     return loss
@@ -75,7 +98,7 @@ class GNNTrainer:
         temperature: float = 0.07,
         num_hops: int = 2,
         graph_type: str = "heterogeneous",
-        checkpoint_interval: int = 25,  # Save checkpoint every N epochs
+        checkpoint_interval: int = 25,
         wandb_project: str | None = "gnn-training",
         wandb_name: str | None = None,
         warmup_epochs: int = 3,
@@ -107,58 +130,44 @@ class GNNTrainer:
         is_hetero: bool,
     ):
         """Process a batch and extract necessary components."""
-        # Handle heterogeneous vs homogeneous graphs
         if is_hetero:
-            # For heterogeneous graphs, work with paragraph nodes
             batch_size = batch["paragraph"].batch_size
             x = batch["paragraph"].x.clone()
 
-            # Use query embeddings for anchor nodes
             if hasattr(batch["paragraph"], "x_query"):
                 x[:batch_size] = batch["paragraph"].x_query[:batch_size]
 
-            # Extract time information for anchor nodes
             if hasattr(batch["paragraph"], "time"):
                 anchor_times = batch["paragraph"].time[:batch_size]
             else:
                 anchor_times = None
 
-            # Get citation edges (for positive sampling)
             if ("paragraph", "cites", "paragraph") in batch.edge_types:
                 cite_edge_index = batch["paragraph", "cites", "paragraph"].edge_index
             else:
-                # No citation edges in this batch, skip
                 return None
 
             # Mask citation edges to prevent leakage
-            # 1. Identify paragraphs in the same case as anchor nodes (batch_size)
-            # Get belongs_to edges to find which cases the anchor paragraphs belong to
             if ("paragraph", "belongs_to", "case") in batch.edge_types:
                 par_to_case = batch["paragraph", "belongs_to", "case"].edge_index
                 case_to_par = batch["case", "contains", "paragraph"].edge_index
 
-                # Find cases that anchor paragraphs belong to
                 anchor_mask = par_to_case[0] < batch_size
                 anchor_cases = par_to_case[1, anchor_mask].unique()
 
-                # Find all paragraphs in those cases
                 case_mask = torch.isin(case_to_par[0], anchor_cases)
                 paragraphs_in_anchor_cases = case_to_par[1, case_mask].unique()
             else:
-                # If no case structure, only mask anchor paragraphs
                 paragraphs_in_anchor_cases = torch.arange(
                     batch_size, device=self.device
                 )
 
-            # 2. Mask citation edges where src or tgt involve anchor cases
             cite_src, cite_tgt = cite_edge_index
-            # Mask edges where source AND target are in anchor cases
             leakage_mask = torch.isin(
                 cite_src, paragraphs_in_anchor_cases
             ) | torch.isin(cite_tgt, paragraphs_in_anchor_cases)
             masked_cite_edges = cite_edge_index[:, ~leakage_mask]
 
-            # Create modified batch with masked citation edges and updated features
             modified_batch = batch.clone()
             modified_batch["paragraph", "cites", "paragraph"].edge_index = (
                 masked_cite_edges
@@ -183,11 +192,9 @@ class GNNTrainer:
             batch_size = batch.batch_size
             x = batch.x.clone()
 
-            # Use query embeddings for anchor nodes
             if hasattr(batch, "x_query"):
                 x[:batch_size] = batch.x_query[:batch_size]
 
-            # Extract time information for anchor nodes
             if hasattr(batch, "time"):
                 anchor_times = batch.time[:batch_size]
             else:
@@ -195,8 +202,6 @@ class GNNTrainer:
 
             edge_index = batch.edge_index
 
-            # Mask edges to prevent leakage
-            # Remove edges where BOTH src and tgt are in anchor batch
             src, tgt = edge_index
             leakage_mask = ~((src < batch_size) | (tgt < batch_size))
             masked_edge_index = edge_index[:, leakage_mask]
@@ -207,6 +212,7 @@ class GNNTrainer:
                 "edge_index": edge_index,
                 "x": x,
                 "masked_edge_index": masked_edge_index,
+                "date_feature": batch.date_feature,
                 "anchor_times": anchor_times,
                 "all_times": batch.time if hasattr(batch, "time") else None,
             }
@@ -220,7 +226,6 @@ class GNNTrainer:
         """Compute loss for a processed batch."""
         batch_size = batch_data["batch_size"]
         edge_index = batch_data["edge_index"]
-        anchor_times = batch_data.get("anchor_times")
         all_times = batch_data.get("all_times")
 
         # Get embeddings
@@ -228,58 +233,42 @@ class GNNTrainer:
             out = model(batch_data["modified_batch"])
             embeddings = out["paragraph"] if isinstance(out, dict) else out
         else:
-            out = model(batch_data["x"], batch_data["masked_edge_index"])
+            date_feature = batch_data.get("date_feature")
+            out = model(
+                batch_data["x"],
+                batch_data["masked_edge_index"],
+                date_feature=date_feature,
+            )
             embeddings = out["paragraph"] if isinstance(out, dict) else out
 
-        anchor_emb = embeddings[:batch_size]
-
-        # Find edges where source is in the input batch (for positive sampling)
+        # Find edges where source is in the input batch
         src, tgt = edge_index
         input_mask = src < batch_size
         if input_mask.sum() == 0:
-            # No edges for this batch, skip
             return None
 
         batch_src = src[input_mask]
         batch_tgt = tgt[input_mask]
 
-        # Sort edges by source for efficient grouping
-        sorted_idx = torch.argsort(batch_src)
-        src_sorted = batch_src[sorted_idx]
-        tgt_sorted = batch_tgt[sorted_idx]
+        anchor_emb = embeddings[batch_src]
+        positive_emb = embeddings[batch_tgt]
 
-        # Find unique sources and their edge counts
-        unique_src, counts = torch.unique_consecutive(src_sorted, return_counts=True)
-
-        # Random sampling: generate random offset for each unique source
-        random_offsets = (torch.rand_like(counts.float()) * counts.float()).long()
-
-        # Compute cumulative positions
-        cumsum = torch.cat(
-            [torch.tensor([0], device=self.device), counts.cumsum(0)[:-1]]
-        )
-        selected_edges = cumsum + random_offsets
-
-        # Get positive samples
-        positive_indices = torch.arange(
-            batch_size, device=self.device
-        )  # Default to self
-        positive_indices[unique_src] = tgt_sorted[selected_edges]
-
-        positive_emb = embeddings[positive_indices]
-
-        # Extract times for positive samples
-        positive_times = None
+        # Get times for all pairs
+        pair_anchor_times = None
+        pair_positive_times = None
         if all_times is not None:
-            positive_times = all_times[positive_indices]
+            pair_anchor_times = all_times[batch_src]
+            pair_positive_times = all_times[batch_tgt]
 
-        # Compute loss with in-batch negatives (temporally filtered)
+        # Compute loss with in-batch negatives
         loss = info_nce_loss(
             anchor_emb,
             positive_emb,
             self.temperature,
-            anchor_times=anchor_times,
-            positive_times=positive_times,
+            anchor_times=pair_anchor_times,
+            positive_times=pair_positive_times,
+            anchor_indices=batch_src,  # Mask Same Source
+            positive_indices=batch_tgt,  # Mask Same Target (ADDED)
         )
 
         return loss
@@ -321,14 +310,13 @@ class GNNTrainer:
             num_batches += 1
             batch_counter += 1
 
-            # Log batch-level metrics to wandb
             if self.wandb_project is not None and batch_idx % 100 == 0:
                 wandb.log(
                     {
                         "train/batch_loss": loss.item(),
                         "train/learning_rate": optimizer.param_groups[0]["lr"],
                         "train/batch": batch_counter,
-                        "train/learning_rate": scheduler.get_last_lr()[0],
+                        "train/scheduler_lr": scheduler.get_last_lr()[0],
                     }
                 )
 
@@ -340,13 +328,7 @@ class GNNTrainer:
         gnn_model: nn.Module,
         train_cutoff_year: int | None = None,
     ) -> torch.nn.Module:
-        """
-        Train GNN model using preprocessed data from graph builder.
-
-        Args:
-            gnn_model: The GNN model to train
-            train_cutoff_year: Cutoff year for training data (e.g., 2018)
-        """
+        """Train GNN model."""
         os.makedirs(self.output_path, exist_ok=True)
         checkpoint_dir = os.path.join(self.output_path, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -355,12 +337,7 @@ class GNNTrainer:
         print(f"Training GNN with {self.graph_type.capitalize()} Graph Builder")
         print("=" * 80)
 
-        # Build graph based on type
         is_hetero = self.graph_type == "heterogeneous"
-
-        # Type declarations
-        train_graph_data: Data | HeteroData
-        input_nodes: tuple[str, torch.Tensor] | torch.Tensor | None
 
         if is_hetero:
             hetero_builder = HeterogeneousGraphBuilder(self.preprocessed_dir)
@@ -375,21 +352,17 @@ class GNNTrainer:
                 include_only_citing=True,
             ).to(self.device)
 
-        # Filter to only sample nodes with at least one positive (citation) edge
         print("\nFiltering nodes with positive examples...")
         if is_hetero:
-            # Get citation edge index
             cite_edge_index = train_graph_data[
                 "paragraph", "cites", "paragraph"
             ].edge_index
-            # Find unique source nodes (nodes that cite others)
             nodes_with_positives = cite_edge_index[0].unique()
             print(
                 f"  Paragraph nodes with citations: {len(nodes_with_positives)} / {train_graph_data['paragraph'].num_nodes}"
             )
             input_nodes = ("paragraph", nodes_with_positives)
         else:
-            # For homogeneous graphs, find nodes with outgoing edges
             edge_index = train_graph_data.edge_index
             nodes_with_positives = edge_index[0].unique()
             print(
@@ -399,7 +372,6 @@ class GNNTrainer:
 
         train_graph_data = ToUndirected()(train_graph_data)
 
-        # Initialize wandb
         if self.wandb_project is not None:
             wandb.init(
                 project=self.wandb_project,
@@ -419,23 +391,10 @@ class GNNTrainer:
                 },
             )
 
-        # Initialize model
         print("\nInitializing GNN model...")
         model = gnn_model.to(self.device)
 
-        # Log model architecture to wandb
         if self.wandb_project is not None:
-            total_params = sum(p.numel() for p in model.parameters())
-            trainable_params = sum(
-                p.numel() for p in model.parameters() if p.requires_grad
-            )
-            wandb.config.update(
-                {
-                    "model/total_parameters": total_params,
-                    "model/trainable_parameters": trainable_params,
-                }
-            )
-            # Log model architecture
             wandb.watch(model, log="all", log_freq=100)
 
         optimizer = AdamW(
@@ -444,7 +403,6 @@ class GNNTrainer:
             weight_decay=self.weight_decay,
         )
 
-        # Create data loaders
         num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
 
         train_loader = NeighborLoader(
@@ -457,24 +415,21 @@ class GNNTrainer:
             subgraph_type="bidirectional",
         )
 
-        # Calculate steps
         steps_per_epoch = len(train_loader)
         total_steps = self.epochs * steps_per_epoch
         warmup_steps = self.warmup_epochs * steps_per_epoch
 
-        # Simple warmup + cosine decay
         def lr_lambda(current_step):
             if current_step < warmup_steps:
-                return current_step / warmup_steps
-
-            progress = (current_step - warmup_steps) / (total_steps - warmup_steps)
-            return 0.5 * (1 + math.cos(math.pi * progress))
+                return float(current_step) / float(max(1, warmup_steps))
+            progress = float(current_step - warmup_steps) / float(
+                max(1, total_steps - warmup_steps)
+            )
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
 
         scheduler = LambdaLR(optimizer, lr_lambda)
 
         print(f"\nStarting training for {self.epochs} epochs...")
-        print(f"Checkpoints will be saved every {self.checkpoint_interval} epochs")
-
         best_loss = float("inf")
         global_batch_counter = 0
 
@@ -492,7 +447,6 @@ class GNNTrainer:
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
-            # Log epoch-level metrics to wandb
             if self.wandb_project is not None:
                 wandb.log(
                     {
@@ -501,19 +455,15 @@ class GNNTrainer:
                     }
                 )
 
-            # Track best model
             if train_loss < best_loss:
                 torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
                 print(
                     f"  ✓ New best training loss: {best_loss:.4f} -> {train_loss:.4f}"
                 )
                 best_loss = train_loss
-
-                # Log best loss to wandb
                 if self.wandb_project is not None:
                     wandb.run.summary["best_train_loss"] = best_loss
 
-            # Save checkpoint at specified intervals
             if (epoch + 1) % self.checkpoint_interval == 0:
                 checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}.pt")
                 torch.save(
@@ -522,23 +472,10 @@ class GNNTrainer:
                 )
                 print(f"  ✓ Checkpoint saved: {checkpoint_path}")
 
-                # Log checkpoint to wandb
-                if self.wandb_project is not None:
-                    wandb.save(checkpoint_path)
-
-        # Save final model
         torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
-
-        # Load best model
         print(f"\nLoading best model (train loss: {best_loss:.4f})...")
         model.load_state_dict(torch.load(f"{self.output_path}/best_model.pt"))
 
-        print(
-            f"Training complete! Best model saved to {self.output_path}/best_model.pt"
-        )
-        print(f"Checkpoints saved to {checkpoint_dir}/")
-
-        # Finish wandb run
         if self.wandb_project is not None:
             wandb.finish()
 

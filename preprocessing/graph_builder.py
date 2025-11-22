@@ -298,6 +298,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         idx_to_metadata: dict[int, dict] = {}
         doc_embeddings_list = []
         query_embeddings_list = []
+        date_features_list = []
         node_times = []
         node_ids = []
 
@@ -334,12 +335,12 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             # doc_emb = np.concatenate([doc_emb, [relative_position]])
             # query_emb = np.concatenate([query_emb, [relative_position]])
 
-            # date_feature = self._extract_date_features(meta.get("date"))
-            # doc_emb = np.concatenate([doc_emb, date_feature])
-            # query_emb = np.concatenate([query_emb, date_feature])
+            # Store date feature separately instead of concatenating
+            date_feature = self._extract_date_features(meta.get("date"))
 
             doc_embeddings_list.append(doc_emb)
             query_embeddings_list.append(query_emb)
+            date_features_list.append(date_feature)
             node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
 
             # Add timestamp (convert date to Unix timestamp)
@@ -359,6 +360,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         # Create PyTorch Geometric Data
         x_doc = torch.tensor(np.array(doc_embeddings_list), dtype=torch.float32)
         x_query = torch.tensor(np.array(query_embeddings_list), dtype=torch.float32)
+        date_features = torch.tensor(np.array(date_features_list), dtype=torch.float32)
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
@@ -378,6 +380,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         graph_data = Data(
             x=x_doc,  # Default to document embeddings for backward compatibility
             x_query=x_query,  # Query embeddings (for citing paragraphs)
+            date_feature=date_features,  # Date features stored separately
             edge_index=edge_index,
             num_nodes=len(doc_embeddings_list),
             time=node_times_tensor,  # For temporal sampling
