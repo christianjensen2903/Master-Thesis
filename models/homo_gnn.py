@@ -63,6 +63,6 @@ class CitationGNN(nn.Module):
         # x = self.projector(x)
 
         # Normalize embeddings
-        x = F.normalize(x, p=2, dim=1)
+        # x = F.normalize(x, p=2, dim=1)
 
         return x

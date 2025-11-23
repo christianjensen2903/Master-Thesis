@@ -33,11 +33,7 @@ def info_nce_loss(
     anchor_indices: [batch_size] - IDs of source nodes
     positive_indices: [batch_size] - IDs of target nodes
     """
-    # Normalize embeddings
-    anchor = F.normalize(anchor, dim=-1)
-    positive = F.normalize(positive, dim=-1)
-
-    # Compute similarity matrix: [batch_size, batch_size]
+    # Compute similarity matrix using unnormalized dot product: [batch_size, batch_size]
     sim_matrix = torch.mm(anchor, positive.t()) / temperature
 
     batch_size = sim_matrix.size(0)
