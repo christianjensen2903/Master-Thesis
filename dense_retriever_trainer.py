@@ -67,7 +67,7 @@ class DenseRetrieverTrainer:
             text_to = str(row["TEXT_TO"])
             from_id = str(row["FROM_ID"])
             to_id = str(row["TO_ID"])
-            documents[to_id] = text_to
+            documents[to_id] = f"passage: {text_to}"
 
         for _, row in val_df.iterrows():
             text_from = str(row["TEXT_FROM"])
@@ -79,7 +79,7 @@ class DenseRetrieverTrainer:
                 continue
 
             if from_id not in queries:
-                queries[from_id] = text_from
+                queries[from_id] = f"query: {text_from}"
                 relevant_docs[from_id] = set()
 
             relevant_docs[from_id].add(to_id)
@@ -110,7 +110,9 @@ class DenseRetrieverTrainer:
         ):
             text_from = str(row["TEXT_FROM"])
             text_to = str(row["TEXT_TO"])
-            train_data.append({"sentence1": text_from, "sentence2": text_to})
+            train_data.append(
+                {"sentence1": f"query: {text_from}", "sentence2": f"passage: {text_to}"}
+            )
 
         train_dataset = Dataset.from_list(train_data)
         return train_dataset, val_df, train_df

@@ -63,7 +63,7 @@ class EmbeddingPreprocessor:
             text_from = str(row["TEXT_FROM"])
             # Use the first occurrence (they should all be the same for a given paragraph)
             if par_id not in text_from_map:
-                text_from_map[par_id] = text_from
+                text_from_map[par_id] = f"query: {text_from}"
 
         print(f"Found masked text for {len(text_from_map)} citing paragraphs")
 
@@ -88,7 +88,7 @@ class EmbeddingPreprocessor:
                     {
                         "id": par_id,
                         "type": "paragraph",
-                        "text": text,
+                        "text": f"passage: {text}",
                         "text_from": text_from_map.get(
                             par_id
                         ),  # Masked text if available
@@ -118,12 +118,12 @@ class EmbeddingPreprocessor:
         paragraphs_with_masked_text = 0
         for p in paragraphs_data:
             if p["text_from"] is not None:
-                # Use masked text from par-to-par
+                # Use masked text from par-to-par (already has "query: " prefix)
                 query_texts.append(p["text_from"])
                 paragraphs_with_masked_text += 1
             else:
                 # Fallback: use mask token for paragraphs that never cite
-                query_texts.append(self.mask_token)
+                query_texts.append(f"query: {self.mask_token}")
 
         print(
             f"Using TEXT_FROM for {paragraphs_with_masked_text}/{len(paragraphs_data)} paragraphs"
@@ -156,19 +156,19 @@ class EmbeddingPreprocessor:
 
         # Encode case-level metadata
         subject_matter_embeddings = self.encoder.encode(
-            [c["subject_matter_text"] for c in case_metadata_data],
+            [f"passage: {c['subject_matter_text']}" for c in case_metadata_data],
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
         )
         keywords_embeddings = self.encoder.encode(
-            [c["keywords_text"] for c in case_metadata_data],
+            [f"passage: {c['keywords_text']}" for c in case_metadata_data],
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
         )
         case_law_about_embeddings = self.encoder.encode(
-            [c["case_law_about_text"] for c in case_metadata_data],
+            [f"passage: {c['case_law_about_text']}" for c in case_metadata_data],
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
@@ -254,7 +254,7 @@ class EmbeddingPreprocessor:
                     {
                         "id": f"art:{celex}:{art_num}",
                         "type": "article",
-                        "text": text,
+                        "text": f"passage: {text}",
                         "celex": celex,
                         "article_number": art_num,
                         "title": act.get("title", ""),
@@ -267,7 +267,7 @@ class EmbeddingPreprocessor:
 
         # Encode all texts
         print("Encoding articles...")
-        texts = [a["text"] for a in articles_data]
+        texts = [a["text"] for a in articles_data]  # Already has "passage: " prefix
         embeddings = self.encoder.encode(
             texts,
             batch_size=self.batch_size,
