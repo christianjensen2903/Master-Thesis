@@ -17,12 +17,16 @@ class BaseRetriever(ABC):
         pass
 
     @abstractmethod
-    def transform(self, texts: np.ndarray) -> np.ndarray:
+    def transform(
+        self, texts: np.ndarray, paragraph_ids: list[tuple[str, int]] | None = None
+    ) -> np.ndarray:
         """
         Transform texts into their vector representations.
 
         Args:
             texts: Array of paragraph texts
+            paragraph_ids: Optional list of (celex, number) tuples for each text.
+                          Used to look up precomputed embeddings if available.
 
         Returns:
             Matrix of shape (n_texts, n_features)

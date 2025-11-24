@@ -112,7 +112,6 @@ class Evaluator:
         par_to_par_path: str = "data/par-to-par-cleaned.csv",
         train_cutoff_year: int = 2018,
         top_k: int | None = None,
-        save_embeddings_path: str | None = None,
     ):
         self.retriever = retriever
         self.embeddings = embeddings
@@ -121,7 +120,6 @@ class Evaluator:
         self.par_to_par_path = par_to_par_path
         self.train_cutoff_year = train_cutoff_year
         self.top_k = top_k
-        self.save_embeddings_path = save_embeddings_path
 
         # Data structures (populated by load_and_prepare)
         self.pid_to_text: NDArray[np.object_] | None = None
@@ -347,16 +345,30 @@ class Evaluator:
     def _embed_queries(self) -> None:
         """Embed query texts using the retriever."""
         assert self.query_texts is not None
+        assert self.query_pids is not None
+        assert self.paragraph_celex is not None
+        assert self.paragraph_number is not None
+
         query_texts = self.query_texts
 
         print("Embedding queries...")
 
+        # Build paragraph IDs for queries
+        query_paragraph_ids = [
+            (self.paragraph_celex[pid], int(self.paragraph_number[pid]))
+            for pid in self.query_pids
+        ]
+
         # Check if retriever has a special method for queries (e.g., GNN)
         if hasattr(self.retriever, "transform_queries"):
-            query_embeddings = self.retriever.transform_queries(query_texts)
+            query_embeddings = self.retriever.transform_queries(
+                query_texts, paragraph_ids=query_paragraph_ids
+            )
         else:
             # Standard transform for all other retrievers
-            query_embeddings = self.retriever.transform(query_texts)
+            query_embeddings = self.retriever.transform(
+                query_texts, paragraph_ids=query_paragraph_ids
+            )
 
         self.query_embeddings = query_embeddings
         print(f"Query embeddings shape: {query_embeddings.shape}")
@@ -502,38 +514,6 @@ class Evaluator:
         upper = float(np.quantile(means, 1.0 - alpha / 2.0))
         return lower, upper
 
-    def load_embeddings(self, path: str | None = None) -> NDArray | None:
-        """Load embeddings from disk using numpy's load format."""
-        load_path = path or self.save_embeddings_path
-        if load_path is None:
-            return None
-
-        if not os.path.exists(load_path):
-            return None
-
-        try:
-            embeddings = np.load(load_path)
-            print(f"Loaded embeddings from {load_path} (shape: {embeddings.shape})")
-            return embeddings
-        except Exception as e:
-            print(f"Failed to load embeddings from {load_path}: {e}")
-            return None
-
-    def save_embeddings(self, path: str | None = None) -> None:
-        """Save embeddings to disk using numpy's save format."""
-        if self.embeddings is None:
-            raise ValueError("No embeddings to save. Run evaluation first.")
-
-        save_path = path or self.save_embeddings_path
-        if save_path is None:
-            return
-
-        dir_path = os.path.dirname(save_path)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-        np.save(save_path, self.embeddings)
-        print(f"Saved embeddings to {save_path} (shape: {self.embeddings.shape})")
-
     def run(self) -> float:
         print(f"Mode: {self.mode}")
         print("Loading and preparing data...")
@@ -548,29 +528,32 @@ class Evaluator:
         print(f"Test paragraphs: {np.sum(self.paragraph_set == 'test')}")
         print(f"Total queries: {len(self.query_pids)}")
 
-        # Try to load embeddings if not provided
-        if self.embeddings is None and self.save_embeddings_path:
-            print("\nAttempting to load embeddings from disk...")
-            loaded_embeddings = self.load_embeddings()
-            if loaded_embeddings is not None:
-                # Validate loaded embeddings match paragraph index
-                if len(loaded_embeddings) != len(self.pid_to_text):
-                    print(
-                        f"Warning: Loaded embeddings size mismatch "
-                        f"({len(loaded_embeddings)} vs {len(self.pid_to_text)}). "
-                        f"Regenerating embeddings..."
-                    )
-                else:
-                    self.embeddings = loaded_embeddings
+        assert self.paragraph_celex is not None
+        assert self.paragraph_number is not None
 
-        # Generate embeddings if still not available
+        # Generate embeddings using retriever
         if self.embeddings is None:
             print("\nGenerating embeddings from retriever...")
             train_mask = self.paragraph_set == "train"
+
+            # Build paragraph IDs for all paragraphs
+            paragraph_ids = [
+                (self.paragraph_celex[pid], int(self.paragraph_number[pid]))
+                for pid in range(len(self.pid_to_text))
+            ]
+
             # Fit on training data, transform on all data
             self.retriever.fit(self.pid_to_text, mask=train_mask)
-            self.embeddings = self.retriever.transform(self.pid_to_text)
+            self.embeddings = self.retriever.transform(
+                self.pid_to_text, paragraph_ids=paragraph_ids
+            )
             print(f"Embeddings shape: {self.embeddings.shape}")
+
+            # Save embeddings if retriever supports it
+            if hasattr(self.retriever, "save_embeddings"):
+                save_path = getattr(self.retriever, "save_embeddings_path", None)
+                if save_path:
+                    self.retriever.save_embeddings(self.embeddings, save_path)
         else:
             # Validate embeddings match paragraph index
             if len(self.embeddings) != len(self.pid_to_text):
@@ -579,10 +562,6 @@ class Evaluator:
                     f"but have {len(self.pid_to_text)} paragraphs. "
                     f"You must regenerate embeddings in '{self.mode}' mode."
                 )
-
-        # Save embeddings if path is specified
-        if self.save_embeddings_path:
-            self.save_embeddings()
 
         # Embed queries using cleaned query texts
         self._embed_queries()
@@ -605,7 +584,7 @@ class Evaluator:
 
 
 if __name__ == "__main__":
-    from retrievers import DenseRetriever, GNNRetriever, TfidfRetriever, BOWRetriever
+    from retrievers import DenseRetriever, TfidfRetriever, BOWRetriever
     import torch
     from sentence_transformers import SentenceTransformer
 

@@ -27,7 +27,9 @@ class TfidfRetriever(BaseRetriever):
         self.vectorizer.fit(fit_texts)
         self._is_fitted = True
 
-    def transform(self, texts: np.ndarray) -> csr_matrix:
+    def transform(
+        self, texts: np.ndarray, paragraph_ids: list[tuple[str, int]] | None = None
+    ) -> csr_matrix:
         if not self._is_fitted:
             raise RuntimeError("Retriever must be fitted before transform")
 
