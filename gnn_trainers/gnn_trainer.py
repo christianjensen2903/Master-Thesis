@@ -22,6 +22,8 @@ def info_nce_loss(
     temperature=0.07,
     anchor_times=None,
     positive_times=None,
+    anchor_indices=None,
+    positive_indices=None,  # ADDED: To detect target collisions
 ):
     """
     In-batch negative contrastive loss with temporal filtering and False Negative masking.
@@ -34,15 +36,37 @@ def info_nce_loss(
     # Compute similarity matrix using unnormalized dot product: [batch_size, batch_size]
     sim_matrix = torch.mm(anchor, positive.t()) / temperature
 
+    batch_size = sim_matrix.size(0)
+    diagonal_mask = torch.eye(batch_size, dtype=torch.bool, device=sim_matrix.device)
+
+    # Initialize mask for False Negatives (True = mask out/ignore)
+    # We start with False everywhere except potentially the diagonal handling later
+    false_negative_mask = torch.zeros_like(sim_matrix, dtype=torch.bool)
+
+    # 1. Handle "Same Anchor" (One-to-Many)
+    # This ensures that if Node A cites B and C, C is not treated as a negative for (A->B).
+    if anchor_indices is not None:
+        same_anchor = anchor_indices.unsqueeze(1) == anchor_indices.unsqueeze(0)
+        false_negative_mask = false_negative_mask | same_anchor
+
+    # 2. Handle "Same Target" (Many-to-One)
+    # This ensures that if Node A cites B and Node D cites B,
+    # we don't penalize A for being close to B (from D's row).
+    if positive_indices is not None:
+        same_target = positive_indices.unsqueeze(1) == positive_indices.unsqueeze(0)
+        false_negative_mask = false_negative_mask | same_target
+
+    # Ensure diagonal is NOT masked out by the logic above (we need diagonal for the loss)
+    # We want to mask: (SameAnchor OR SameTarget) AND (NOT Diagonal)
+    final_mask = false_negative_mask & ~diagonal_mask
+
+    # Apply mask: set false negatives to -inf so Softmax ignores them
+    sim_matrix = sim_matrix.masked_fill(final_mask, float("-inf"))
+
     # Apply temporal masking if time information is provided
     if anchor_times is not None and positive_times is not None:
         # positive_j is valid negative for anchor_i only if positive_time_j < anchor_time_i
         time_mask = positive_times.unsqueeze(0) < anchor_times.unsqueeze(1)
-
-        batch_size = sim_matrix.size(0)
-        diagonal_mask = torch.eye(
-            batch_size, dtype=torch.bool, device=sim_matrix.device
-        )
 
         # Ensure diagonal (positive pairs) are always valid
         time_mask = time_mask | diagonal_mask
@@ -198,7 +222,6 @@ class GNNTrainer:
         """Compute loss for a processed batch."""
         batch_size = batch_data["batch_size"]
         edge_index = batch_data["edge_index"]
-        anchor_times = batch_data.get("anchor_times")
         all_times = batch_data.get("all_times")
 
         # Get embeddings
@@ -214,8 +237,6 @@ class GNNTrainer:
             )
             embeddings = out["paragraph"] if isinstance(out, dict) else out
 
-        anchor_emb = embeddings[:batch_size]
-
         # Find edges where source is in the input batch
         src, tgt = edge_index
         input_mask = src < batch_size
@@ -225,44 +246,25 @@ class GNNTrainer:
         batch_src = src[input_mask]
         batch_tgt = tgt[input_mask]
 
-        # Sort edges by source for efficient grouping
-        sorted_idx = torch.argsort(batch_src)
-        src_sorted = batch_src[sorted_idx]
-        tgt_sorted = batch_tgt[sorted_idx]
+        anchor_emb = embeddings[batch_src]
+        positive_emb = embeddings[batch_tgt]
 
-        # Find unique sources and their edge counts
-        unique_src, counts = torch.unique_consecutive(src_sorted, return_counts=True)
-
-        # Random sampling: generate random offset for each unique source
-        random_offsets = (torch.rand_like(counts.float()) * counts.float()).long()
-
-        # Compute cumulative positions
-        cumsum = torch.cat(
-            [torch.tensor([0], device=self.device), counts.cumsum(0)[:-1]]
-        )
-        selected_edges = cumsum + random_offsets
-
-        # Get positive samples
-        positive_indices = torch.arange(
-            batch_size, device=self.device
-        )  # Default to self
-        positive_indices[unique_src] = tgt_sorted[selected_edges]
-
-        positive_emb = embeddings[positive_indices]
-
-        # Extract times for positive samples
-        positive_times = None
-
+        # Get times for all pairs
+        pair_anchor_times = None
+        pair_positive_times = None
         if all_times is not None:
-            positive_times = all_times[positive_indices]
+            pair_anchor_times = all_times[batch_src]
+            pair_positive_times = all_times[batch_tgt]
 
         # Compute loss with in-batch negatives
         loss = info_nce_loss(
             anchor_emb,
             positive_emb,
             self.temperature,
-            anchor_times=anchor_times,
-            positive_times=positive_times,
+            anchor_times=pair_anchor_times,
+            positive_times=pair_positive_times,
+            anchor_indices=batch_src,  # Mask Same Source
+            positive_indices=batch_tgt,  # Mask Same Target (ADDED)
         )
 
         return loss
