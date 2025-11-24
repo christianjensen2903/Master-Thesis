@@ -29,17 +29,15 @@ class CitationGNN(nn.Module):
         # Keep same dimensions for residual
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
-        self.alphas = nn.ParameterList()
 
         for _ in range(num_layers):
             self.convs.append(SAGEConv(input_dim, input_dim, aggr="sum"))
             self.norms.append(nn.LayerNorm(input_dim))
-            self.alphas.append(nn.Parameter(torch.tensor(0.2)))
 
         self.projector = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
+            nn.Linear(input_dim, output_dim * 2),
             nn.GELU(),
-            nn.Linear(output_dim, output_dim),
+            nn.Linear(output_dim * 2, output_dim),
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -51,20 +49,20 @@ class CitationGNN(nn.Module):
         date_feature: torch.Tensor,
     ) -> torch.Tensor:
 
-        # date_feature = self.date_projection(date_feature)
-        # x = x + date_feature
+        date_feature = self.date_projection(date_feature)
+        x = x + date_feature
 
         for i, conv in enumerate(self.convs):
             x_new = conv(x, edge_index)
             x_new = self.norms[i](x_new)
-            x_new = F.gelu(x_new)
-            x_new = self.dropout(x_new)
-            a = F.sigmoid(self.alphas[i])
-            x = a * x_new + (1 - a) * x
+            if i < len(self.convs) - 1:
+                x_new = F.gelu(x_new)
+                x_new = self.dropout(x_new)
+            x = F.layer_norm(x, [x.size(-1)]) + x_new
 
-        x = self.projector(x)
+        # x = self.projector(x)
 
         # Normalize embeddings
-        x = F.normalize(x, p=2, dim=1)
+        # x = F.normalize(x, p=2, dim=1)
 
         return x
