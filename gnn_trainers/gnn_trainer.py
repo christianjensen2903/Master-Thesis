@@ -99,6 +99,8 @@ class GNNTrainer:
         wandb_name: str | None = None,
         warmup_epochs: int = 3,
         eval_every_n_epochs: int = 1,
+        gradient_clip_val: float | None = None,  # NEW: Optional gradient clipping
+        log_every_n_batches: int = 100,  # NEW: Control logging frequency
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -114,6 +116,8 @@ class GNNTrainer:
         self.wandb_name = wandb_name
         self.warmup_epochs = warmup_epochs
         self.eval_every_n_epochs = eval_every_n_epochs
+        self.gradient_clip_val = gradient_clip_val
+        self.log_every_n_batches = log_every_n_batches
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -243,7 +247,7 @@ class GNNTrainer:
         src, tgt = edge_index
         input_mask = src < batch_size
         if input_mask.sum() == 0:
-            return None
+            return None, None  # Return None for both loss and stats
 
         batch_src = src[input_mask]
         batch_tgt = tgt[input_mask]
@@ -287,6 +291,8 @@ class GNNTrainer:
         num_batches = 0
         batch_counter = global_batch_counter
 
+        epoch_grad_norms = []
+
         for batch_idx, batch in enumerate(
             tqdm(loader, desc="Training batches", leave=False)
         ):
@@ -301,6 +307,21 @@ class GNNTrainer:
             optimizer.zero_grad()
             loss.backward()
 
+            total_norm = 0.0
+            max_grad = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+                    max_grad = max(max_grad, p.grad.data.abs().max().item())
+            total_norm = total_norm**0.5
+            epoch_grad_norms.append(total_norm)
+
+            if self.gradient_clip_val is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=self.gradient_clip_val
+                )
+
             optimizer.step()
             scheduler.step()
 
@@ -308,17 +329,23 @@ class GNNTrainer:
             num_batches += 1
             batch_counter += 1
 
-            if self.wandb_project is not None and batch_idx % 100 == 0:
-                wandb.log(
-                    {
-                        "train/batch_loss": loss.item(),
-                        "train/learning_rate": optimizer.param_groups[0]["lr"],
-                        "train/batch": batch_counter,
-                        "train/scheduler_lr": scheduler.get_last_lr()[0],
-                    }
-                )
+            if (
+                self.wandb_project is not None
+                and batch_idx % self.log_every_n_batches == 0
+            ):
+                log_dict = {
+                    "train/batch_loss": loss.item(),
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    "train/batch": batch_counter,
+                    "train/scheduler_lr": scheduler.get_last_lr()[0],
+                    "train/grad_norm": total_norm,
+                    "train/max_grad": max_grad,
+                }
+
+                wandb.log(log_dict)
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+
         return avg_loss, batch_counter
 
     @torch.no_grad()
@@ -327,7 +354,7 @@ class GNNTrainer:
         model: nn.Module,
         loader: NeighborLoader,
         is_hetero: bool,
-    ) -> float:
+    ) -> tuple[float, dict]:
         """Validate the model on validation set."""
         model.eval()
         total_loss = 0
@@ -346,6 +373,7 @@ class GNNTrainer:
             num_batches += 1
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+
         return avg_loss
 
     def train(
@@ -428,6 +456,9 @@ class GNNTrainer:
                 )
                 val_input_nodes = val_nodes_with_positives
 
+            # Only sample nodes post-training cutoff year
+            val_graph_data = val_graph_data.filter(lambda x: x.time <= val_cutoff_year)
+
             val_graph_data = ToUndirected()(val_graph_data)
 
             num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
@@ -455,6 +486,8 @@ class GNNTrainer:
                 "val_cutoff_year": val_cutoff_year,
                 "device": str(self.device),
                 "num_nodes_with_positives": len(nodes_with_positives),
+                "gradient_clip_val": self.gradient_clip_val,
+                "log_every_n_batches": self.log_every_n_batches,
             }
             if val_cutoff_year is not None:
                 config["num_val_nodes_with_positives"] = len(val_nodes_with_positives)
@@ -519,6 +552,7 @@ class GNNTrainer:
                 global_batch_counter,
             )
 
+            # NEW: Enhanced console output
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
@@ -527,7 +561,6 @@ class GNNTrainer:
             if val_loader is not None and (epoch + 1) % self.eval_every_n_epochs == 0:
                 val_loss = self.validate(model, val_loader, is_hetero)
                 print(f"  Val Loss:   {val_loss:.4f}")
-
             # Log to wandb
             if self.wandb_project is not None:
                 log_dict = {
@@ -535,7 +568,7 @@ class GNNTrainer:
                     "epoch": epoch + 1,
                 }
                 if val_loss is not None:
-                    log_dict["val/epoch_loss"] = val_loss
+                    log_dict.update({"val/epoch_loss": val_loss})
                 wandb.log(log_dict)
 
             # Save best model based on validation loss if available, otherwise training loss
