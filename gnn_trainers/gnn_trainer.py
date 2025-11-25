@@ -24,6 +24,7 @@ def info_nce_loss(
     positive_times=None,
     anchor_indices=None,
     positive_indices=None,  # ADDED: To detect target collisions
+    return_stats=False,
 ):
     """
     In-batch negative contrastive loss with temporal filtering and False Negative masking.
@@ -32,6 +33,7 @@ def info_nce_loss(
     positive: [batch_size, dim]
     anchor_indices: [batch_size] - IDs of source nodes
     positive_indices: [batch_size] - IDs of target nodes
+    return_stats: if True, return (loss, stats_dict), else return loss only
     """
     # Compute similarity matrix using unnormalized dot product: [batch_size, batch_size]
     sim_matrix = torch.mm(anchor, positive.t()) / temperature
@@ -79,7 +81,70 @@ def info_nce_loss(
 
     loss = F.cross_entropy(sim_matrix, labels)
 
-    return loss
+    if not return_stats:
+        return loss
+
+    # Compute statistics for monitoring
+    stats = {}
+
+    # Get positive similarities (diagonal)
+    positive_sims = torch.diagonal(sim_matrix)
+    stats["pos_sim_mean"] = positive_sims.mean().item()
+    stats["pos_sim_std"] = positive_sims.std().item()
+    stats["pos_sim_min"] = positive_sims.min().item()
+    stats["pos_sim_max"] = positive_sims.max().item()
+
+    # Get negative similarities (off-diagonal valid entries)
+    # Create a mask for valid negatives (not masked to -inf)
+    valid_mask = ~torch.isinf(sim_matrix) & ~diagonal_mask
+
+    if valid_mask.any():
+        negative_sims = sim_matrix[valid_mask]
+        stats["neg_sim_mean"] = negative_sims.mean().item()
+        stats["neg_sim_std"] = negative_sims.std().item()
+        stats["neg_sim_max"] = negative_sims.max().item()
+
+        # Number of valid negatives per sample
+        num_valid_negatives = valid_mask.sum(dim=1).float()
+        stats["num_negatives_mean"] = num_valid_negatives.mean().item()
+        stats["num_negatives_min"] = num_valid_negatives.min().item()
+        stats["num_negatives_max"] = num_valid_negatives.max().item()
+
+        # Margin: difference between positive and max negative similarity
+        max_neg_per_sample = torch.where(
+            valid_mask,
+            sim_matrix,
+            torch.tensor(float("-inf"), device=sim_matrix.device),
+        ).max(dim=1)[0]
+        margin = positive_sims - max_neg_per_sample
+        stats["margin_mean"] = margin.mean().item()
+        stats["margin_min"] = margin.min().item()
+
+        # Positive rank: where does the positive rank among all samples?
+        # Lower is better (rank 1 means positive is the highest similarity)
+        ranks = (sim_matrix > positive_sims.unsqueeze(1)).sum(dim=1) + 1
+        stats["pos_rank_mean"] = ranks.float().mean().item()
+        stats["pos_rank_median"] = ranks.float().median().item()
+
+        # Accuracy@k: percentage of positives in top-k
+        for k in [1, 5, 10]:
+            if k <= sim_matrix.size(1):
+                acc_at_k = (ranks <= k).float().mean().item()
+                stats[f"acc@{k}"] = acc_at_k
+    else:
+        # No valid negatives case
+        stats["neg_sim_mean"] = 0.0
+        stats["neg_sim_std"] = 0.0
+        stats["neg_sim_max"] = 0.0
+        stats["num_negatives_mean"] = 0.0
+        stats["num_negatives_min"] = 0.0
+        stats["num_negatives_max"] = 0.0
+        stats["margin_mean"] = 0.0
+        stats["margin_min"] = 0.0
+        stats["pos_rank_mean"] = 1.0
+        stats["pos_rank_median"] = 1.0
+
+    return loss, stats
 
 
 class GNNTrainer:
@@ -230,6 +295,7 @@ class GNNTrainer:
         model: nn.Module,
         batch_data: dict,
         is_hetero: bool,
+        return_stats: bool = False,
     ):
         """Compute loss for a processed batch."""
         batch_size = batch_data["batch_size"]
@@ -264,7 +330,7 @@ class GNNTrainer:
             input_mask = src < batch_size
 
         if input_mask.sum() == 0:
-            return None, None  # Return None for both loss and stats
+            return (None, None) if return_stats else None
 
         batch_src = src[input_mask]
         batch_tgt = tgt[input_mask]
@@ -280,17 +346,26 @@ class GNNTrainer:
             pair_positive_times = all_times[batch_tgt]
 
         # Compute loss with in-batch negatives
-        loss = info_nce_loss(
+        result = info_nce_loss(
             anchor_emb,
             positive_emb,
             self.temperature,
             anchor_times=pair_anchor_times,
             positive_times=pair_positive_times,
             anchor_indices=batch_src,  # Mask Same Source
-            positive_indices=batch_tgt,  # Mask Same Target (ADDED)
+            positive_indices=batch_tgt,  # Mask Same Target
+            return_stats=return_stats,
         )
 
-        return loss
+        if return_stats:
+            loss, stats = result
+            # Add embedding statistics
+            stats["emb_norm_mean"] = embeddings.norm(dim=1).mean().item()
+            stats["emb_norm_std"] = embeddings.norm(dim=1).std().item()
+            stats["num_pairs"] = input_mask.sum().item()
+            return loss, stats
+        else:
+            return result
 
     def train_epoch(
         self,
@@ -308,7 +383,8 @@ class GNNTrainer:
         num_batches = 0
         batch_counter = global_batch_counter
 
-        epoch_grad_norms = []
+        # Accumulators for batch statistics
+        batch_stats_accum = {}
 
         for batch_idx, batch in enumerate(
             tqdm(loader, desc="Training batches", leave=False)
@@ -317,9 +393,12 @@ class GNNTrainer:
             if batch_data is None:
                 continue
 
-            loss = self._compute_loss(model, batch_data, is_hetero)
-            if loss is None:
+            # Get loss and stats
+            result = self._compute_loss(model, batch_data, is_hetero, return_stats=True)
+            if result[0] is None:
                 continue
+
+            loss, batch_stats = result
 
             optimizer.zero_grad()
             loss.backward()
@@ -332,7 +411,6 @@ class GNNTrainer:
                     total_norm += param_norm.item() ** 2
                     max_grad = max(max_grad, p.grad.data.abs().max().item())
             total_norm = total_norm**0.5
-            epoch_grad_norms.append(total_norm)
 
             if self.gradient_clip_val is not None:
                 torch.nn.utils.clip_grad_norm_(
@@ -345,6 +423,12 @@ class GNNTrainer:
             total_loss += loss.item()
             num_batches += 1
             batch_counter += 1
+
+            # Accumulate statistics
+            for key, value in batch_stats.items():
+                if key not in batch_stats_accum:
+                    batch_stats_accum[key] = []
+                batch_stats_accum[key].append(value)
 
             if (
                 self.wandb_project is not None
@@ -359,11 +443,21 @@ class GNNTrainer:
                     "train/max_grad": max_grad,
                 }
 
+                # Add batch statistics to wandb
+                for key, value in batch_stats.items():
+                    log_dict[f"train/{key}"] = value
+
                 wandb.log(log_dict)
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
 
-        return avg_loss, batch_counter
+        # Compute epoch averages for statistics
+        epoch_stats = {}
+        for key, values in batch_stats_accum.items():
+            if values:
+                epoch_stats[key] = sum(values) / len(values)
+
+        return avg_loss, batch_counter, epoch_stats
 
     @torch.no_grad()
     def validate(
@@ -377,21 +471,38 @@ class GNNTrainer:
         total_loss = 0
         num_batches = 0
 
+        # Accumulators for validation statistics
+        val_stats_accum = {}
+
         for batch in tqdm(loader, desc="Validation batches", leave=False):
             batch_data = self._process_batch(batch, is_hetero)
             if batch_data is None:
                 continue
 
-            loss = self._compute_loss(model, batch_data, is_hetero)
-            if loss is None:
+            result = self._compute_loss(model, batch_data, is_hetero, return_stats=True)
+            if result[0] is None:
                 continue
+
+            loss, batch_stats = result
 
             total_loss += loss.item()
             num_batches += 1
 
+            # Accumulate statistics
+            for key, value in batch_stats.items():
+                if key not in val_stats_accum:
+                    val_stats_accum[key] = []
+                val_stats_accum[key].append(value)
+
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
 
-        return avg_loss
+        # Compute validation averages for statistics
+        val_stats = {}
+        for key, values in val_stats_accum.items():
+            if values:
+                val_stats[key] = sum(values) / len(values)
+
+        return avg_loss, val_stats
 
     def train(
         self,
@@ -568,7 +679,7 @@ class GNNTrainer:
         global_batch_counter = 0
 
         for epoch in range(self.epochs):
-            train_loss, global_batch_counter = self.train_epoch(
+            train_loss, global_batch_counter, train_stats = self.train_epoch(
                 model,
                 train_loader,
                 optimizer,
@@ -578,23 +689,53 @@ class GNNTrainer:
                 global_batch_counter,
             )
 
-            # NEW: Enhanced console output
+            # Enhanced console output with key metrics
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
+            # Print key training statistics
+            if train_stats:
+                print(
+                    f"  Pos Sim:    {train_stats.get('pos_sim_mean', 0):.3f} ± {train_stats.get('pos_sim_std', 0):.3f}"
+                )
+                print(
+                    f"  Neg Sim:    {train_stats.get('neg_sim_mean', 0):.3f} ± {train_stats.get('neg_sim_std', 0):.3f}"
+                )
+                print(f"  Margin:     {train_stats.get('margin_mean', 0):.3f}")
+                print(f"  Acc@1:      {train_stats.get('acc@1', 0):.2%}")
+                print(f"  Num Negs:   {train_stats.get('num_negatives_mean', 0):.1f}")
+
             # Run validation if enabled and it's time to evaluate
             val_loss = None
+            val_stats = None
             if val_loader is not None and (epoch + 1) % self.eval_every_n_epochs == 0:
-                val_loss = self.validate(model, val_loader, is_hetero)
+                val_loss, val_stats = self.validate(model, val_loader, is_hetero)
                 print(f"  Val Loss:   {val_loss:.4f}")
+
+                # Print key validation statistics
+                if val_stats:
+                    print(f"  Val Pos Sim: {val_stats.get('pos_sim_mean', 0):.3f}")
+                    print(f"  Val Margin:  {val_stats.get('margin_mean', 0):.3f}")
+                    print(f"  Val Acc@1:   {val_stats.get('acc@1', 0):.2%}")
+
             # Log to wandb
             if self.wandb_project is not None:
                 log_dict = {
                     "train/epoch_loss": train_loss,
                     "epoch": epoch + 1,
                 }
+
+                # Add epoch-level training statistics
+                for key, value in train_stats.items():
+                    log_dict[f"train_epoch/{key}"] = value
+
                 if val_loss is not None:
-                    log_dict.update({"val/epoch_loss": val_loss})
+                    log_dict["val/epoch_loss"] = val_loss
+                    # Add epoch-level validation statistics
+                    if val_stats:
+                        for key, value in val_stats.items():
+                            log_dict[f"val_epoch/{key}"] = value
+
                 wandb.log(log_dict)
 
             # Save best model based on validation loss if available, otherwise training loss
