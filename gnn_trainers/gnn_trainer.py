@@ -203,10 +203,14 @@ class GNNTrainer:
                 anchor_times = None
 
             edge_index = batch.edge_index
+            edge_attr = batch.edge_attr if hasattr(batch, "edge_attr") else None
 
             src, tgt = edge_index
             leakage_mask = ~((src < batch_size) | (tgt < batch_size))
             masked_edge_index = edge_index[:, leakage_mask]
+            masked_edge_attr = (
+                edge_attr[leakage_mask] if edge_attr is not None else None
+            )
 
             return {
                 "batch_size": batch_size,
@@ -214,6 +218,8 @@ class GNNTrainer:
                 "edge_index": edge_index,
                 "x": x,
                 "masked_edge_index": masked_edge_index,
+                "masked_edge_attr": masked_edge_attr,
+                "edge_attr": edge_attr,
                 "date_feature": batch.date_feature,
                 "anchor_times": anchor_times,
                 "all_times": batch.time if hasattr(batch, "time") else None,
@@ -236,16 +242,27 @@ class GNNTrainer:
             embeddings = out["paragraph"] if isinstance(out, dict) else out
         else:
             date_feature = batch_data.get("date_feature")
+            masked_edge_attr = batch_data.get("masked_edge_attr")
             out = model(
                 batch_data["x"],
                 batch_data["masked_edge_index"],
                 date_feature=date_feature,
+                edge_attr=masked_edge_attr,
             )
             embeddings = out["paragraph"] if isinstance(out, dict) else out
 
         # Find edges where source is in the input batch
+        # We only want "cites" edges (edge_attr == 0) for training
         src, tgt = edge_index
-        input_mask = src < batch_size
+        edge_attr = batch_data.get("edge_attr")
+
+        if edge_attr is not None:
+            # Only use forward citation edges (type 0 = "cites")
+            cites_mask = edge_attr == 0
+            input_mask = (src < batch_size) & cites_mask
+        else:
+            input_mask = src < batch_size
+
         if input_mask.sum() == 0:
             return None, None  # Return None for both loss and stats
 
@@ -405,6 +422,7 @@ class GNNTrainer:
             train_graph_data = homo_builder.build_graph(
                 train_cutoff_year=train_cutoff_year,
                 include_only_citing=True,
+                add_reverse_edges=True,  # Enable edge direction features
             ).to(self.device)
 
         print("\nFiltering nodes with positive examples...")
@@ -419,13 +437,19 @@ class GNNTrainer:
             input_nodes = ("paragraph", nodes_with_positives)
         else:
             edge_index = train_graph_data.edge_index
-            nodes_with_positives = edge_index[0].unique()
+            edge_attr = train_graph_data.edge_attr
+            # Only consider "cites" edges (type 0) for finding nodes with positives
+            cites_mask = edge_attr == 0
+            cites_edges = edge_index[:, cites_mask]
+            nodes_with_positives = cites_edges[0].unique()
             print(
                 f"  Nodes with citations: {len(nodes_with_positives)} / {train_graph_data.num_nodes}"
             )
             input_nodes = nodes_with_positives
 
-        train_graph_data = ToUndirected()(train_graph_data)
+        # Don't use ToUndirected for homogeneous graphs anymore since we handle it ourselves
+        if is_hetero:
+            train_graph_data = ToUndirected()(train_graph_data)
 
         # Build validation graph if val_cutoff_year is provided
         val_loader = None
@@ -448,18 +472,20 @@ class GNNTrainer:
                 val_graph_data = homo_builder.build_graph(
                     train_cutoff_year=val_cutoff_year,
                     include_only_citing=True,
+                    add_reverse_edges=True,
                 ).to(self.device)
                 val_edge_index = val_graph_data.edge_index
-                val_nodes_with_positives = val_edge_index[0].unique()
+                val_edge_attr = val_graph_data.edge_attr
+                val_cites_mask = val_edge_attr == 0
+                val_cites_edges = val_edge_index[:, val_cites_mask]
+                val_nodes_with_positives = val_cites_edges[0].unique()
                 print(
                     f"  Val nodes with citations: {len(val_nodes_with_positives)} / {val_graph_data.num_nodes}"
                 )
                 val_input_nodes = val_nodes_with_positives
 
-            # Only sample nodes post-training cutoff year
-            val_graph_data = val_graph_data.filter(lambda x: x.time <= val_cutoff_year)
-
-            val_graph_data = ToUndirected()(val_graph_data)
+            if is_hetero:
+                val_graph_data = ToUndirected()(val_graph_data)
 
             num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
             val_loader = NeighborLoader(

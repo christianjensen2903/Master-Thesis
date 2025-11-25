@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv  # type: ignore
+from torch_geometric.nn import GATConv, SAGEConv  # type: ignore
 
 
 class CitationGNN(nn.Module):
@@ -12,10 +12,14 @@ class CitationGNN(nn.Module):
         num_layers: int = 3,
         dropout: float = 0.5,
         date_feature_dim: int = 1,
+        num_heads: int = 4,
+        edge_dim: int = 16,  # Dimension for edge feature embedding
     ):
         super().__init__()
         if output_dim is None:
             output_dim = input_dim
+
+        self.num_heads = num_heads
 
         self.date_projection = nn.Sequential(
             nn.Linear(date_feature_dim, 128),
@@ -26,12 +30,38 @@ class CitationGNN(nn.Module):
             nn.GELU(),
         )
 
+        # Edge type embedding (2 types: citing=0, cited_by=1)
+        self.edge_embedding = nn.Embedding(2, edge_dim)
+
         # Keep same dimensions for residual
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
-        for _ in range(num_layers):
-            self.convs.append(SAGEConv(input_dim, input_dim, aggr="sum"))
+        for i in range(num_layers):
+            if i < num_layers - 1:
+                self.convs.append(
+                    GATConv(
+                        in_channels=input_dim,
+                        out_channels=input_dim // num_heads,
+                        heads=num_heads,
+                        dropout=dropout,
+                        edge_dim=edge_dim,
+                        add_self_loops=False,  # We handle edge types explicitly
+                        concat=True,  # Concatenate head outputs
+                    )
+                )
+            else:
+                self.convs.append(
+                    GATConv(
+                        input_dim,
+                        input_dim,
+                        heads=num_heads,
+                        dropout=dropout,
+                        edge_dim=edge_dim,
+                        add_self_loops=False,
+                        concat=False,
+                    )
+                )
             self.norms.append(nn.LayerNorm(input_dim))
 
         self.projector = nn.Sequential(
@@ -47,22 +77,25 @@ class CitationGNN(nn.Module):
         x: torch.Tensor,
         edge_index: torch.Tensor,
         date_feature: torch.Tensor,
+        edge_attr: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
-        date_feature = self.date_projection(date_feature)
-        x = x + date_feature
+        # date_feature = self.date_projection(date_feature)
+        # x = x + date_feature
 
         for i, conv in enumerate(self.convs):
-            x_new = conv(x, edge_index)
+            # Convert edge type indices to embeddings
+            edge_emb = self.edge_embedding(edge_attr)  # [E, edge_dim]
+            x_new = conv(x, edge_index, edge_attr=edge_emb)
             x_new = self.norms[i](x_new)
             if i < len(self.convs) - 1:
                 x_new = F.gelu(x_new)
                 x_new = self.dropout(x_new)
-            x = F.layer_norm(x, [x.size(-1)]) + x_new
+            x = x + x_new
 
-        # x = self.projector(x)
+        x = self.projector(x)
 
         # Normalize embeddings
-        # x = F.normalize(x, p=2, dim=1)
+        x = F.normalize(x, p=2, dim=1)
 
         return x

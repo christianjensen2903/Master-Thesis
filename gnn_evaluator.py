@@ -105,11 +105,14 @@ class SimpleIncrementalEvaluator:
             graph_data = HeterogeneousGraphBuilder(preprocessed_dir).build_graph(
                 include_only_citing=False
             )
+            graph_data = ToUndirected()(graph_data)
         else:
             graph_data = HomogeneousGraphBuilder(preprocessed_dir).build_graph(
-                include_only_citing=(self.mode == "citation_pairs")
+                include_only_citing=(self.mode == "citation_pairs"),
+                add_reverse_edges=True,  # Enable edge direction features
             )
-        self.graph_data = ToUndirected()(graph_data)
+            # Don't use ToUndirected for homogeneous since we handle it in build_graph
+        self.graph_data = graph_data
 
         self.embeddings = self._compute_initial_embeddings(
             self.graph_data, self.train_cutoff_year
@@ -199,11 +202,17 @@ class SimpleIncrementalEvaluator:
             )
             edge_index_cutoff = graph_data.edge_index[:, edge_mask]
 
+            # Also filter edge_attr if present
+            edge_attr_cutoff = None
+            if hasattr(graph_data, "edge_attr") and graph_data.edge_attr is not None:
+                edge_attr_cutoff = graph_data.edge_attr[edge_mask]
+
             with torch.no_grad():
                 return self.gnn_model(
                     graph_data.x,
                     edge_index_cutoff,
                     date_feature=graph_data.date_feature,
+                    edge_attr=edge_attr_cutoff,
                 )
 
     def run(self, k_values: list[int] = [5, 10, 100]) -> float:
@@ -240,7 +249,15 @@ class SimpleIncrementalEvaluator:
                 mask = self.graph_data.time == time
                 cand_mask = self.graph_data.time < time
                 node_id_hash = self.graph_data.node_id_hash
-                source_nodes = self.graph_data.edge_index[0]
+                # For homogeneous with edge features, only use "cites" edges (type 0)
+                if (
+                    hasattr(self.graph_data, "edge_attr")
+                    and self.graph_data.edge_attr is not None
+                ):
+                    cites_mask = self.graph_data.edge_attr == 0
+                    source_nodes = self.graph_data.edge_index[0, cites_mask]
+                else:
+                    source_nodes = self.graph_data.edge_index[0]
 
             # Convert boolean mask to actual indices
             cand_indices = torch.where(cand_mask)[0]
@@ -315,6 +332,11 @@ class SimpleIncrementalEvaluator:
                 edge_mask = ~((src < num_nodes) | (tgt < num_nodes))
                 masked_edge_index = sub.edge_index[:, edge_mask]
 
+                # Also mask edge_attr if present
+                masked_edge_attr = None
+                if hasattr(sub, "edge_attr") and sub.edge_attr is not None:
+                    masked_edge_attr = sub.edge_attr[edge_mask]
+
                 # Create combined feature matrix
                 x = sub.x.clone()
                 x[:num_nodes] = sub.x_query[:num_nodes]
@@ -325,7 +347,10 @@ class SimpleIncrementalEvaluator:
 
                 with torch.no_grad():
                     embeddings = self.gnn_model(
-                        x_input, masked_edge_index, date_feature=sub.date_feature
+                        x_input,
+                        masked_edge_index,
+                        date_feature=sub.date_feature,
+                        edge_attr=masked_edge_attr,
                     )
 
                 query_emb = embeddings[:num_nodes]
@@ -421,11 +446,20 @@ class SimpleIncrementalEvaluator:
                     )
                     expanded_sub: Data = next(iter(expanded_loader))
 
+                    # Get edge_attr if present
+                    expanded_edge_attr = None
+                    if (
+                        hasattr(expanded_sub, "edge_attr")
+                        and expanded_sub.edge_attr is not None
+                    ):
+                        expanded_edge_attr = expanded_sub.edge_attr
+
                     # Compute embeddings on expanded subgraph
                     expanded_embeddings = self.gnn_model(
                         expanded_sub.x,
                         expanded_sub.edge_index,
                         date_feature=expanded_sub.date_feature,
+                        edge_attr=expanded_edge_attr,
                     )
 
                     # Only update embeddings for nodes in the original subgraph
@@ -448,32 +482,12 @@ if __name__ == "__main__":
     hidden_dim = 384
     out_channels = 384
 
-    # builder = HeterogeneousGraphBuilder("data/preprocessed")
-    # sample_graph = builder.build_graph(
-    #     train_cutoff_year=2018, include_only_citing=False
-    # )
-
-    # # Extract metadata (node types and edge types)
-    # metadata = (
-    #     list(sample_graph.node_types),
-    #     list(sample_graph.edge_types),
-    # )
-
     model = CitationGNN(in_channels, output_dim=out_channels, num_layers=2)
-    # model = HeteroGNN(
-    #     in_channels,
-    #     hidden_dim=256,
-    #     output_dim=in_channels,
-    #     num_layers=3,
-    #     metadata=metadata,
-    # )
     model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
-    # model.load_state_dict(torch.load("checkpoints/homo_gnn/checkpoints/epoch_30.pt"))
 
     # Run evaluation
     evaluator = SimpleIncrementalEvaluator(
         gnn_model=model,
-        # mode="all_paragraphs",
         preprocessed_dir="data/preprocessed",
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,

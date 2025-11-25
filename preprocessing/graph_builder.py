@@ -276,6 +276,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         train_cutoff_year: int | None = None,
         include_only_citing: bool = True,
         include_self_loops: bool = False,
+        add_reverse_edges: bool = True,
     ) -> Data:
         """
         Build homogeneous citation graph.
@@ -284,6 +285,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             train_cutoff_year: Only include paragraphs before this year
             include_only_citing: Only include paragraphs involved in citations
             include_self_loops: Whether to add self loops to all nodes
+            add_reverse_edges: Whether to add reverse edges with different edge type
 
         Returns:
             graph_data: PyTorch Geometric Data object
@@ -314,27 +316,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             doc_emb = self.par_embeddings_doc[par_idx]
             query_emb = self.par_embeddings_query[par_idx]
 
-            # Concatenate case metadata if available and requested
-            # if self.has_case_metadata:
-            # metadata_emb = self._get_case_metadata_embedding(meta["celex"])
-            # if metadata_emb is not None:
-            #     doc_emb = np.concatenate([doc_emb, metadata_emb])
-            #     query_emb = np.concatenate([query_emb, metadata_emb])
-            # else:
-            #     # Pad with zeros if case not found (shouldn't happen normally)
-            #     zero_pad = np.zeros(
-            #         self.case_embeddings_subject_matter.shape[1]
-            #         + self.case_embeddings_keywords.shape[1]
-            #         + self.case_embeddings_case_law_about.shape[1]
-            #     )
-            #     doc_emb = np.concatenate([doc_emb, zero_pad])
-            #     query_emb = np.concatenate([query_emb, zero_pad])
-
-            # relative_position = relative_positions[par_idx]
-
-            # doc_emb = np.concatenate([doc_emb, [relative_position]])
-            # query_emb = np.concatenate([query_emb, [relative_position]])
-
             # Store date feature separately instead of concatenating
             date_feature = self._extract_date_features(meta.get("date"))
 
@@ -347,15 +328,28 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             date_str = meta.get("date")
             node_times.append(self._date_to_timestamp(date_str))
 
-        # Build citation edges (bidirectional)
+        # Build citation edges with edge attributes
+        # Edge type 0 = "cites" (forward direction: src cites tgt)
+        # Edge type 1 = "cited_by" (reverse direction: tgt is cited by src)
         edge_list = []
+        edge_attr_list = []
+
         for src_id, tgt_id in self.citations:
             if src_id in node_id_to_idx and tgt_id in node_id_to_idx:
                 src_idx = node_id_to_idx[src_id]
                 tgt_idx = node_id_to_idx[tgt_id]
-                # Add both directions
+
+                # Forward edge: src -> tgt (src cites tgt)
+                # This means information flows from cited (tgt) to citing (src)
+                # Edge type 0 = "cites" direction
                 edge_list.append([src_idx, tgt_idx])
-                # edge_list.append([tgt_idx, src_idx])
+                edge_attr_list.append(0)  # citing edge
+
+                if add_reverse_edges:
+                    # Reverse edge: tgt -> src (tgt is cited by src)
+                    # Edge type 1 = "cited_by" direction
+                    edge_list.append([tgt_idx, src_idx])
+                    edge_attr_list.append(1)  # cited_by edge
 
         # Create PyTorch Geometric Data
         x_doc = torch.tensor(np.array(doc_embeddings_list), dtype=torch.float32)
@@ -364,17 +358,19 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
         if edge_list:
             edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+            edge_attr = torch.tensor(edge_attr_list, dtype=torch.long)
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_attr = torch.empty((0,), dtype=torch.long)
 
         # Add self loops if requested
         if include_self_loops:
-            edge_index, _ = add_self_loops(
-                edge_index, num_nodes=len(doc_embeddings_list)
+            num_nodes = len(doc_embeddings_list)
+            edge_index, edge_attr = add_self_loops(
+                edge_index, edge_attr, num_nodes=num_nodes
             )
 
         node_times_tensor = torch.tensor(node_times, dtype=torch.long)
-
         node_ids_tensor = torch.stack(node_ids)
 
         graph_data = Data(
@@ -382,6 +378,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             x_query=x_query,  # Query embeddings (for citing paragraphs)
             date_feature=date_features,  # Date features stored separately
             edge_index=edge_index,
+            edge_attr=edge_attr,  # Edge direction: 0=cites, 1=cited_by
             num_nodes=len(doc_embeddings_list),
             time=node_times_tensor,  # For temporal sampling
             node_id_hash=node_ids_tensor,  # Hashed node IDs
@@ -401,6 +398,9 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
         print(
             f"Built homogeneous graph: {len(doc_embeddings_list)} nodes, {edge_index.shape[1]} edges"
+        )
+        print(
+            f"  Edge types: 0=cites ({(edge_attr == 0).sum().item()}), 1=cited_by ({(edge_attr == 1).sum().item()})"
         )
 
         return graph_data
