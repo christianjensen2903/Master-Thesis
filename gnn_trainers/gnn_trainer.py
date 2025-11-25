@@ -23,47 +23,66 @@ def info_nce_loss(
     anchor_times=None,
     positive_times=None,
     anchor_indices=None,
-    positive_indices=None,
+    positive_indices=None,  # ADDED: To detect target collisions
 ):
     """
     In-batch negative contrastive loss with temporal filtering and False Negative masking.
+
+    anchor: [batch_size, dim]
+    positive: [batch_size, dim]
+    anchor_indices: [batch_size] - IDs of source nodes
+    positive_indices: [batch_size] - IDs of target nodes
     """
+    # Compute similarity matrix using unnormalized dot product: [batch_size, batch_size]
     sim_matrix = torch.mm(anchor, positive.t()) / temperature
 
     batch_size = sim_matrix.size(0)
     diagonal_mask = torch.eye(batch_size, dtype=torch.bool, device=sim_matrix.device)
 
+    # Initialize mask for False Negatives (True = mask out/ignore)
+    # We start with False everywhere except potentially the diagonal handling later
     false_negative_mask = torch.zeros_like(sim_matrix, dtype=torch.bool)
 
+    # 1. Handle "Same Anchor" (One-to-Many)
+    # This ensures that if Node A cites B and C, C is not treated as a negative for (A->B).
     if anchor_indices is not None:
         same_anchor = anchor_indices.unsqueeze(1) == anchor_indices.unsqueeze(0)
         false_negative_mask = false_negative_mask | same_anchor
 
+    # 2. Handle "Same Target" (Many-to-One)
+    # This ensures that if Node A cites B and Node D cites B,
+    # we don't penalize A for being close to B (from D's row).
     if positive_indices is not None:
         same_target = positive_indices.unsqueeze(1) == positive_indices.unsqueeze(0)
         false_negative_mask = false_negative_mask | same_target
 
+    # Ensure diagonal is NOT masked out by the logic above (we need diagonal for the loss)
+    # We want to mask: (SameAnchor OR SameTarget) AND (NOT Diagonal)
     final_mask = false_negative_mask & ~diagonal_mask
+
+    # Apply mask: set false negatives to -inf so Softmax ignores them
     sim_matrix = sim_matrix.masked_fill(final_mask, float("-inf"))
 
+    # Apply temporal masking if time information is provided
     if anchor_times is not None and positive_times is not None:
+        # positive_j is valid negative for anchor_i only if positive_time_j < anchor_time_i
         time_mask = positive_times.unsqueeze(0) < anchor_times.unsqueeze(1)
+
+        # Ensure diagonal (positive pairs) are always valid
         time_mask = time_mask | diagonal_mask
+
+        # Apply mask: set invalid negatives to very low value
         sim_matrix = sim_matrix.masked_fill(~time_mask, float("-inf"))
 
+    # Labels: for each anchor_i, the positive is at position i (diagonal)
     labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
+
     loss = F.cross_entropy(sim_matrix, labels)
 
     return loss
 
 
 class GNNTrainer:
-    """
-    Trainer for dual encoder GNN models where:
-    - Query encoder uses only node features (no message passing)
-    - Document encoder uses GNN with graph structure
-    """
-
     def __init__(
         self,
         preprocessed_dir: str,
@@ -74,14 +93,14 @@ class GNNTrainer:
         weight_decay: float = 1e-5,
         temperature: float = 0.07,
         num_hops: int = 2,
-        graph_type: str = "homogeneous",
+        graph_type: str = "heterogeneous",
         checkpoint_interval: int = 25,
         wandb_project: str | None = "gnn-training",
         wandb_name: str | None = None,
         warmup_epochs: int = 3,
         eval_every_n_epochs: int = 1,
-        gradient_clip_val: float | None = None,
-        log_every_n_batches: int = 100,
+        gradient_clip_val: float | None = None,  # NEW: Optional gradient clipping
+        log_every_n_batches: int = 100,  # NEW: Control logging frequency
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -107,16 +126,18 @@ class GNNTrainer:
         print(f"Using device: {self.device}")
         print(f"Using graph type: {self.graph_type}")
 
-    def _process_batch(self, batch, is_hetero: bool):
+    def _process_batch(
+        self,
+        batch,
+        is_hetero: bool,
+    ):
         """Process a batch and extract necessary components."""
         if is_hetero:
             batch_size = batch["paragraph"].batch_size
             x = batch["paragraph"].x.clone()
-            x_query = (
-                batch["paragraph"].x_query.clone()
-                if hasattr(batch["paragraph"], "x_query")
-                else x.clone()
-            )
+
+            if hasattr(batch["paragraph"], "x_query"):
+                x[:batch_size] = batch["paragraph"].x_query[:batch_size]
 
             if hasattr(batch["paragraph"], "time"):
                 anchor_times = batch["paragraph"].time[:batch_size]
@@ -160,7 +181,6 @@ class GNNTrainer:
                 "modified_batch": modified_batch,
                 "edge_index": cite_edge_index,
                 "x": x,
-                "x_query": x_query,
                 "anchor_times": anchor_times,
                 "all_times": (
                     batch["paragraph"].time
@@ -173,7 +193,9 @@ class GNNTrainer:
             # For homogeneous graphs
             batch_size = batch.batch_size
             x = batch.x.clone()
-            x_query = batch.x_query.clone() if hasattr(batch, "x_query") else x.clone()
+
+            if hasattr(batch, "x_query"):
+                x[:batch_size] = batch.x_query[:batch_size]
 
             if hasattr(batch, "time"):
                 anchor_times = batch.time[:batch_size]
@@ -191,59 +213,47 @@ class GNNTrainer:
                 "modified_batch": None,
                 "edge_index": edge_index,
                 "x": x,
-                "x_query": x_query,
                 "masked_edge_index": masked_edge_index,
                 "date_feature": batch.date_feature,
                 "anchor_times": anchor_times,
                 "all_times": batch.time if hasattr(batch, "time") else None,
             }
 
-    def _compute_loss(self, model: nn.Module, batch_data: dict, is_hetero: bool):
-        """
-        Compute loss for a processed batch using dual encoder approach.
-
-        Key difference from standard GNN trainer:
-        - Anchor embeddings come from query encoder (no edges)
-        - Positive embeddings come from document encoder (with edges)
-        """
+    def _compute_loss(
+        self,
+        model: nn.Module,
+        batch_data: dict,
+        is_hetero: bool,
+    ):
+        """Compute loss for a processed batch."""
         batch_size = batch_data["batch_size"]
         edge_index = batch_data["edge_index"]
         all_times = batch_data.get("all_times")
 
+        # Get embeddings
         if is_hetero:
-            # Get document embeddings using GNN
-            doc_embeddings = model.encode_documents(batch_data["modified_batch"])
-            if isinstance(doc_embeddings, dict):
-                doc_embeddings = doc_embeddings["paragraph"]
-
-            # Get query embeddings using MLP only (for anchor nodes)
-            x_query = batch_data["x_query"]
-            query_embeddings = model.encode_query(x_query)
+            out = model(batch_data["modified_batch"])
+            embeddings = out["paragraph"] if isinstance(out, dict) else out
         else:
-            # Get document embeddings using GNN
-            doc_embeddings = model.encode_documents(
+            date_feature = batch_data.get("date_feature")
+            out = model(
                 batch_data["x"],
                 batch_data["masked_edge_index"],
-                date_feature=batch_data.get("date_feature"),
+                date_feature=date_feature,
             )
-
-            # Get query embeddings using MLP only
-            x_query = batch_data["x_query"]
-            query_embeddings = model.encode_query(x_query)
+            embeddings = out["paragraph"] if isinstance(out, dict) else out
 
         # Find edges where source is in the input batch
         src, tgt = edge_index
         input_mask = src < batch_size
         if input_mask.sum() == 0:
-            return None
+            return None, None  # Return None for both loss and stats
 
         batch_src = src[input_mask]
         batch_tgt = tgt[input_mask]
 
-        # Anchor embeddings from QUERY encoder (no graph structure)
-        anchor_emb = query_embeddings[batch_src]
-        # Positive embeddings from DOCUMENT encoder (with graph structure)
-        positive_emb = doc_embeddings[batch_tgt]
+        anchor_emb = embeddings[batch_src]
+        positive_emb = embeddings[batch_tgt]
 
         # Get times for all pairs
         pair_anchor_times = None
@@ -259,8 +269,8 @@ class GNNTrainer:
             self.temperature,
             anchor_times=pair_anchor_times,
             positive_times=pair_positive_times,
-            anchor_indices=batch_src,
-            positive_indices=batch_tgt,
+            anchor_indices=batch_src,  # Mask Same Source
+            positive_indices=batch_tgt,  # Mask Same Target (ADDED)
         )
 
         return loss
@@ -280,6 +290,8 @@ class GNNTrainer:
         total_loss = 0
         num_batches = 0
         batch_counter = global_batch_counter
+
+        epoch_grad_norms = []
 
         for batch_idx, batch in enumerate(
             tqdm(loader, desc="Training batches", leave=False)
@@ -303,6 +315,7 @@ class GNNTrainer:
                     total_norm += param_norm.item() ** 2
                     max_grad = max(max_grad, p.grad.data.abs().max().item())
             total_norm = total_norm**0.5
+            epoch_grad_norms.append(total_norm)
 
             if self.gradient_clip_val is not None:
                 torch.nn.utils.clip_grad_norm_(
@@ -328,15 +341,20 @@ class GNNTrainer:
                     "train/grad_norm": total_norm,
                     "train/max_grad": max_grad,
                 }
+
                 wandb.log(log_dict)
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+
         return avg_loss, batch_counter
 
     @torch.no_grad()
     def validate(
-        self, model: nn.Module, loader: NeighborLoader, is_hetero: bool
-    ) -> float:
+        self,
+        model: nn.Module,
+        loader: NeighborLoader,
+        is_hetero: bool,
+    ) -> tuple[float, dict]:
         """Validate the model on validation set."""
         model.eval()
         total_loss = 0
@@ -355,23 +373,22 @@ class GNNTrainer:
             num_batches += 1
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+
         return avg_loss
 
     def train(
         self,
         gnn_model: nn.Module,
-        train_cutoff_year: int,
-        val_cutoff_year: int,
+        train_cutoff_year: int | None = None,
+        val_cutoff_year: int | None = None,
     ) -> torch.nn.Module:
-        """Train dual encoder GNN model with optional validation."""
+        """Train GNN model with optional validation."""
         os.makedirs(self.output_path, exist_ok=True)
         checkpoint_dir = os.path.join(self.output_path, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         print("\n" + "=" * 80)
-        print(
-            f"Training Dual Encoder GNN with {self.graph_type.capitalize()} Graph Builder"
-        )
+        print(f"Training GNN with {self.graph_type.capitalize()} Graph Builder")
         print("=" * 80)
 
         is_hetero = self.graph_type == "heterogeneous"
@@ -410,70 +427,50 @@ class GNNTrainer:
 
         train_graph_data = ToUndirected()(train_graph_data)
 
-        # Build validation graph
-        print("\nBuilding validation graph...")
-        print(f"  Training cutoff: {train_cutoff_year}")
-        print(f"  Validation cutoff: {val_cutoff_year}")
-
-        if is_hetero:
-            val_graph_data = hetero_builder.build_graph(
-                train_cutoff_year=val_cutoff_year,
-                include_only_citing=True,
-            ).to(self.device)
-
-            val_cite_edge_index = val_graph_data[
-                "paragraph", "cites", "paragraph"
-            ].edge_index
-
-            if hasattr(val_graph_data["paragraph"], "time"):
-                citing_nodes = val_cite_edge_index[0].unique()
-                node_times = val_graph_data["paragraph"].time
-                post_cutoff_mask = node_times > train_cutoff_year
-                post_cutoff_nodes = torch.where(post_cutoff_mask)[0]
-                val_nodes_with_positives = citing_nodes[
-                    torch.isin(citing_nodes, post_cutoff_nodes)
-                ]
-            else:
+        # Build validation graph if val_cutoff_year is provided
+        val_loader = None
+        if val_cutoff_year is not None:
+            print("\nBuilding validation graph...")
+            if is_hetero:
+                val_graph_data = hetero_builder.build_graph(
+                    train_cutoff_year=val_cutoff_year,
+                    include_only_citing=True,
+                ).to(self.device)
+                val_cite_edge_index = val_graph_data[
+                    "paragraph", "cites", "paragraph"
+                ].edge_index
                 val_nodes_with_positives = val_cite_edge_index[0].unique()
+                print(
+                    f"  Val paragraph nodes with citations: {len(val_nodes_with_positives)} / {val_graph_data['paragraph'].num_nodes}"
+                )
+                val_input_nodes = ("paragraph", val_nodes_with_positives)
+            else:
+                val_graph_data = homo_builder.build_graph(
+                    train_cutoff_year=val_cutoff_year,
+                    include_only_citing=True,
+                ).to(self.device)
+                val_edge_index = val_graph_data.edge_index
+                val_nodes_with_positives = val_edge_index[0].unique()
+                print(
+                    f"  Val nodes with citations: {len(val_nodes_with_positives)} / {val_graph_data.num_nodes}"
+                )
+                val_input_nodes = val_nodes_with_positives
 
-            print(f"  Total paragraph nodes: {val_graph_data['paragraph'].num_nodes}")
-            print(
-                f"  Val paragraph nodes (post-cutoff with citations): {len(val_nodes_with_positives)}"
+            # Only sample nodes post-training cutoff year
+            val_graph_data = val_graph_data.filter(lambda x: x.time <= val_cutoff_year)
+
+            val_graph_data = ToUndirected()(val_graph_data)
+
+            num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
+            val_loader = NeighborLoader(
+                val_graph_data,
+                num_neighbors=num_neighbors,
+                batch_size=self.batch_size,
+                input_nodes=val_input_nodes,
+                shuffle=False,
+                time_attr="time",
+                subgraph_type="bidirectional",
             )
-            val_input_nodes = ("paragraph", val_nodes_with_positives)
-        else:
-            val_graph_data = homo_builder.build_graph(
-                train_cutoff_year=val_cutoff_year,
-                include_only_citing=True,
-            ).to(self.device)
-
-            val_edge_index = val_graph_data.edge_index
-            citing_nodes = val_edge_index[0].unique()
-            node_times = val_graph_data.time
-            post_cutoff_mask = node_times > train_cutoff_year
-            post_cutoff_nodes = torch.where(post_cutoff_mask)[0]
-            val_nodes_with_positives = citing_nodes[
-                torch.isin(citing_nodes, post_cutoff_nodes)
-            ]
-
-            print(f"  Total nodes: {val_graph_data.num_nodes}")
-            print(
-                f"  Val nodes (post-cutoff with citations): {len(val_nodes_with_positives)}"
-            )
-            val_input_nodes = val_nodes_with_positives
-
-        val_graph_data = ToUndirected()(val_graph_data)
-
-        num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
-        val_loader = NeighborLoader(
-            val_graph_data,
-            num_neighbors=num_neighbors,
-            batch_size=self.batch_size,
-            input_nodes=val_input_nodes,
-            shuffle=False,
-            time_attr="time",
-            subgraph_type="bidirectional",
-        )
 
         if self.wandb_project is not None:
             config = {
@@ -491,9 +488,9 @@ class GNNTrainer:
                 "num_nodes_with_positives": len(nodes_with_positives),
                 "gradient_clip_val": self.gradient_clip_val,
                 "log_every_n_batches": self.log_every_n_batches,
-                "model_type": "dual_encoder",
             }
-            config["num_val_nodes_with_positives"] = len(val_nodes_with_positives)
+            if val_cutoff_year is not None:
+                config["num_val_nodes_with_positives"] = len(val_nodes_with_positives)
 
             wandb.init(
                 project=self.wandb_project,
@@ -501,7 +498,7 @@ class GNNTrainer:
                 config=config,
             )
 
-        print("\nInitializing Dual Encoder GNN model...")
+        print("\nInitializing GNN model...")
         model = gnn_model.to(self.device)
 
         if self.wandb_project is not None:
@@ -555,14 +552,16 @@ class GNNTrainer:
                 global_batch_counter,
             )
 
+            # NEW: Enhanced console output
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
+            # Run validation if enabled and it's time to evaluate
             val_loss = None
-            if (epoch + 1) % self.eval_every_n_epochs == 0:
+            if val_loader is not None and (epoch + 1) % self.eval_every_n_epochs == 0:
                 val_loss = self.validate(model, val_loader, is_hetero)
                 print(f"  Val Loss:   {val_loss:.4f}")
-
+            # Log to wandb
             if self.wandb_project is not None:
                 log_dict = {
                     "train/epoch_loss": train_loss,
@@ -572,6 +571,7 @@ class GNNTrainer:
                     log_dict.update({"val/epoch_loss": val_loss})
                 wandb.log(log_dict)
 
+            # Save best model based on validation loss if available, otherwise training loss
             if val_loss is not None:
                 if val_loss < best_val_loss:
                     torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
@@ -593,7 +593,10 @@ class GNNTrainer:
 
             if (epoch + 1) % self.checkpoint_interval == 0:
                 checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}.pt")
-                torch.save(model.state_dict(), checkpoint_path)
+                torch.save(
+                    model.state_dict(),
+                    checkpoint_path,
+                )
                 print(f"  ✓ Checkpoint saved: {checkpoint_path}")
 
         torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
