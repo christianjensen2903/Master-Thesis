@@ -98,6 +98,7 @@ class GNNTrainer:
         wandb_project: str | None = "gnn-training",
         wandb_name: str | None = None,
         warmup_epochs: int = 3,
+        eval_every_n_epochs: int = 1,
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -112,6 +113,7 @@ class GNNTrainer:
         self.wandb_project = wandb_project
         self.wandb_name = wandb_name
         self.warmup_epochs = warmup_epochs
+        self.eval_every_n_epochs = eval_every_n_epochs
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -319,12 +321,40 @@ class GNNTrainer:
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         return avg_loss, batch_counter
 
+    @torch.no_grad()
+    def validate(
+        self,
+        model: nn.Module,
+        loader: NeighborLoader,
+        is_hetero: bool,
+    ) -> float:
+        """Validate the model on validation set."""
+        model.eval()
+        total_loss = 0
+        num_batches = 0
+
+        for batch in tqdm(loader, desc="Validation batches", leave=False):
+            batch_data = self._process_batch(batch, is_hetero)
+            if batch_data is None:
+                continue
+
+            loss = self._compute_loss(model, batch_data, is_hetero)
+            if loss is None:
+                continue
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        return avg_loss
+
     def train(
         self,
         gnn_model: nn.Module,
         train_cutoff_year: int | None = None,
+        val_cutoff_year: int | None = None,
     ) -> torch.nn.Module:
-        """Train GNN model."""
+        """Train GNN model with optional validation."""
         os.makedirs(self.output_path, exist_ok=True)
         checkpoint_dir = os.path.join(self.output_path, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -335,6 +365,7 @@ class GNNTrainer:
 
         is_hetero = self.graph_type == "heterogeneous"
 
+        # Build training graph
         if is_hetero:
             hetero_builder = HeterogeneousGraphBuilder(self.preprocessed_dir)
             train_graph_data = hetero_builder.build_graph(
@@ -368,23 +399,70 @@ class GNNTrainer:
 
         train_graph_data = ToUndirected()(train_graph_data)
 
+        # Build validation graph if val_cutoff_year is provided
+        val_loader = None
+        if val_cutoff_year is not None:
+            print("\nBuilding validation graph...")
+            if is_hetero:
+                val_graph_data = hetero_builder.build_graph(
+                    train_cutoff_year=val_cutoff_year,
+                    include_only_citing=True,
+                ).to(self.device)
+                val_cite_edge_index = val_graph_data[
+                    "paragraph", "cites", "paragraph"
+                ].edge_index
+                val_nodes_with_positives = val_cite_edge_index[0].unique()
+                print(
+                    f"  Val paragraph nodes with citations: {len(val_nodes_with_positives)} / {val_graph_data['paragraph'].num_nodes}"
+                )
+                val_input_nodes = ("paragraph", val_nodes_with_positives)
+            else:
+                val_graph_data = homo_builder.build_graph(
+                    train_cutoff_year=val_cutoff_year,
+                    include_only_citing=True,
+                ).to(self.device)
+                val_edge_index = val_graph_data.edge_index
+                val_nodes_with_positives = val_edge_index[0].unique()
+                print(
+                    f"  Val nodes with citations: {len(val_nodes_with_positives)} / {val_graph_data.num_nodes}"
+                )
+                val_input_nodes = val_nodes_with_positives
+
+            val_graph_data = ToUndirected()(val_graph_data)
+
+            num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
+            val_loader = NeighborLoader(
+                val_graph_data,
+                num_neighbors=num_neighbors,
+                batch_size=self.batch_size,
+                input_nodes=val_input_nodes,
+                shuffle=False,
+                time_attr="time",
+                subgraph_type="bidirectional",
+            )
+
         if self.wandb_project is not None:
+            config = {
+                "batch_size": self.batch_size,
+                "epochs": self.epochs,
+                "learning_rate": self.learning_rate,
+                "weight_decay": self.weight_decay,
+                "temperature": self.temperature,
+                "num_hops": self.num_hops,
+                "graph_type": self.graph_type,
+                "checkpoint_interval": self.checkpoint_interval,
+                "train_cutoff_year": train_cutoff_year,
+                "val_cutoff_year": val_cutoff_year,
+                "device": str(self.device),
+                "num_nodes_with_positives": len(nodes_with_positives),
+            }
+            if val_cutoff_year is not None:
+                config["num_val_nodes_with_positives"] = len(val_nodes_with_positives)
+
             wandb.init(
                 project=self.wandb_project,
                 name=self.wandb_name,
-                config={
-                    "batch_size": self.batch_size,
-                    "epochs": self.epochs,
-                    "learning_rate": self.learning_rate,
-                    "weight_decay": self.weight_decay,
-                    "temperature": self.temperature,
-                    "num_hops": self.num_hops,
-                    "graph_type": self.graph_type,
-                    "checkpoint_interval": self.checkpoint_interval,
-                    "train_cutoff_year": train_cutoff_year,
-                    "device": str(self.device),
-                    "num_nodes_with_positives": len(nodes_with_positives),
-                },
+                config=config,
             )
 
         print("\nInitializing GNN model...")
@@ -426,7 +504,8 @@ class GNNTrainer:
         scheduler = LambdaLR(optimizer, lr_lambda)
 
         print(f"\nStarting training for {self.epochs} epochs...")
-        best_loss = float("inf")
+        best_train_loss = float("inf")
+        best_val_loss = float("inf")
         global_batch_counter = 0
 
         for epoch in range(self.epochs):
@@ -443,22 +522,41 @@ class GNNTrainer:
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
-            if self.wandb_project is not None:
-                wandb.log(
-                    {
-                        "train/epoch_loss": train_loss,
-                        "epoch": epoch + 1,
-                    }
-                )
+            # Run validation if enabled and it's time to evaluate
+            val_loss = None
+            if val_loader is not None and (epoch + 1) % self.eval_every_n_epochs == 0:
+                val_loss = self.validate(model, val_loader, is_hetero)
+                print(f"  Val Loss:   {val_loss:.4f}")
 
-            if train_loss < best_loss:
-                torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                print(
-                    f"  ✓ New best training loss: {best_loss:.4f} -> {train_loss:.4f}"
-                )
-                best_loss = train_loss
-                if self.wandb_project is not None:
-                    wandb.run.summary["best_train_loss"] = best_loss
+            # Log to wandb
+            if self.wandb_project is not None:
+                log_dict = {
+                    "train/epoch_loss": train_loss,
+                    "epoch": epoch + 1,
+                }
+                if val_loss is not None:
+                    log_dict["val/epoch_loss"] = val_loss
+                wandb.log(log_dict)
+
+            # Save best model based on validation loss if available, otherwise training loss
+            if val_loss is not None:
+                if val_loss < best_val_loss:
+                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
+                    print(
+                        f"  ✓ New best validation loss: {best_val_loss:.4f} -> {val_loss:.4f}"
+                    )
+                    best_val_loss = val_loss
+                    if self.wandb_project is not None:
+                        wandb.run.summary["best_val_loss"] = best_val_loss
+            else:
+                if train_loss < best_train_loss:
+                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
+                    print(
+                        f"  ✓ New best training loss: {best_train_loss:.4f} -> {train_loss:.4f}"
+                    )
+                    best_train_loss = train_loss
+                    if self.wandb_project is not None:
+                        wandb.run.summary["best_train_loss"] = best_train_loss
 
             if (epoch + 1) % self.checkpoint_interval == 0:
                 checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}.pt")
@@ -469,7 +567,12 @@ class GNNTrainer:
                 print(f"  ✓ Checkpoint saved: {checkpoint_path}")
 
         torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
-        print(f"\nLoading best model (train loss: {best_loss:.4f})...")
+
+        if val_loader is not None:
+            print(f"\nLoading best model (val loss: {best_val_loss:.4f})...")
+        else:
+            print(f"\nLoading best model (train loss: {best_train_loss:.4f})...")
+
         model.load_state_dict(torch.load(f"{self.output_path}/best_model.pt"))
 
         if self.wandb_project is not None:
