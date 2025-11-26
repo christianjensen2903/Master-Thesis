@@ -242,7 +242,7 @@ class EmbeddingPreprocessor:
         # Collect all articles with metadata
         articles_data = []
         for celex, act in tqdm(legal_acts.items(), desc="Processing legal acts"):
-            for article in act.get("articles", []):
+            for i, article in enumerate(act.get("articles", [])):
                 # Get article number and text
                 art_num = article.get("number", "")
                 text = article.get("text", "")
@@ -252,7 +252,7 @@ class EmbeddingPreprocessor:
 
                 articles_data.append(
                     {
-                        "id": f"art:{celex}:{art_num}",
+                        "id": f"art:{celex}:{art_num}{i}",
                         "type": "article",
                         "text": f"passage: {text}",
                         "celex": celex,
