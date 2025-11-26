@@ -587,6 +587,12 @@ class GNNTrainer:
                 val_cites_mask = val_edge_attr == 0
                 val_cites_edges = val_edge_index[:, val_cites_mask]
                 val_nodes_with_positives = val_cites_edges[0].unique()
+                train_cutoff_time_stamp = homo_builder._date_to_timestamp(
+                    f"{train_cutoff_year}-01-01"
+                )
+                node_times = val_graph_data.time[val_nodes_with_positives]
+                time_mask = node_times > train_cutoff_time_stamp
+                val_nodes_with_positives = val_nodes_with_positives[time_mask]
                 print(
                     f"  Val nodes with citations: {len(val_nodes_with_positives)} / {val_graph_data.num_nodes}"
                 )
