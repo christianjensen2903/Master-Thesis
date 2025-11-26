@@ -23,7 +23,7 @@ def info_nce_loss(
     anchor_times=None,
     positive_times=None,
     anchor_indices=None,
-    positive_indices=None,
+    positive_indices=None,  # ADDED: To detect target collisions
     return_stats=False,
 ):
     """
@@ -42,11 +42,18 @@ def info_nce_loss(
     diagonal_mask = torch.eye(batch_size, dtype=torch.bool, device=sim_matrix.device)
 
     # Initialize mask for False Negatives (True = mask out/ignore)
+    # We start with False everywhere except potentially the diagonal handling later
     false_negative_mask = torch.zeros_like(sim_matrix, dtype=torch.bool)
 
     if anchor_indices is not None and positive_indices is not None:
+        # same_anchor[i,k] = True if anchor_i == anchor_k
         same_anchor = anchor_indices.unsqueeze(1) == anchor_indices.unsqueeze(0)
+        # same_target[k,j] = True if positive_k == positive_j
         same_target = positive_indices.unsqueeze(1) == positive_indices.unsqueeze(0)
+
+        # Mask (i,j) if there exists ANY k where:
+        #   anchor_i == anchor_k  AND  positive_k == positive_j
+        # This means positive_j is a true positive for anchor_i
         false_negative_mask = (same_anchor.float() @ same_target.float()) > 0
 
     # Ensure diagonal is NOT masked (we need it for the loss)
@@ -57,8 +64,13 @@ def info_nce_loss(
 
     # Apply temporal masking if time information is provided
     if anchor_times is not None and positive_times is not None:
+        # positive_j is valid negative for anchor_i only if positive_time_j < anchor_time_i
         time_mask = positive_times.unsqueeze(0) < anchor_times.unsqueeze(1)
+
+        # Ensure diagonal (positive pairs) are always valid
         time_mask = time_mask | diagonal_mask
+
+        # Apply mask: set invalid negatives to very low value
         sim_matrix = sim_matrix.masked_fill(~time_mask, float("-inf"))
 
     # Labels: for each anchor_i, the positive is at position i (diagonal)
@@ -80,6 +92,7 @@ def info_nce_loss(
     stats["pos_sim_max"] = positive_sims.max().item()
 
     # Get negative similarities (off-diagonal valid entries)
+    # Create a mask for valid negatives (not masked to -inf)
     valid_mask = ~torch.isinf(sim_matrix) & ~diagonal_mask
 
     if valid_mask.any():
@@ -88,11 +101,13 @@ def info_nce_loss(
         stats["neg_sim_std"] = negative_sims.std().item()
         stats["neg_sim_max"] = negative_sims.max().item()
 
+        # Number of valid negatives per sample
         num_valid_negatives = valid_mask.sum(dim=1).float()
         stats["num_negatives_mean"] = num_valid_negatives.mean().item()
         stats["num_negatives_min"] = num_valid_negatives.min().item()
         stats["num_negatives_max"] = num_valid_negatives.max().item()
 
+        # Margin: difference between positive and max negative similarity
         max_neg_per_sample = torch.where(
             valid_mask,
             sim_matrix,
@@ -102,15 +117,19 @@ def info_nce_loss(
         stats["margin_mean"] = margin.mean().item()
         stats["margin_min"] = margin.min().item()
 
+        # Positive rank: where does the positive rank among all samples?
+        # Lower is better (rank 1 means positive is the highest similarity)
         ranks = (sim_matrix > positive_sims.unsqueeze(1)).sum(dim=1) + 1
         stats["pos_rank_mean"] = ranks.float().mean().item()
         stats["pos_rank_median"] = ranks.float().median().item()
 
+        # Accuracy@k: percentage of positives in top-k
         for k in [1, 5, 10]:
             if k <= sim_matrix.size(1):
                 acc_at_k = (ranks <= k).float().mean().item()
                 stats[f"acc@{k}"] = acc_at_k
     else:
+        # No valid negatives case
         stats["neg_sim_mean"] = 0.0
         stats["neg_sim_std"] = 0.0
         stats["neg_sim_max"] = 0.0
@@ -142,8 +161,8 @@ class GNNTrainer:
         wandb_name: str | None = None,
         warmup_epochs: int = 3,
         eval_every_n_epochs: int = 1,
-        gradient_clip_val: float | None = None,
-        log_every_n_batches: int = 100,
+        gradient_clip_val: float | None = None,  # NEW: Optional gradient clipping
+        log_every_n_batches: int = 100,  # NEW: Control logging frequency
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -180,9 +199,7 @@ class GNNTrainer:
             x = batch["paragraph"].x.clone()
 
             if hasattr(batch["paragraph"], "x_query"):
-                x_query = batch["paragraph"].x_query[:batch_size].clone()
-            else:
-                x_query = x[:batch_size].clone()
+                x[:batch_size] = batch["paragraph"].x_query[:batch_size]
 
             if hasattr(batch["paragraph"], "time"):
                 anchor_times = batch["paragraph"].time[:batch_size]
@@ -226,7 +243,6 @@ class GNNTrainer:
                 "modified_batch": modified_batch,
                 "edge_index": cite_edge_index,
                 "x": x,
-                "x_query": x_query,
                 "anchor_times": anchor_times,
                 "all_times": (
                     batch["paragraph"].time
@@ -238,12 +254,10 @@ class GNNTrainer:
         else:
             # For homogeneous graphs
             batch_size = batch.batch_size
-            x = batch.x
+            x = batch.x.clone()
 
             if hasattr(batch, "x_query"):
-                x_query = batch.x_query[:batch_size]
-            else:
-                x_query = x[:batch_size]
+                x[:batch_size] = batch.x_query[:batch_size]
 
             if hasattr(batch, "time"):
                 anchor_times = batch.time[:batch_size]
@@ -265,7 +279,6 @@ class GNNTrainer:
                 "modified_batch": None,
                 "edge_index": edge_index,
                 "x": x,
-                "x_query": x_query,
                 "masked_edge_index": masked_edge_index,
                 "masked_edge_attr": masked_edge_attr,
                 "edge_attr": edge_attr,
@@ -286,33 +299,28 @@ class GNNTrainer:
         edge_index = batch_data["edge_index"]
         all_times = batch_data.get("all_times")
 
-        # Get embeddings using dual encoder
+        # Get embeddings
         if is_hetero:
             out = model(batch_data["modified_batch"])
-            candidate_embeddings = out["paragraph"] if isinstance(out, dict) else out
-            # For hetero, encode queries separately
-            x_query = batch_data["x_query"]
-            query_embeddings = model.encode_query(x_query)
+            embeddings = out["paragraph"] if isinstance(out, dict) else out
         else:
             date_feature = batch_data.get("date_feature")
             masked_edge_attr = batch_data.get("masked_edge_attr")
-
-            # Encode candidates using graph structure
-            candidate_embeddings = model.encode_candidates(
+            out = model(
                 batch_data["x"],
                 batch_data["masked_edge_index"],
                 date_feature=date_feature,
                 edge_attr=masked_edge_attr,
             )
-
-            # Encode queries without graph structure
-            query_embeddings = model.encode_query(batch_data["x_query"])
+            embeddings = out["paragraph"] if isinstance(out, dict) else out
 
         # Find edges where source is in the input batch
+        # We only want "cites" edges (edge_attr == 0) for training
         src, tgt = edge_index
         edge_attr = batch_data.get("edge_attr")
 
         if edge_attr is not None:
+            # Only use forward citation edges (type 0 = "cites")
             cites_mask = edge_attr == 0
             input_mask = (src < batch_size) & cites_mask
         else:
@@ -324,10 +332,8 @@ class GNNTrainer:
         batch_src = src[input_mask]
         batch_tgt = tgt[input_mask]
 
-        # Anchor embeddings from query encoder (batch_src indexes into query_embeddings)
-        anchor_emb = query_embeddings[batch_src]
-        # Positive embeddings from candidate encoder
-        positive_emb = candidate_embeddings[batch_tgt]
+        anchor_emb = embeddings[batch_src]
+        positive_emb = embeddings[batch_tgt]
 
         # Get times for all pairs
         pair_anchor_times = None
@@ -343,16 +349,16 @@ class GNNTrainer:
             self.temperature,
             anchor_times=pair_anchor_times,
             positive_times=pair_positive_times,
-            anchor_indices=batch_src,
-            positive_indices=batch_tgt,
+            anchor_indices=batch_src,  # Mask Same Source
+            positive_indices=batch_tgt,  # Mask Same Target
             return_stats=return_stats,
         )
 
         if return_stats:
             loss, stats = result
-            stats["emb_norm_mean"] = candidate_embeddings.norm(dim=1).mean().item()
-            stats["emb_norm_std"] = candidate_embeddings.norm(dim=1).std().item()
-            stats["query_emb_norm_mean"] = query_embeddings.norm(dim=1).mean().item()
+            # Add embedding statistics
+            stats["emb_norm_mean"] = embeddings.norm(dim=1).mean().item()
+            stats["emb_norm_std"] = embeddings.norm(dim=1).std().item()
             stats["num_pairs"] = input_mask.sum().item()
             return loss, stats
         else:
@@ -374,6 +380,7 @@ class GNNTrainer:
         num_batches = 0
         batch_counter = global_batch_counter
 
+        # Accumulators for batch statistics
         batch_stats_accum = {}
 
         for batch_idx, batch in enumerate(
@@ -383,6 +390,7 @@ class GNNTrainer:
             if batch_data is None:
                 continue
 
+            # Get loss and stats
             result = self._compute_loss(model, batch_data, is_hetero, return_stats=True)
             if result[0] is None:
                 continue
@@ -413,6 +421,7 @@ class GNNTrainer:
             num_batches += 1
             batch_counter += 1
 
+            # Accumulate statistics
             for key, value in batch_stats.items():
                 if key not in batch_stats_accum:
                     batch_stats_accum[key] = []
@@ -431,6 +440,7 @@ class GNNTrainer:
                     "train/max_grad": max_grad,
                 }
 
+                # Add batch statistics to wandb
                 for key, value in batch_stats.items():
                     log_dict[f"train/{key}"] = value
 
@@ -438,6 +448,7 @@ class GNNTrainer:
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
 
+        # Compute epoch averages for statistics
         epoch_stats = {}
         for key, values in batch_stats_accum.items():
             if values:
@@ -457,6 +468,7 @@ class GNNTrainer:
         total_loss = 0
         num_batches = 0
 
+        # Accumulators for validation statistics
         val_stats_accum = {}
 
         for batch in tqdm(loader, desc="Validation batches", leave=False):
@@ -473,6 +485,7 @@ class GNNTrainer:
             total_loss += loss.item()
             num_batches += 1
 
+            # Accumulate statistics
             for key, value in batch_stats.items():
                 if key not in val_stats_accum:
                     val_stats_accum[key] = []
@@ -480,6 +493,7 @@ class GNNTrainer:
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
 
+        # Compute validation averages for statistics
         val_stats = {}
         for key, values in val_stats_accum.items():
             if values:
@@ -516,7 +530,7 @@ class GNNTrainer:
             train_graph_data = homo_builder.build_graph(
                 train_cutoff_year=train_cutoff_year,
                 include_only_citing=True,
-                add_reverse_edges=True,
+                add_reverse_edges=True,  # Enable edge direction features
             ).to(self.device)
 
         print("\nFiltering nodes with positive examples...")
@@ -532,6 +546,7 @@ class GNNTrainer:
         else:
             edge_index = train_graph_data.edge_index
             edge_attr = train_graph_data.edge_attr
+            # Only consider "cites" edges (type 0) for finding nodes with positives
             cites_mask = edge_attr == 0
             cites_edges = edge_index[:, cites_mask]
             nodes_with_positives = cites_edges[0].unique()
@@ -540,6 +555,7 @@ class GNNTrainer:
             )
             input_nodes = nodes_with_positives
 
+        # Don't use ToUndirected for homogeneous graphs anymore since we handle it ourselves
         if is_hetero:
             train_graph_data = ToUndirected()(train_graph_data)
 
@@ -676,9 +692,11 @@ class GNNTrainer:
                 global_batch_counter,
             )
 
+            # Enhanced console output with key metrics
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
 
+            # Print key training statistics
             if train_stats:
                 print(
                     f"  Pos Sim:    {train_stats.get('pos_sim_mean', 0):.3f} ± {train_stats.get('pos_sim_std', 0):.3f}"
@@ -690,34 +708,40 @@ class GNNTrainer:
                 print(f"  Acc@1:      {train_stats.get('acc@1', 0):.2%}")
                 print(f"  Num Negs:   {train_stats.get('num_negatives_mean', 0):.1f}")
 
+            # Run validation if enabled and it's time to evaluate
             val_loss = None
             val_stats = None
             if val_loader is not None and (epoch + 1) % self.eval_every_n_epochs == 0:
                 val_loss, val_stats = self.validate(model, val_loader, is_hetero)
                 print(f"  Val Loss:   {val_loss:.4f}")
 
+                # Print key validation statistics
                 if val_stats:
                     print(f"  Val Pos Sim: {val_stats.get('pos_sim_mean', 0):.3f}")
                     print(f"  Val Margin:  {val_stats.get('margin_mean', 0):.3f}")
                     print(f"  Val Acc@1:   {val_stats.get('acc@1', 0):.2%}")
 
+            # Log to wandb
             if self.wandb_project is not None:
                 log_dict = {
                     "train/epoch_loss": train_loss,
                     "epoch": epoch + 1,
                 }
 
+                # Add epoch-level training statistics
                 for key, value in train_stats.items():
                     log_dict[f"train_epoch/{key}"] = value
 
                 if val_loss is not None:
                     log_dict["val/epoch_loss"] = val_loss
+                    # Add epoch-level validation statistics
                     if val_stats:
                         for key, value in val_stats.items():
                             log_dict[f"val_epoch/{key}"] = value
 
                 wandb.log(log_dict)
 
+            # Save best model based on validation loss if available, otherwise training loss
             if val_loss is not None:
                 if val_loss < best_val_loss:
                     torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
