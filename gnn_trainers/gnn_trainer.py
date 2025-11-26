@@ -45,21 +45,18 @@ def info_nce_loss(
     # We start with False everywhere except potentially the diagonal handling later
     false_negative_mask = torch.zeros_like(sim_matrix, dtype=torch.bool)
 
-    # 1. Handle "Same Anchor" (One-to-Many)
-    # This ensures that if Node A cites B and C, C is not treated as a negative for (A->B).
-    if anchor_indices is not None:
+    if anchor_indices is not None and positive_indices is not None:
+        # same_anchor[i,k] = True if anchor_i == anchor_k
         same_anchor = anchor_indices.unsqueeze(1) == anchor_indices.unsqueeze(0)
-        false_negative_mask = false_negative_mask | same_anchor
-
-    # 2. Handle "Same Target" (Many-to-One)
-    # This ensures that if Node A cites B and Node D cites B,
-    # we don't penalize A for being close to B (from D's row).
-    if positive_indices is not None:
+        # same_target[k,j] = True if positive_k == positive_j
         same_target = positive_indices.unsqueeze(1) == positive_indices.unsqueeze(0)
-        false_negative_mask = false_negative_mask | same_target
 
-    # Ensure diagonal is NOT masked out by the logic above (we need diagonal for the loss)
-    # We want to mask: (SameAnchor OR SameTarget) AND (NOT Diagonal)
+        # Mask (i,j) if there exists ANY k where:
+        #   anchor_i == anchor_k  AND  positive_k == positive_j
+        # This means positive_j is a true positive for anchor_i
+        false_negative_mask = (same_anchor.float() @ same_target.float()) > 0
+
+    # Ensure diagonal is NOT masked (we need it for the loss)
     final_mask = false_negative_mask & ~diagonal_mask
 
     # Apply mask: set false negatives to -inf so Softmax ignores them
@@ -604,7 +601,7 @@ class GNNTrainer:
                 num_neighbors=num_neighbors,
                 batch_size=self.batch_size,
                 input_nodes=val_input_nodes,
-                shuffle=False,
+                shuffle=True,
                 time_attr="time",
                 subgraph_type="bidirectional",
             )
