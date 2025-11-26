@@ -75,17 +75,19 @@ def train_homo_example() -> None:
     trainer = GNNTrainer(
         preprocessed_dir="data/preprocessed",
         output_path="checkpoints/homo_gnn",
-        batch_size=64,
+        batch_size=2048,
         epochs=50,
-        learning_rate=1e-4,
-        weight_decay=1e-4,
-        temperature=0.2,
+        learning_rate=1e-3,
+        weight_decay=5e-4,
+        temperature=0.05,
         num_hops=2,
         checkpoint_interval=10,
         graph_type="homogeneous",  # Use homogeneous graph
         wandb_project="homo-gnn-training",
-        gradient_clip_val=500.0,
-        eval_every_n_epochs=5,
+        # gradient_clip_val=3.0,
+        eval_every_n_epochs=2,
+        warmup_epochs=3,
+        x_similarity_threshold=0.8,
     )
     # Train on paragraph pairs
     cutoff_year = 2018
