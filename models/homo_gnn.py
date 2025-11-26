@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, SAGEConv  # type: ignore
+from torch_geometric.nn import SAGEConv
 
 
 class CitationGNN(nn.Module):
@@ -13,7 +13,8 @@ class CitationGNN(nn.Module):
         dropout: float = 0.5,
         date_feature_dim: int = 1,
         num_heads: int = 4,
-        edge_dim: int = 16,  # Dimension for edge feature embedding
+        edge_dim: int = 16,
+        degree_embed_dim: int = 32,  # Embedding dim for degree features
     ):
         super().__init__()
         if output_dim is None:
@@ -21,56 +22,43 @@ class CitationGNN(nn.Module):
 
         self.num_heads = num_heads
 
-        self.date_projection = nn.Sequential(
-            nn.Linear(date_feature_dim, 128),
+        # Embed in-degree and out-degree counts
+        # Using a small MLP to project [in_degree, out_degree] -> degree_embed_dim
+        self.degree_encoder = nn.Sequential(
+            nn.Linear(2, degree_embed_dim),
             nn.GELU(),
-            nn.LayerNorm(128),
-            nn.Dropout(dropout),
-            nn.Linear(128, input_dim),
-            nn.GELU(),
+            nn.Linear(degree_embed_dim, input_dim),
         )
 
-        # Edge type embedding (2 types: citing=0, cited_by=1)
-        self.edge_embedding = nn.Embedding(2, edge_dim)
-
-        # Keep same dimensions for residual
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
         for i in range(num_layers):
-            if i < num_layers - 1:
-                self.convs.append(
-                    GATConv(
-                        in_channels=input_dim,
-                        out_channels=input_dim // num_heads,
-                        heads=num_heads,
-                        dropout=dropout,
-                        edge_dim=edge_dim,
-                        add_self_loops=False,  # We handle edge types explicitly
-                        concat=True,  # Concatenate head outputs
-                    )
-                )
-            else:
-                self.convs.append(
-                    GATConv(
-                        input_dim,
-                        input_dim,
-                        heads=num_heads,
-                        dropout=dropout,
-                        edge_dim=edge_dim,
-                        add_self_loops=False,
-                        concat=False,
-                    )
-                )
+            self.convs.append(SAGEConv(input_dim, input_dim, aggr="mean"))
             self.norms.append(nn.LayerNorm(input_dim))
 
         self.projector = nn.Sequential(
-            nn.Linear(input_dim, output_dim * 2),
-            nn.GELU(),
-            nn.Linear(output_dim * 2, output_dim),
+            nn.Linear(output_dim, output_dim),
         )
 
         self.dropout = nn.Dropout(dropout)
+
+    def compute_degree_features(
+        self, edge_index: torch.Tensor, num_nodes: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute in-degree and out-degree for each node."""
+        # edge_index[0] = source nodes, edge_index[1] = target nodes
+        # in-degree: count of edges where node is target
+        # out-degree: count of edges where node is source
+
+        in_degree = torch.zeros(num_nodes, device=edge_index.device)
+        out_degree = torch.zeros(num_nodes, device=edge_index.device)
+
+        ones = torch.ones(edge_index.size(1), device=edge_index.device)
+        in_degree.scatter_add_(0, edge_index[1], ones)
+        out_degree.scatter_add_(0, edge_index[0], ones)
+
+        return in_degree, out_degree
 
     def forward(
         self,
@@ -79,23 +67,27 @@ class CitationGNN(nn.Module):
         date_feature: torch.Tensor,
         edge_attr: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        num_nodes = x.size(0)
 
-        # date_feature = self.date_projection(date_feature)
-        # x = x + date_feature
+        # Compute degree features
+        in_deg, out_deg = self.compute_degree_features(edge_index, num_nodes)
+
+        # Stack and optionally log-transform (helps with skewed distributions)
+        degree_feats = torch.stack([in_deg, out_deg], dim=1)  # [num_nodes, 2]
+        degree_feats = torch.log1p(degree_feats)  # log(1 + x) for stability
+
+        # Encode and add to node features
+        degree_embedding = self.degree_encoder(degree_feats)  # [num_nodes, input_dim]
+        x = x + degree_embedding
 
         for i, conv in enumerate(self.convs):
-            # Convert edge type indices to embeddings
-            edge_emb = self.edge_embedding(edge_attr)  # [E, edge_dim]
-            x_new = conv(x, edge_index, edge_attr=edge_emb)
-            x_new = self.norms[i](x_new)
-            if i < len(self.convs) - 1:
-                x_new = F.gelu(x_new)
-                x_new = self.dropout(x_new)
+            x = self.norms[i](x)
+            x_new = conv(x, edge_index)
+            x_new = F.gelu(x_new)
+            x_new = self.dropout(x_new)
             x = x + x_new
 
         x = self.projector(x)
-
-        # Normalize embeddings
         x = F.normalize(x, p=2, dim=1)
 
         return x
