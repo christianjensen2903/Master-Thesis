@@ -23,13 +23,8 @@ def info_nce_loss(
     anchor_times=None,
     positive_times=None,
     anchor_indices=None,
-    positive_indices=None,
+    positive_indices=None,  # ADDED: To detect target collisions
     return_stats=False,
-    # NEW: Similarity-based false negative masking
-    gnn_similarity_threshold=None,  # Mask if GNN embedding cosine sim > threshold
-    anchor_x=None,  # Original text embeddings for anchors [batch_size, dim]
-    positive_x=None,  # Original text embeddings for positives [batch_size, dim]
-    x_similarity_threshold=None,  # Mask if text embedding cosine sim > threshold
 ):
     """
     In-batch negative contrastive loss with temporal filtering and False Negative masking.
@@ -38,10 +33,6 @@ def info_nce_loss(
     positive: [batch_size, dim]
     anchor_indices: [batch_size] - IDs of source nodes
     positive_indices: [batch_size] - IDs of target nodes
-    gnn_similarity_threshold: float - Mask negatives with GNN cosine sim > threshold
-    anchor_x: [batch_size, dim] - Original text embeddings for anchors (before GNN)
-    positive_x: [batch_size, dim] - Original text embeddings for positives (before GNN)
-    x_similarity_threshold: float - Mask negatives with text cosine sim > threshold
     return_stats: if True, return (loss, stats_dict), else return loss only
     """
     # Compute similarity matrix using unnormalized dot product: [batch_size, batch_size]
@@ -51,12 +42,9 @@ def info_nce_loss(
     diagonal_mask = torch.eye(batch_size, dtype=torch.bool, device=sim_matrix.device)
 
     # Initialize mask for False Negatives (True = mask out/ignore)
+    # We start with False everywhere except potentially the diagonal handling later
     false_negative_mask = torch.zeros_like(sim_matrix, dtype=torch.bool)
 
-    # Track statistics about masking
-    mask_stats = {}
-
-    # 1. Same source/target masking (existing logic)
     if anchor_indices is not None and positive_indices is not None:
         # same_anchor[i,k] = True if anchor_i == anchor_k
         same_anchor = anchor_indices.unsqueeze(1) == anchor_indices.unsqueeze(0)
@@ -66,76 +54,10 @@ def info_nce_loss(
         # Mask (i,j) if there exists ANY k where:
         #   anchor_i == anchor_k  AND  positive_k == positive_j
         # This means positive_j is a true positive for anchor_i
-        index_based_mask = (same_anchor.float() @ same_target.float()) > 0
-        false_negative_mask = false_negative_mask | index_based_mask
-
-        if return_stats:
-            # Count how many were masked by index logic (excluding diagonal)
-            mask_stats["num_masked_by_index"] = (
-                (index_based_mask & ~diagonal_mask).sum().item()
-            )
-
-    # 2. NEW: GNN embedding similarity-based masking
-    if gnn_similarity_threshold is not None:
-        # Compute cosine similarity (normalized) for consistent thresholding
-        anchor_norm = F.normalize(anchor, p=2, dim=1)
-        positive_norm = F.normalize(positive, p=2, dim=1)
-        gnn_cosine_sim = torch.mm(anchor_norm, positive_norm.t())
-
-        # Mask negatives that are too similar (potential false negatives)
-        # But never mask the diagonal (true positives)
-        high_gnn_sim_mask = (gnn_cosine_sim > gnn_similarity_threshold) & ~diagonal_mask
-
-        if return_stats:
-            # Count newly masked (not already masked by other criteria)
-            newly_masked = high_gnn_sim_mask & ~false_negative_mask
-            mask_stats["num_masked_by_gnn_sim"] = newly_masked.sum().item()
-            mask_stats["gnn_sim_threshold"] = gnn_similarity_threshold
-            # Track the similarity distribution of masked pairs
-            if newly_masked.any():
-                mask_stats["masked_gnn_sim_mean"] = (
-                    gnn_cosine_sim[newly_masked].mean().item()
-                )
-                mask_stats["masked_gnn_sim_max"] = (
-                    gnn_cosine_sim[newly_masked].max().item()
-                )
-
-        false_negative_mask = false_negative_mask | high_gnn_sim_mask
-
-    # 3. NEW: Text embedding similarity-based masking
-    if (
-        x_similarity_threshold is not None
-        and anchor_x is not None
-        and positive_x is not None
-    ):
-        # Compute cosine similarity of original text embeddings
-        anchor_x_norm = F.normalize(anchor_x, p=2, dim=1)
-        positive_x_norm = F.normalize(positive_x, p=2, dim=1)
-        x_cosine_sim = torch.mm(anchor_x_norm, positive_x_norm.t())
-
-        # Mask negatives with highly similar text (potential false negatives)
-        high_x_sim_mask = (x_cosine_sim > x_similarity_threshold) & ~diagonal_mask
-
-        if return_stats:
-            newly_masked = high_x_sim_mask & ~false_negative_mask
-            mask_stats["num_masked_by_x_sim"] = newly_masked.sum().item()
-            mask_stats["x_sim_threshold"] = x_similarity_threshold
-            if newly_masked.any():
-                mask_stats["masked_x_sim_mean"] = (
-                    x_cosine_sim[newly_masked].mean().item()
-                )
-                mask_stats["masked_x_sim_max"] = x_cosine_sim[newly_masked].max().item()
-
-        false_negative_mask = false_negative_mask | high_x_sim_mask
+        false_negative_mask = (same_anchor.float() @ same_target.float()) > 0
 
     # Ensure diagonal is NOT masked (we need it for the loss)
     final_mask = false_negative_mask & ~diagonal_mask
-
-    if return_stats:
-        mask_stats["total_masked"] = final_mask.sum().item()
-        mask_stats["mask_ratio"] = final_mask.sum().item() / (
-            batch_size * (batch_size - 1)
-        )
 
     # Apply mask: set false negatives to -inf so Softmax ignores them
     sim_matrix = sim_matrix.masked_fill(final_mask, float("-inf"))
@@ -161,9 +83,6 @@ def info_nce_loss(
 
     # Compute statistics for monitoring
     stats = {}
-
-    # Add masking statistics
-    stats.update(mask_stats)
 
     # Get positive similarities (diagonal)
     positive_sims = torch.diagonal(sim_matrix)
@@ -242,11 +161,8 @@ class GNNTrainer:
         wandb_name: str | None = None,
         warmup_epochs: int = 3,
         eval_every_n_epochs: int = 1,
-        gradient_clip_val: float | None = None,
-        log_every_n_batches: int = 100,
-        # NEW: Similarity-based false negative masking thresholds
-        gnn_similarity_threshold: float | None = None,  # e.g., 0.8
-        x_similarity_threshold: float | None = None,  # e.g., 0.9
+        gradient_clip_val: float | None = None,  # NEW: Optional gradient clipping
+        log_every_n_batches: int = 100,  # NEW: Control logging frequency
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -264,8 +180,6 @@ class GNNTrainer:
         self.eval_every_n_epochs = eval_every_n_epochs
         self.gradient_clip_val = gradient_clip_val
         self.log_every_n_batches = log_every_n_batches
-        self.gnn_similarity_threshold = gnn_similarity_threshold
-        self.x_similarity_threshold = x_similarity_threshold
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -273,12 +187,6 @@ class GNNTrainer:
             self.device = torch.device("cpu")
         print(f"Using device: {self.device}")
         print(f"Using graph type: {self.graph_type}")
-        if gnn_similarity_threshold is not None:
-            print(
-                f"GNN similarity threshold for FN masking: {gnn_similarity_threshold}"
-            )
-        if x_similarity_threshold is not None:
-            print(f"Text similarity threshold for FN masking: {x_similarity_threshold}")
 
     def _process_batch(
         self,
@@ -335,9 +243,6 @@ class GNNTrainer:
                 "modified_batch": modified_batch,
                 "edge_index": cite_edge_index,
                 "x": x,
-                "original_x": batch[
-                    "paragraph"
-                ].x,  # NEW: Keep original x for similarity masking
                 "anchor_times": anchor_times,
                 "all_times": (
                     batch["paragraph"].time
@@ -374,7 +279,6 @@ class GNNTrainer:
                 "modified_batch": None,
                 "edge_index": edge_index,
                 "x": x,
-                "original_x": batch.x,  # NEW: Keep original x for similarity masking
                 "masked_edge_index": masked_edge_index,
                 "masked_edge_attr": masked_edge_attr,
                 "edge_attr": edge_attr,
@@ -394,7 +298,6 @@ class GNNTrainer:
         batch_size = batch_data["batch_size"]
         edge_index = batch_data["edge_index"]
         all_times = batch_data.get("all_times")
-        original_x = batch_data.get("original_x")  # NEW: Get original text embeddings
 
         # Get embeddings
         if is_hetero:
@@ -432,13 +335,6 @@ class GNNTrainer:
         anchor_emb = embeddings[batch_src]
         positive_emb = embeddings[batch_tgt]
 
-        # NEW: Get original text embeddings for similarity-based masking
-        anchor_x = None
-        positive_x = None
-        if self.x_similarity_threshold is not None and original_x is not None:
-            anchor_x = original_x[batch_src]
-            positive_x = original_x[batch_tgt]
-
         # Get times for all pairs
         pair_anchor_times = None
         pair_positive_times = None
@@ -456,11 +352,6 @@ class GNNTrainer:
             anchor_indices=batch_src,  # Mask Same Source
             positive_indices=batch_tgt,  # Mask Same Target
             return_stats=return_stats,
-            # NEW: Pass similarity thresholds
-            gnn_similarity_threshold=self.gnn_similarity_threshold,
-            anchor_x=anchor_x,
-            positive_x=positive_x,
-            x_similarity_threshold=self.x_similarity_threshold,
         )
 
         if return_stats:
@@ -737,9 +628,6 @@ class GNNTrainer:
                 "num_nodes_with_positives": len(nodes_with_positives),
                 "gradient_clip_val": self.gradient_clip_val,
                 "log_every_n_batches": self.log_every_n_batches,
-                # NEW: Log similarity thresholds
-                "gnn_similarity_threshold": self.gnn_similarity_threshold,
-                "x_similarity_threshold": self.x_similarity_threshold,
             }
             if val_cutoff_year is not None:
                 config["num_val_nodes_with_positives"] = len(val_nodes_with_positives)
@@ -819,19 +707,6 @@ class GNNTrainer:
                 print(f"  Margin:     {train_stats.get('margin_mean', 0):.3f}")
                 print(f"  Acc@1:      {train_stats.get('acc@1', 0):.2%}")
                 print(f"  Num Negs:   {train_stats.get('num_negatives_mean', 0):.1f}")
-                # NEW: Print masking statistics
-                if train_stats.get("total_masked", 0) > 0:
-                    print(
-                        f"  Masked FN:  {train_stats.get('total_masked', 0):.1f} ({train_stats.get('mask_ratio', 0):.1%})"
-                    )
-                    if "num_masked_by_gnn_sim" in train_stats:
-                        print(
-                            f"    By GNN:   {train_stats.get('num_masked_by_gnn_sim', 0):.1f}"
-                        )
-                    if "num_masked_by_x_sim" in train_stats:
-                        print(
-                            f"    By Text:  {train_stats.get('num_masked_by_x_sim', 0):.1f}"
-                        )
 
             # Run validation if enabled and it's time to evaluate
             val_loss = None
