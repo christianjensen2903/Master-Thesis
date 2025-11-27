@@ -268,6 +268,9 @@ class BaseGraphBuilder(ABC):
         Returns:
             List of (source_idx, target_idx) edges
         """
+        if max_neighbors <= 0:
+            return []
+
         n, d = embeddings.shape
         print(f"  Computing semantic edges for {n} nodes using FAISS...")
 
@@ -490,7 +493,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
                     edge_attr_list.append(1)  # cited_by edge
 
         # Add semantic similarity edges (edge type 2)
-        if include_semantic_edges:
+        if include_semantic_edges and semantic_max_neighbors > 0:
             print("Computing semantic similarity edges...")
             embeddings = np.array(doc_embeddings_list)
             times_array = np.array(node_times)
