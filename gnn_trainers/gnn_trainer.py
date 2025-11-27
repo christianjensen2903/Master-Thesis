@@ -23,26 +23,45 @@ def info_nce_loss(
     anchor_times=None,
     positive_times=None,
     anchor_indices=None,
-    positive_indices=None,  # ADDED: To detect target collisions
+    positive_indices=None,
+    hard_negatives=None,
+    hard_negative_times=None,
     return_stats=False,
 ):
     """
-    In-batch negative contrastive loss with temporal filtering and False Negative masking.
+    In-batch negative contrastive loss with temporal filtering, False Negative masking, and hard negatives.
 
     anchor: [batch_size, dim]
     positive: [batch_size, dim]
     anchor_indices: [batch_size] - IDs of source nodes
     positive_indices: [batch_size] - IDs of target nodes
+    hard_negatives: [num_hard_negatives, dim] - Hard negative embeddings shared across all anchors
+    hard_negative_times: [num_hard_negatives] - Timestamps for hard negatives (for temporal filtering)
     return_stats: if True, return (loss, stats_dict), else return loss only
     """
     # Compute similarity matrix using unnormalized dot product: [batch_size, batch_size]
     sim_matrix = torch.mm(anchor, positive.t()) / temperature
 
+    # If hard negatives provided, compute similarities and concatenate
+    num_hard_negatives = 0
+    if hard_negatives is not None and hard_negatives.size(0) > 0:
+        num_hard_negatives = hard_negatives.size(0)
+        hard_neg_sim = (
+            torch.mm(anchor, hard_negatives.t()) / temperature
+        )  # [batch_size, num_hard_negatives]
+        sim_matrix = torch.cat(
+            [sim_matrix, hard_neg_sim], dim=1
+        )  # [batch_size, batch_size + num_hard_negatives]
+
     batch_size = sim_matrix.size(0)
-    diagonal_mask = torch.eye(batch_size, dtype=torch.bool, device=sim_matrix.device)
+    total_cols = sim_matrix.size(1)  # batch_size + num_hard_negatives
+
+    # Diagonal mask for the in-batch positives part only
+    diagonal_mask = torch.eye(
+        batch_size, total_cols, dtype=torch.bool, device=sim_matrix.device
+    )
 
     # Initialize mask for False Negatives (True = mask out/ignore)
-    # We start with False everywhere except potentially the diagonal handling later
     false_negative_mask = torch.zeros_like(sim_matrix, dtype=torch.bool)
 
     if anchor_indices is not None and positive_indices is not None:
@@ -54,7 +73,19 @@ def info_nce_loss(
         # Mask (i,j) if there exists ANY k where:
         #   anchor_i == anchor_k  AND  positive_k == positive_j
         # This means positive_j is a true positive for anchor_i
-        false_negative_mask = (same_anchor.float() @ same_target.float()) > 0
+        fn_mask_in_batch = (same_anchor.float() @ same_target.float()) > 0
+
+        # Pad with zeros for hard negatives (they are pre-filtered to not be false negatives)
+        if num_hard_negatives > 0:
+            hard_neg_fn_mask = torch.zeros(
+                batch_size,
+                num_hard_negatives,
+                dtype=torch.bool,
+                device=sim_matrix.device,
+            )
+            false_negative_mask = torch.cat([fn_mask_in_batch, hard_neg_fn_mask], dim=1)
+        else:
+            false_negative_mask = fn_mask_in_batch
 
     # Ensure diagonal is NOT masked (we need it for the loss)
     final_mask = false_negative_mask & ~diagonal_mask
@@ -66,6 +97,22 @@ def info_nce_loss(
     if anchor_times is not None and positive_times is not None:
         # positive_j is valid negative for anchor_i only if positive_time_j < anchor_time_i
         time_mask = positive_times.unsqueeze(0) < anchor_times.unsqueeze(1)
+
+        # Extend time mask for hard negatives if provided
+        if num_hard_negatives > 0 and hard_negative_times is not None:
+            hard_neg_time_mask = hard_negative_times.unsqueeze(
+                0
+            ) < anchor_times.unsqueeze(1)
+            time_mask = torch.cat([time_mask, hard_neg_time_mask], dim=1)
+        elif num_hard_negatives > 0:
+            # No time info for hard negatives, assume they're all valid
+            hard_neg_time_mask = torch.ones(
+                batch_size,
+                num_hard_negatives,
+                dtype=torch.bool,
+                device=sim_matrix.device,
+            )
+            time_mask = torch.cat([time_mask, hard_neg_time_mask], dim=1)
 
         # Ensure diagonal (positive pairs) are always valid
         time_mask = time_mask | diagonal_mask
@@ -83,6 +130,7 @@ def info_nce_loss(
 
     # Compute statistics for monitoring
     stats = {}
+    stats["num_hard_negatives"] = num_hard_negatives
 
     # Get positive similarities (diagonal)
     positive_sims = torch.diagonal(sim_matrix)
@@ -167,6 +215,8 @@ class GNNTrainer:
         include_semantic_edges: bool = False,
         semantic_threshold: float = 0.7,
         semantic_max_neighbors: int = 10,
+        # Hard negative mining
+        num_hard_negatives: int = 0,
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -188,6 +238,8 @@ class GNNTrainer:
         self.include_semantic_edges = include_semantic_edges
         self.semantic_threshold = semantic_threshold
         self.semantic_max_neighbors = semantic_max_neighbors
+        # Hard negative mining
+        self.num_hard_negatives = num_hard_negatives
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -199,6 +251,8 @@ class GNNTrainer:
             print(
                 f"  Semantic edges enabled (threshold={semantic_threshold}, max_neighbors={semantic_max_neighbors})"
             )
+        if num_hard_negatives > 0:
+            print(f"  Semantic hard negatives enabled (max={num_hard_negatives})")
 
     def _process_batch(
         self,
@@ -371,6 +425,19 @@ class GNNTrainer:
             pair_anchor_times = all_times[batch_src]
             pair_positive_times = all_times[batch_tgt]
 
+        # Extract hard negatives from semantic similarity edges if enabled
+        hard_negatives = None
+        hard_negative_times = None
+        if self.num_hard_negatives > 0 and edge_attr is not None:
+            hard_negatives, hard_negative_times = self._get_semantic_hard_negatives(
+                embeddings=embeddings,
+                edge_index=edge_index,
+                edge_attr=edge_attr,
+                batch_size=batch_size,
+                positive_indices=batch_tgt,
+                all_times=all_times,
+            )
+
         # Compute loss with in-batch negatives
         result = info_nce_loss(
             anchor_emb,
@@ -380,6 +447,8 @@ class GNNTrainer:
             positive_times=pair_positive_times,
             anchor_indices=batch_src,  # Mask Same Source
             positive_indices=batch_tgt,  # Mask Same Target
+            hard_negatives=hard_negatives,
+            hard_negative_times=hard_negative_times,
             return_stats=return_stats,
         )
 
@@ -392,6 +461,59 @@ class GNNTrainer:
             return loss, stats
         else:
             return result
+
+    def _get_semantic_hard_negatives(
+        self,
+        embeddings: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        batch_size: int,
+        positive_indices: torch.Tensor,
+        all_times: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """
+        Get hard negatives from semantic similarity edges (edge_attr == 2).
+
+        These are nodes connected to anchors via pre-computed semantic similarity
+        edges from the graph builder, excluding any positive targets.
+
+        Returns hard negatives that will be used as negatives for ALL anchor-positive pairs.
+        """
+        # Find semantic edges (edge_attr == 2) where source is an anchor (< batch_size)
+        # Semantic edges point FROM anchor TO similar node (src -> tgt)
+        src, tgt = edge_index
+        semantic_mask = edge_attr == 2
+        anchor_mask = src < batch_size
+
+        # Get semantic edges from anchors
+        valid_mask = semantic_mask & anchor_mask
+        if not valid_mask.any():
+            return None, None
+
+        # Get target nodes of semantic edges from anchors
+        semantic_targets = tgt[valid_mask]
+
+        # Exclude positive targets (we don't want false negatives)
+        positive_set = positive_indices.unique()
+        is_not_positive = ~torch.isin(semantic_targets, positive_set)
+        semantic_targets = semantic_targets[is_not_positive]
+
+        if len(semantic_targets) == 0:
+            return None, None
+
+        # Get unique hard negative indices
+        unique_hard_neg_indices = semantic_targets.unique()
+
+        # Limit to num_hard_negatives if specified
+        if len(unique_hard_neg_indices) > self.num_hard_negatives:
+            unique_hard_neg_indices = unique_hard_neg_indices[: self.num_hard_negatives]
+
+        hard_negatives = embeddings[unique_hard_neg_indices]
+        hard_negative_times = (
+            all_times[unique_hard_neg_indices] if all_times is not None else None
+        )
+
+        return hard_negatives, hard_negative_times
 
     def train_epoch(
         self,
@@ -666,6 +788,7 @@ class GNNTrainer:
                 "include_semantic_edges": self.include_semantic_edges,
                 "semantic_threshold": self.semantic_threshold,
                 "semantic_max_neighbors": self.semantic_max_neighbors,
+                "num_hard_negatives": self.num_hard_negatives,
             }
             if val_cutoff_year is not None:
                 config["num_val_nodes_with_positives"] = len(val_nodes_with_positives)
