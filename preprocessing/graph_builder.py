@@ -13,7 +13,7 @@ from torch_geometric.utils import add_self_loops  # type: ignore
 # Fix OpenMP conflict on macOS (FAISS and PyTorch may use different OpenMP runtimes)
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-import faiss
+import faiss  # type: ignore
 
 # Set FAISS to single-threaded mode to avoid segmentation faults
 faiss.omp_set_num_threads(1)
