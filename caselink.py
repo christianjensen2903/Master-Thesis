@@ -334,6 +334,7 @@ class CaseLinkGraphBuilder:
         include_only_citing: bool = True,
         include_semantic_edges: bool = True,
         semantic_threshold: float = 0.7,
+        article_threshold: float = 0.9,
         semantic_max_neighbors: int = 10,
         include_article_nodes: bool = True,
         use_temporal_constraint: bool = True,
@@ -345,7 +346,8 @@ class CaseLinkGraphBuilder:
             train_cutoff_year: Only include paragraphs before this year
             include_only_citing: Only include paragraphs involved in citations
             include_semantic_edges: Add semantic similarity edges (like CaseLink)
-            semantic_threshold: Cosine similarity threshold for semantic edges
+            semantic_threshold: Cosine similarity threshold for paragraph semantic edges
+            article_threshold: Cosine similarity threshold for article semantic edges
             semantic_max_neighbors: Max number of semantic neighbors per node
             include_article_nodes: Include article nodes in the graph
             use_temporal_constraint: For semantic edges, only link to earlier paragraphs
@@ -512,7 +514,7 @@ class CaseLinkGraphBuilder:
             article_semantic_edges = self._compute_semantic_similarity_edges(
                 art_emb_array,
                 times=None,  # Articles don't have temporal constraints
-                threshold=semantic_threshold,
+                threshold=article_threshold,
                 max_neighbors=semantic_max_neighbors,
                 use_temporal_constraint=False,
             )
@@ -613,10 +615,7 @@ class CaseLinkGNN(nn.Module):
         output_dim: int | None = None,
         num_layers: int = 3,
         dropout: float = 0.3,
-        num_edge_types: int = 6,
-        use_attention: bool = False,
         num_heads: int = 4,
-        degree_embed_dim: int = 32,
     ):
         super().__init__()
 
@@ -626,71 +625,44 @@ class CaseLinkGNN(nn.Module):
             output_dim = input_dim
 
         self.num_layers = num_layers
-        self.num_edge_types = num_edge_types
-        self.use_attention = use_attention
         self.hidden_dim = hidden_dim
-
-        # Node type embedding (paragraph vs article)
-        self.node_type_embedding = nn.Embedding(2, hidden_dim)
-
-        # Degree encoder (like CaseLink's degree-aware features)
-        self.degree_encoder = nn.Sequential(
-            nn.Linear(2, degree_embed_dim),
-            nn.GELU(),
-            nn.Linear(degree_embed_dim, hidden_dim),
-        )
-
-        # Edge type embedding for relation-aware message passing
-        self.edge_type_embedding = nn.Embedding(num_edge_types, hidden_dim)
-
-        # Input projection
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
 
         # GNN layers - use separate convolutions per edge type or shared
         self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
 
-        for _ in range(num_layers):
-            if use_attention:
-                # GAT for attention-based aggregation
-                self.convs.append(
-                    GATConv(
-                        hidden_dim,
-                        hidden_dim // num_heads,
-                        heads=num_heads,
-                        concat=True,
-                        dropout=dropout,
-                    )
-                )
-            else:
-                # GraphSAGE for mean aggregation
-                self.convs.append(SAGEConv(hidden_dim, hidden_dim, aggr="mean"))
-            self.norms.append(nn.LayerNorm(hidden_dim))
-
-        # Output projection
-        self.projector = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, output_dim),
+        self.convs.append(
+            GATConv(
+                input_dim,
+                hidden_dim,
+                heads=num_heads,
+                concat=False,
+                dropout=dropout,
+                add_self_loops=False,
+            )
         )
 
-        self.dropout = nn.Dropout(dropout)
+        for _ in range(num_layers - 2):
+            self.convs.append(
+                GATConv(
+                    hidden_dim,
+                    hidden_dim,
+                    heads=num_heads,
+                    concat=False,
+                    dropout=dropout,
+                    add_self_loops=False,
+                )
+            )
 
-    def compute_degree_features(
-        self,
-        edge_index: torch.Tensor,
-        num_nodes: int,
-        edge_attr: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute in-degree and out-degree for each node."""
-        in_degree = torch.zeros(num_nodes, device=edge_index.device)
-        out_degree = torch.zeros(num_nodes, device=edge_index.device)
-
-        ones = torch.ones(edge_index.size(1), device=edge_index.device)
-        in_degree.scatter_add_(0, edge_index[1], ones)
-        out_degree.scatter_add_(0, edge_index[0], ones)
-
-        return in_degree, out_degree
+        self.convs.append(
+            GATConv(
+                hidden_dim,
+                output_dim,
+                heads=num_heads,
+                concat=False,
+                dropout=dropout,
+                add_self_loops=False,
+            )
+        )
 
     def forward(
         self,
@@ -700,37 +672,22 @@ class CaseLinkGNN(nn.Module):
         edge_attr: torch.Tensor | None = None,
         node_type: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        num_nodes = x.size(0)
 
-        # Input projection
-        # h = self.input_proj(x)
+        in_feat = x  # Store input for residual connection
         h = x
 
-        # Add node type embedding if available
-        if node_type is not None:
-            h = h + self.node_type_embedding(node_type)
+        # Apply all layers with activation and normalization
+        for i in range(self.num_layers):
+            h = self.convs[i](h, edge_index)
 
-        # Compute and add degree features
-        # in_deg, out_deg = self.compute_degree_features(edge_index, num_nodes, edge_attr)
-        # degree_feats = torch.stack([in_deg, out_deg], dim=1)
-        # degree_feats = torch.log1p(degree_feats)  # log(1 + x) for stability
-        # degree_embedding = self.degree_encoder(degree_feats)
-        # h = h + degree_embedding
+            # Apply activation and norm for all layers except the last
+            if i < self.num_layers - 1:
+                h = F.relu(h)
 
-        # GNN layers with residual connections (key CaseLink feature)
-        for i, conv in enumerate(self.convs):
-            h_norm = self.norms[i](h)
-            h_new = conv(h_norm, edge_index)
-            h_new = F.gelu(h_new)
-            h_new = self.dropout(h_new)
-            # Residual connection
-            h = h + h_new
+        h = h + in_feat
+        h = F.normalize(h, p=2, dim=1)
 
-        # Output projection
-        out = self.projector(h)
-        out = F.normalize(out, p=2, dim=1)
-
-        return out
+        return h
 
 
 class CaseLinkGNNRelational(nn.Module):

@@ -624,9 +624,11 @@ if __name__ == "__main__":
     trainer = CaseLinkTrainer(
         preprocessed_dir="data/preprocessed",
         output_path="output/caselink",
-        batch_size=2048,
-        epochs=50,
+        batch_size=512,
+        epochs=100,
         learning_rate=1e-4,
+        temperature=0.1,
+        weight_decay=1e-6,
         degree_reg_weight=1e-3,
         include_semantic_edges=True,
         include_article_nodes=True,
@@ -643,7 +645,8 @@ if __name__ == "__main__":
         hidden_dim=384,
         output_dim=384,
         num_layers=1,
-        num_edge_types=5,
+        dropout=0.2,
+        num_heads=1,
     )
 
     # Train
