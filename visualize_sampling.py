@@ -20,7 +20,13 @@ class SamplingVisualizer:
         self.graph_type = graph_type
         self.device = torch.device("cpu")  # Use CPU for visualization
 
-    def load_graph(self, train_cutoff_year=None):
+    def load_graph(
+        self,
+        train_cutoff_year=None,
+        include_semantic_edges: bool = True,
+        semantic_threshold: float = 0.7,
+        semantic_max_neighbors: int = 10,
+    ):
         """Load the graph data and compute nodes with positives."""
         if self.graph_type == "heterogeneous":
             builder = HeterogeneousGraphBuilder(self.preprocessed_dir)
@@ -46,11 +52,20 @@ class SamplingVisualizer:
             graph_data = builder.build_graph(
                 train_cutoff_year=train_cutoff_year,
                 include_only_citing=True,
+                include_semantic_edges=include_semantic_edges,
+                semantic_threshold=semantic_threshold,
+                semantic_max_neighbors=semantic_max_neighbors,
             ).to(self.device)
 
-            # Find nodes with positive examples (same as trainer)
-            edge_index = graph_data.edge_index
+            # Find nodes with positive examples (cites edges only, edge_attr=0)
+            cites_mask = graph_data.edge_attr == 0
+            edge_index = graph_data.edge_index[:, cites_mask]
             nodes_with_positives = edge_index[0].unique()
+
+            # Count edges by type
+            cites_count = (graph_data.edge_attr == 0).sum().item()
+            cited_by_count = (graph_data.edge_attr == 1).sum().item()
+            semantic_count = (graph_data.edge_attr == 2).sum().item()
 
             print(f"Homogeneous graph loaded:")
             print(f"  Total nodes: {graph_data.num_nodes}")
@@ -58,8 +73,9 @@ class SamplingVisualizer:
             print(
                 f"  Percentage with positives: {len(nodes_with_positives) / graph_data.num_nodes * 100:.1f}%"
             )
-
-            graph_data = ToUndirected()(graph_data)
+            print(f"  Cites edges: {cites_count}")
+            print(f"  Cited-by edges: {cited_by_count}")
+            print(f"  Semantic edges: {semantic_count}")
 
             return graph_data, False, nodes_with_positives
 
@@ -73,6 +89,13 @@ class SamplingVisualizer:
             else:
                 return None
 
+            # Get sequential edges if available
+            sequential_edge_index = None
+            if ("paragraph", "next", "paragraph") in batch.edge_types:
+                sequential_edge_index = batch[
+                    "paragraph", "next", "paragraph"
+                ].edge_index
+
             # Check which anchor nodes have positives
             anchor_node_ids = None
             if hasattr(batch["paragraph"], "n_id"):
@@ -85,10 +108,17 @@ class SamplingVisualizer:
                 anchor_times = batch["paragraph"].time[:batch_size]
                 all_times = batch["paragraph"].time
 
-            # Get case structure for masking
+            # Get case structure for masking and grouping
+            par_to_case_mapping = {}
             if ("paragraph", "belongs_to", "case") in batch.edge_types:
                 par_to_case = batch["paragraph", "belongs_to", "case"].edge_index
                 case_to_par = batch["case", "contains", "paragraph"].edge_index
+
+                # Build paragraph to case mapping
+                for i in range(par_to_case.shape[1]):
+                    par_idx = par_to_case[0, i].item()
+                    case_idx = par_to_case[1, i].item()
+                    par_to_case_mapping[par_idx] = case_idx
 
                 anchor_mask = par_to_case[0] < batch_size
                 anchor_cases = par_to_case[1, anchor_mask].unique()
@@ -109,11 +139,14 @@ class SamplingVisualizer:
             return {
                 "batch_size": batch_size,
                 "cite_edge_index": cite_edge_index,
+                "sequential_edge_index": sequential_edge_index,
+                "semantic_edge_index": None,  # Hetero doesn't have semantic edges yet
                 "masked_edges": masked_edges,
                 "kept_edges": kept_edges,
                 "anchor_times": anchor_times,
                 "all_times": all_times,
                 "paragraphs_in_anchor_cases": paragraphs_in_anchor_cases,
+                "par_to_case_mapping": par_to_case_mapping,
                 "total_nodes": batch["paragraph"].x.shape[0],
                 "anchor_node_ids": anchor_node_ids,
                 "nodes_with_positives": nodes_with_positives,
@@ -121,6 +154,19 @@ class SamplingVisualizer:
         else:
             batch_size = batch.batch_size
             edge_index = batch.edge_index
+            edge_attr = batch.edge_attr if hasattr(batch, "edge_attr") else None
+
+            # Separate edges by type
+            if edge_attr is not None:
+                cites_mask = edge_attr == 0
+                cited_by_mask = edge_attr == 1
+                semantic_mask = edge_attr == 2
+
+                cite_edge_index = edge_index[:, cites_mask | cited_by_mask]
+                semantic_edge_index = edge_index[:, semantic_mask]
+            else:
+                cite_edge_index = edge_index
+                semantic_edge_index = torch.zeros((2, 0), dtype=torch.long)
 
             # Check which anchor nodes have positives
             anchor_node_ids = None
@@ -134,17 +180,31 @@ class SamplingVisualizer:
                 anchor_times = batch.time[:batch_size]
                 all_times = batch.time
 
-            # Identify masked edges
-            src, tgt = edge_index
+            # Identify masked citation edges
+            src, tgt = cite_edge_index
             leakage_mask = (src < batch_size) | (tgt < batch_size)
-            masked_edges = edge_index[:, leakage_mask]
-            kept_edges = edge_index[:, ~leakage_mask]
+            masked_edges = cite_edge_index[:, leakage_mask]
+            kept_edges = cite_edge_index[:, ~leakage_mask]
+
+            # Identify masked semantic edges
+            if semantic_edge_index.shape[1] > 0:
+                sem_src, sem_tgt = semantic_edge_index
+                sem_leakage_mask = (sem_src < batch_size) | (sem_tgt < batch_size)
+                masked_semantic_edges = semantic_edge_index[:, sem_leakage_mask]
+                kept_semantic_edges = semantic_edge_index[:, ~sem_leakage_mask]
+            else:
+                masked_semantic_edges = torch.zeros((2, 0), dtype=torch.long)
+                kept_semantic_edges = torch.zeros((2, 0), dtype=torch.long)
 
             return {
                 "batch_size": batch_size,
-                "cite_edge_index": edge_index,
+                "cite_edge_index": cite_edge_index,
+                "sequential_edge_index": None,
+                "semantic_edge_index": semantic_edge_index,
                 "masked_edges": masked_edges,
                 "kept_edges": kept_edges,
+                "masked_semantic_edges": masked_semantic_edges,
+                "kept_semantic_edges": kept_semantic_edges,
                 "anchor_times": anchor_times,
                 "all_times": all_times,
                 "total_nodes": batch.x.shape[0],
@@ -172,6 +232,8 @@ class SamplingVisualizer:
         cite_edges = batch_data["cite_edge_index"]
         masked_edges = batch_data["masked_edges"]
         kept_edges = batch_data["kept_edges"]
+        semantic_edges = batch_data.get("semantic_edge_index")
+        sequential_edges = batch_data.get("sequential_edge_index")
 
         # Find positive pairs (edges where source is in batch)
         src, tgt = cite_edges
@@ -179,12 +241,8 @@ class SamplingVisualizer:
         positive_src = src[positive_mask]
         positive_tgt = tgt[positive_mask]
 
-        # Create figure with multiple subplots
-        fig = plt.figure(figsize=(20, 12))
-        # gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
-
-        # 1. Full graph structure
-        # ax1 = fig.add_subplot(gs[0, :])
+        # Create figure
+        fig = plt.figure(figsize=(24, 14))
         ax1 = fig.add_subplot(1, 1, 1)
         self._plot_graph_structure(
             ax1,
@@ -194,39 +252,9 @@ class SamplingVisualizer:
             masked_edges,
             kept_edges,
             batch_data,
+            semantic_edges=semantic_edges,
+            sequential_edges=sequential_edges,
         )
-
-        # 2. Positive pairs
-        # ax2 = fig.add_subplot(gs[1, 0])
-        # self._plot_positive_pairs(ax2, positive_src, positive_tgt, batch_size)
-
-        # # 3. Temporal filtering (if available)
-        # ax3 = fig.add_subplot(gs[1, 1])
-        # if batch_data["anchor_times"] is not None:
-        #     self._plot_temporal_filtering(
-        #         ax3,
-        #         positive_src,
-        #         positive_tgt,
-        #         batch_data["anchor_times"],
-        #         batch_data["all_times"],
-        #     )
-        # else:
-        #     ax3.text(0.5, 0.5, "No temporal info", ha="center", va="center")
-        #     ax3.axis("off")
-
-        # # 4. Contrastive pairs matrix
-        # ax4 = fig.add_subplot(gs[1, 2])
-        # self._plot_contrastive_matrix(
-        #     ax4,
-        #     positive_src,
-        #     positive_tgt,
-        #     batch_data["anchor_times"],
-        #     batch_data["all_times"],
-        # )
-
-        # 5. Statistics
-        # ax5 = fig.add_subplot(gs[2, :])
-        # self._plot_statistics(ax5, batch_data, positive_src, positive_tgt)
 
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         print(f"Visualization saved to {output_path}")
@@ -241,16 +269,18 @@ class SamplingVisualizer:
         masked_edges,
         kept_edges,
         batch_data,
+        semantic_edges=None,
+        sequential_edges=None,
     ):
-        """Plot the graph structure showing anchor nodes and edges as a DAG."""
+        """Plot the graph structure showing anchor nodes and edges as a DAG with subgraph separation."""
         ax.set_title(
-            "Graph Structure (DAG): Anchor Nodes and Edge Masking",
-            fontsize=14,
+            "Graph Structure: Citation, Semantic & Sequential Edges",
+            fontsize=16,
             fontweight="bold",
         )
 
         # Limit nodes for visualization
-        max_nodes = total_nodes  # min(total_nodes, 80)
+        max_nodes = total_nodes
         anchor_nodes = list(range(batch_size))
         neighbor_nodes = list(range(batch_size, max_nodes))
         all_viz_nodes = anchor_nodes + neighbor_nodes
@@ -259,15 +289,13 @@ class SamplingVisualizer:
         G = nx.DiGraph()
         G.add_nodes_from(all_viz_nodes)
 
-        # Add all edges (we'll color them differently later)
+        # Add citation edges
         for i in range(cite_edges.shape[1]):
             src, tgt = cite_edges[0, i].item(), cite_edges[1, i].item()
             if src < max_nodes and tgt < max_nodes:
                 G.add_edge(src, tgt)
 
-        # Use timestamp-based layout
-        # Sort nodes by their timestamps
-
+        # Use timestamp-based layout with case-based horizontal grouping
         all_times = batch_data.get("all_times")
         if all_times is None:
             raise ValueError("No timestamps available")
@@ -278,7 +306,6 @@ class SamplingVisualizer:
             if node < len(all_times):
                 node_times[node] = all_times[node].item()
             else:
-                # Fallback if node index is out of range
                 node_times[node] = 0
 
         # Normalize timestamps to [0, 1] for y-position
@@ -291,11 +318,32 @@ class SamplingVisualizer:
             time_range = 1
             min_time = 0
 
-        # Group nodes by timestamp (with some tolerance for floating point)
+        # Group nodes by case (for horizontal separation) if available
+        par_to_case = batch_data.get("par_to_case_mapping", {})
+        case_groups = {}
+        ungrouped_nodes = []
+
+        for node in all_viz_nodes:
+            if node in par_to_case:
+                case_id = par_to_case[node]
+                if case_id not in case_groups:
+                    case_groups[case_id] = []
+                case_groups[case_id].append(node)
+            else:
+                ungrouped_nodes.append(node)
+
+        # Assign colors for case groups
+        num_cases = len(case_groups)
+        case_colors = {}
+        if num_cases > 0:
+            cmap = plt.cm.get_cmap("tab20", max(num_cases, 1))
+            for i, case_id in enumerate(sorted(case_groups.keys())):
+                case_colors[case_id] = cmap(i)
+
+        # Group nodes by timestamp
         time_groups = {}
         for node in all_viz_nodes:
             time = node_times[node]
-            # Round to nearest 0.01 to group similar timestamps
             time_key = (
                 round((time - min_time) / time_range * 100) if time_range > 0 else 0
             )
@@ -303,52 +351,68 @@ class SamplingVisualizer:
                 time_groups[time_key] = []
             time_groups[time_key].append(node)
 
-        # Create positions
-        # Better horizontal spreading: force-directed within each time layer
+        # Create positions with case-based horizontal grouping
         positions = {}
+
+        # Assign horizontal bands for each case
+        case_x_bands = {}
+        if num_cases > 0:
+            band_width = 0.85 / num_cases
+            for i, case_id in enumerate(sorted(case_groups.keys())):
+                case_x_bands[case_id] = (
+                    0.05 + i * band_width,
+                    0.05 + (i + 1) * band_width,
+                )
 
         for time_key, nodes in sorted(time_groups.items()):
             y = 1.0 - (time_key / 100.0)
 
-            # Subgraph: only edges among these nodes
-            subG = nx.DiGraph()
-            subG.add_nodes_from(nodes)
-            for src, tgt in G.edges():
-                if src in nodes and tgt in nodes:
-                    subG.add_edge(src, tgt)
+            # Group nodes in this time layer by case
+            nodes_by_case = {}
+            ungrouped_in_layer = []
+            for n in nodes:
+                if n in par_to_case:
+                    case_id = par_to_case[n]
+                    if case_id not in nodes_by_case:
+                        nodes_by_case[case_id] = []
+                    nodes_by_case[case_id].append(n)
+                else:
+                    ungrouped_in_layer.append(n)
 
-            if len(nodes) == 1:
-                # Only one node → center it
-                positions[nodes[0]] = (0.5, y)
-                continue
+            # Position nodes within their case bands
+            for case_id, case_nodes in nodes_by_case.items():
+                if case_id in case_x_bands:
+                    x_min, x_max = case_x_bands[case_id]
+                    if len(case_nodes) == 1:
+                        positions[case_nodes[0]] = ((x_min + x_max) / 2, y)
+                    else:
+                        xs = np.linspace(x_min + 0.02, x_max - 0.02, len(case_nodes))
+                        for i, n in enumerate(case_nodes):
+                            positions[n] = (xs[i], y)
 
-            # Compute horizontal positions using force-layout in 2D
-            try:
-                # Request 2D positions (NetworkX internals expect 2D).
-                sub_pos = nx.spring_layout(
-                    subG,
-                    dim=2,  # <- use 2D to avoid IndexError
-                    k=0.4,  # preferred spacing (tweak if needed)
-                    iterations=50,
-                    seed=42,
-                )
-                # Extract x-coordinates (index 0) for horizontal placement
-                xs = [sub_pos[n][0] for n in nodes]
-            except Exception:
-                # Fallback: small random jitter around an even spread
-                base = np.linspace(0.1, 0.9, num=len(nodes))
-                jitter = (np.random.RandomState(42).rand(len(nodes)) - 0.5) * 0.08
-                xs = list(base + jitter)
+            # Position ungrouped nodes (spread across remaining space)
+            if ungrouped_in_layer:
+                if num_cases == 0:
+                    xs = np.linspace(0.1, 0.9, len(ungrouped_in_layer))
+                else:
+                    xs = np.linspace(0.92, 0.98, len(ungrouped_in_layer))
+                for i, n in enumerate(ungrouped_in_layer):
+                    positions[n] = (xs[i], y)
 
-            # Normalize x coordinates into [0.05, 0.95]
-            xmin, xmax = min(xs), max(xs)
-            scale = (xmax - xmin) if xmax > xmin else 1.0
-
-            for idx, n in enumerate(nodes):
-                # if xs came from spring_layout (float) or fallback array
-                x_val = xs[idx] if isinstance(xs, (list, np.ndarray)) else xs[idx]
-                x = 0.05 + 0.9 * ((x_val - xmin) / scale)
-                positions[n] = (x, y)
+        # Fallback: use force layout for nodes without case grouping
+        nodes_without_pos = [n for n in all_viz_nodes if n not in positions]
+        if nodes_without_pos:
+            subG = G.subgraph(nodes_without_pos).copy()
+            if len(nodes_without_pos) > 1:
+                try:
+                    sub_pos = nx.spring_layout(
+                        subG, dim=2, k=0.5, iterations=50, seed=42
+                    )
+                    for n, (x, _) in sub_pos.items():
+                        y = 1.0 - ((node_times[n] - min_time) / time_range)
+                        positions[n] = (0.1 + 0.8 * (x + 1) / 2, y)
+                except Exception:
+                    pass
 
         # Create edge sets for coloring
         masked_edge_set = set()
@@ -365,7 +429,116 @@ class SamplingVisualizer:
                 if src < max_nodes and tgt < max_nodes:
                     kept_edge_set.add((src, tgt))
 
-        # Draw masked edges (red, dashed) - draw first so they're in back
+        # Create semantic edge set
+        semantic_edge_set = set()
+        kept_semantic_set = set()
+        masked_semantic_set = set()
+        if semantic_edges is not None and semantic_edges.shape[1] > 0:
+            masked_semantic = batch_data.get("masked_semantic_edges")
+            kept_semantic = batch_data.get("kept_semantic_edges")
+
+            if masked_semantic is not None and masked_semantic.shape[1] > 0:
+                for i in range(masked_semantic.shape[1]):
+                    src, tgt = (
+                        masked_semantic[0, i].item(),
+                        masked_semantic[1, i].item(),
+                    )
+                    if src < max_nodes and tgt < max_nodes:
+                        masked_semantic_set.add((src, tgt))
+
+            if kept_semantic is not None and kept_semantic.shape[1] > 0:
+                for i in range(kept_semantic.shape[1]):
+                    src, tgt = kept_semantic[0, i].item(), kept_semantic[1, i].item()
+                    if src < max_nodes and tgt < max_nodes:
+                        kept_semantic_set.add((src, tgt))
+
+            for i in range(semantic_edges.shape[1]):
+                src, tgt = semantic_edges[0, i].item(), semantic_edges[1, i].item()
+                if src < max_nodes and tgt < max_nodes:
+                    semantic_edge_set.add((src, tgt))
+
+        # Create sequential edge set
+        sequential_edge_set = set()
+        if sequential_edges is not None and sequential_edges.shape[1] > 0:
+            for i in range(sequential_edges.shape[1]):
+                src, tgt = sequential_edges[0, i].item(), sequential_edges[1, i].item()
+                if src < max_nodes and tgt < max_nodes:
+                    sequential_edge_set.add((src, tgt))
+
+        # Draw case background bands for visual separation
+        if num_cases > 0 and num_cases <= 15:
+            for case_id, (x_min, x_max) in case_x_bands.items():
+                color = case_colors[case_id]
+                rect = plt.Rectangle(
+                    (x_min - 0.01, -0.02),
+                    x_max - x_min + 0.02,
+                    1.04,
+                    facecolor=color,
+                    alpha=0.1,
+                    edgecolor=color,
+                    linewidth=1.5,
+                    linestyle="--",
+                    zorder=0,
+                )
+                ax.add_patch(rect)
+
+        # Draw sequential edges (orange, dotted) - intra-case connections
+        for src, tgt in sequential_edge_set:
+            if src in positions and tgt in positions:
+                ax.annotate(
+                    "",
+                    xy=positions[tgt],
+                    xytext=positions[src],
+                    arrowprops=dict(
+                        arrowstyle="-",
+                        color="orange",
+                        alpha=0.5,
+                        linestyle=":",
+                        linewidth=1.5,
+                        shrinkA=5,
+                        shrinkB=5,
+                    ),
+                    zorder=0.5,
+                )
+
+        # Draw masked semantic edges (purple, dashed, thin)
+        for src, tgt in masked_semantic_set:
+            if src in positions and tgt in positions:
+                ax.annotate(
+                    "",
+                    xy=positions[tgt],
+                    xytext=positions[src],
+                    arrowprops=dict(
+                        arrowstyle="-",
+                        color="purple",
+                        alpha=0.2,
+                        linestyle="--",
+                        linewidth=0.6,
+                        shrinkA=5,
+                        shrinkB=5,
+                    ),
+                    zorder=0.8,
+                )
+
+        # Draw kept semantic edges (purple, solid)
+        for src, tgt in kept_semantic_set:
+            if src in positions and tgt in positions:
+                ax.annotate(
+                    "",
+                    xy=positions[tgt],
+                    xytext=positions[src],
+                    arrowprops=dict(
+                        arrowstyle="-",
+                        color="purple",
+                        alpha=0.4,
+                        linewidth=1.0,
+                        shrinkA=5,
+                        shrinkB=5,
+                    ),
+                    zorder=1.5,
+                )
+
+        # Draw masked citation edges (red, dashed)
         for src, tgt in masked_edge_set:
             if src in positions and tgt in positions:
                 ax.annotate(
@@ -384,7 +557,7 @@ class SamplingVisualizer:
                     zorder=1,
                 )
 
-        # Draw kept edges (green) - draw on top
+        # Draw kept citation edges (green)
         for src, tgt in kept_edge_set:
             if src in positions and tgt in positions:
                 ax.annotate(
@@ -402,17 +575,24 @@ class SamplingVisualizer:
                     zorder=2,
                 )
 
-        # Draw nodes on top of edges
-        # Draw neighbor nodes first
+        # Draw neighbor nodes
         for node in neighbor_nodes:
             if node in positions:
+                # Color by case if available
+                if node in par_to_case and par_to_case[node] in case_colors:
+                    node_color = case_colors[par_to_case[node]]
+                    edge_color = "darkblue"
+                else:
+                    node_color = "lightblue"
+                    edge_color = "darkblue"
+
                 circle = plt.Circle(
                     positions[node],
-                    0.015,
-                    color="lightblue",
-                    alpha=0.8,
+                    0.012,
+                    color=node_color,
+                    alpha=0.7,
                     zorder=3,
-                    edgecolor="darkblue",
+                    edgecolor=edge_color,
                     linewidth=0.5,
                 )
                 ax.add_patch(circle)
@@ -422,16 +602,16 @@ class SamplingVisualizer:
             if node in positions:
                 circle = plt.Circle(
                     positions[node],
-                    0.02,
+                    0.018,
                     color="red",
-                    alpha=0.8,
+                    alpha=0.9,
                     zorder=4,
                     edgecolor="darkred",
-                    linewidth=0.8,
+                    linewidth=1.0,
                 )
                 ax.add_patch(circle)
 
-        # Add node labels for anchor nodes (optional, can be removed if too cluttered)
+        # Add node labels for anchor nodes if not too many
         if batch_size <= 20:
             for node in anchor_nodes:
                 if node in positions:
@@ -439,7 +619,7 @@ class SamplingVisualizer:
                         positions[node][0],
                         positions[node][1],
                         str(node),
-                        fontsize=6,
+                        fontsize=5,
                         ha="center",
                         va="center",
                         color="white",
@@ -447,7 +627,7 @@ class SamplingVisualizer:
                         zorder=5,
                     )
 
-        # Add legend
+        # Build legend
         from matplotlib.lines import Line2D
 
         legend_elements = [
@@ -474,38 +654,78 @@ class SamplingVisualizer:
             Line2D(
                 [0],
                 [0],
-                color="g",
+                color="green",
                 linewidth=2,
-                label=f"Kept Edges (n={kept_edges.shape[1]})",
+                label=f"Kept Citation Edges (n={kept_edges.shape[1]})",
             ),
             Line2D(
                 [0],
                 [0],
-                color="r",
+                color="red",
                 linestyle="--",
                 linewidth=2,
-                label=f"Masked Edges (n={masked_edges.shape[1]})",
+                label=f"Masked Citation Edges (n={masked_edges.shape[1]})",
             ),
         ]
-        ax.legend(handles=legend_elements, loc="upper right", fontsize=9)
 
-        # Add note about DAG structure
-        note_text = "DAG Layout: Citations flow top → bottom\n(older papers at top, newer at bottom)"
-
-        # Add note about filtering if applicable
-        if batch_data.get("nodes_with_positives") is not None:
-            note_text += (
-                "\n\n✓ Anchors sampled from filtered set\n(only nodes with ≥1 citation)"
+        # Add semantic edge legend if present
+        if semantic_edges is not None and semantic_edges.shape[1] > 0:
+            legend_elements.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color="purple",
+                    linewidth=2,
+                    label=f"Kept Semantic Edges (n={len(kept_semantic_set)})",
+                )
+            )
+            legend_elements.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color="purple",
+                    linestyle="--",
+                    linewidth=1,
+                    alpha=0.5,
+                    label=f"Masked Semantic Edges (n={len(masked_semantic_set)})",
+                )
             )
 
+        # Add sequential edge legend if present
+        if sequential_edges is not None and sequential_edges.shape[1] > 0:
+            legend_elements.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color="orange",
+                    linestyle=":",
+                    linewidth=2,
+                    label=f"Sequential Edges (n={len(sequential_edge_set)})",
+                )
+            )
+
+        ax.legend(
+            handles=legend_elements, loc="upper right", fontsize=9, framealpha=0.9
+        )
+
+        # Add note about layout
+        note_lines = [
+            "Layout: Time flows top→bottom (older at top)",
+        ]
+        if num_cases > 0:
+            note_lines.append(f"Columns = {num_cases} case subgraphs")
+        if batch_data.get("nodes_with_positives") is not None:
+            note_lines.append("✓ Anchors have ≥1 citation")
+
+        note_text = "\n".join(note_lines)
         ax.text(
             0.02,
             0.02,
             note_text,
             transform=ax.transAxes,
-            fontsize=8,
+            fontsize=9,
             verticalalignment="bottom",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.7),
         )
 
         ax.set_xlim(-0.05, 1.05)
@@ -742,11 +962,11 @@ class SamplingVisualizer:
         graph_data,
         is_hetero,
         nodes_with_positives,
-        num_batches=3,
-        batch_size=16,
-        num_hops=2,
-        output_dir="sampling_visualizations",
-    ):
+        num_batches: int = 3,
+        batch_size: int = 16,
+        num_hops: int = 2,
+        output_dir: str = "sampling_visualizations",
+    ) -> None:
         """Visualize multiple batches to check consistency."""
         os.makedirs(output_dir, exist_ok=True)
 
@@ -845,8 +1065,32 @@ def main():
         default="sampling_visualizations",
         help="Output directory for visualizations",
     )
+    parser.add_argument(
+        "--include_semantic_edges",
+        action="store_true",
+        default=True,
+        help="Include semantic similarity edges (homogeneous only)",
+    )
+    parser.add_argument(
+        "--no_semantic_edges",
+        action="store_true",
+        help="Disable semantic similarity edges",
+    )
+    parser.add_argument(
+        "--semantic_threshold",
+        type=float,
+        default=0.7,
+        help="Cosine similarity threshold for semantic edges",
+    )
+    parser.add_argument(
+        "--semantic_max_neighbors",
+        type=int,
+        default=10,
+        help="Max semantic neighbors per node",
+    )
 
     args = parser.parse_args()
+    include_semantic = not args.no_semantic_edges
 
     print("=" * 80)
     print("GNN Sampling Visualization")
@@ -855,6 +1099,11 @@ def main():
     print(f"Batch size: {args.batch_size}")
     print(f"Num hops: {args.num_hops}")
     print(f"Num batches: {args.num_batches}")
+    if args.graph_type == "homogeneous":
+        print(f"Semantic edges: {include_semantic}")
+        if include_semantic:
+            print(f"  Threshold: {args.semantic_threshold}")
+            print(f"  Max neighbors: {args.semantic_max_neighbors}")
 
     # Initialize visualizer
     visualizer = SamplingVisualizer(args.preprocessed_dir, args.graph_type)
@@ -862,7 +1111,10 @@ def main():
     # Load graph
     print("\nLoading graph...")
     graph_data, is_hetero, nodes_with_positives = visualizer.load_graph(
-        args.train_cutoff_year
+        train_cutoff_year=args.train_cutoff_year,
+        include_semantic_edges=include_semantic,
+        semantic_threshold=args.semantic_threshold,
+        semantic_max_neighbors=args.semantic_max_neighbors,
     )
 
     if is_hetero:
