@@ -498,6 +498,8 @@ class CaseLinkGraphBuilder:
             )
             for src_idx, tgt_idx in semantic_edges:
                 edge_list.append([src_idx, tgt_idx])
+                edge_list.append([tgt_idx, src_idx])
+                edge_attr_list.append(2)
                 edge_attr_list.append(2)
             print(f"  Semantic similarity edges: {len(semantic_edges)}")
 

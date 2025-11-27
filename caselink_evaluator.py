@@ -405,6 +405,7 @@ if __name__ == "__main__":
         output_dim=384,
         num_layers=1,
         num_edge_types=5,
+        use_attention=True,
     )
 
     # Load trained weights if available
