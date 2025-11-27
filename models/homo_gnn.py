@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import SAGEConv, GATConv
 
 
 class CitationGNN(nn.Module):
@@ -15,6 +15,7 @@ class CitationGNN(nn.Module):
         num_heads: int = 4,
         edge_dim: int = 16,
         degree_embed_dim: int = 32,  # Embedding dim for degree features
+        num_edge_types: int = 3,
     ):
         super().__init__()
         if output_dim is None:
@@ -30,11 +31,21 @@ class CitationGNN(nn.Module):
             nn.Linear(degree_embed_dim, input_dim),
         )
 
+        self.edge_type_embedding = nn.Embedding(num_edge_types, input_dim)
+
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
         for i in range(num_layers):
-            self.convs.append(SAGEConv(input_dim, input_dim, aggr="mean"))
+            # self.convs.append(SAGEConv(input_dim, input_dim, aggr="mean"))
+            self.convs.append(
+                GATConv(
+                    input_dim,
+                    input_dim // num_heads,
+                    heads=num_heads,
+                    add_self_loops=False,
+                )
+            )
             self.norms.append(nn.LayerNorm(input_dim))
 
         self.projector = nn.Sequential(
@@ -81,8 +92,9 @@ class CitationGNN(nn.Module):
         x = x + degree_embedding
 
         for i, conv in enumerate(self.convs):
+            edge_type_embedding = self.edge_type_embedding(edge_attr)
             x = self.norms[i](x)
-            x_new = conv(x, edge_index)
+            x_new = conv(x, edge_index, edge_attr=edge_type_embedding)
             x_new = F.gelu(x_new)
             x_new = self.dropout(x_new)
             x = x + x_new

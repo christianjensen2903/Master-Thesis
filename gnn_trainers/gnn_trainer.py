@@ -161,8 +161,12 @@ class GNNTrainer:
         wandb_name: str | None = None,
         warmup_epochs: int = 3,
         eval_every_n_epochs: int = 1,
-        gradient_clip_val: float | None = None,  # NEW: Optional gradient clipping
-        log_every_n_batches: int = 100,  # NEW: Control logging frequency
+        gradient_clip_val: float | None = None,
+        log_every_n_batches: int = 100,
+        # Semantic edge parameters (for homogeneous graphs)
+        include_semantic_edges: bool = False,
+        semantic_threshold: float = 0.7,
+        semantic_max_neighbors: int = 10,
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -180,6 +184,10 @@ class GNNTrainer:
         self.eval_every_n_epochs = eval_every_n_epochs
         self.gradient_clip_val = gradient_clip_val
         self.log_every_n_batches = log_every_n_batches
+        # Semantic edge settings
+        self.include_semantic_edges = include_semantic_edges
+        self.semantic_threshold = semantic_threshold
+        self.semantic_max_neighbors = semantic_max_neighbors
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -187,6 +195,10 @@ class GNNTrainer:
             self.device = torch.device("cpu")
         print(f"Using device: {self.device}")
         print(f"Using graph type: {self.graph_type}")
+        if include_semantic_edges and graph_type == "homogeneous":
+            print(
+                f"  Semantic edges enabled (threshold={semantic_threshold}, max_neighbors={semantic_max_neighbors})"
+            )
 
     def _process_batch(
         self,
@@ -268,11 +280,28 @@ class GNNTrainer:
             edge_attr = batch.edge_attr if hasattr(batch, "edge_attr") else None
 
             src, tgt = edge_index
-            leakage_mask = ~((src < batch_size) | (tgt < batch_size))
-            masked_edge_index = edge_index[:, leakage_mask]
-            masked_edge_attr = (
-                edge_attr[leakage_mask] if edge_attr is not None else None
-            )
+
+            # Mask edges to prevent leakage:
+            # 1. All outgoing edges from anchors (src < batch_size)
+            # 2. Citation edges (type 0, 1) incoming to anchors (tgt < batch_size)
+            # Keep semantic edges (type 2) incoming to anchors
+            outgoing_from_anchor = src < batch_size
+            incoming_to_anchor = tgt < batch_size
+
+            if edge_attr is not None:
+                # Citation edges (type 0=cites, 1=cited_by): mask both directions
+                is_citation_edge = (edge_attr == 0) | (edge_attr == 1)
+                # Semantic edges (type 2): only mask outgoing from anchor
+                leakage_mask = outgoing_from_anchor | (
+                    incoming_to_anchor & is_citation_edge
+                )
+            else:
+                # No edge types, mask all edges involving anchors
+                leakage_mask = outgoing_from_anchor | incoming_to_anchor
+
+            keep_mask = ~leakage_mask
+            masked_edge_index = edge_index[:, keep_mask]
+            masked_edge_attr = edge_attr[keep_mask] if edge_attr is not None else None
 
             return {
                 "batch_size": batch_size,
@@ -530,7 +559,10 @@ class GNNTrainer:
             train_graph_data = homo_builder.build_graph(
                 train_cutoff_year=train_cutoff_year,
                 include_only_citing=True,
-                add_reverse_edges=True,  # Enable edge direction features
+                add_reverse_edges=True,
+                include_semantic_edges=self.include_semantic_edges,
+                semantic_threshold=self.semantic_threshold,
+                semantic_max_neighbors=self.semantic_max_neighbors,
             ).to(self.device)
 
         print("\nFiltering nodes with positive examples...")
@@ -581,6 +613,9 @@ class GNNTrainer:
                     train_cutoff_year=val_cutoff_year,
                     include_only_citing=True,
                     add_reverse_edges=True,
+                    include_semantic_edges=self.include_semantic_edges,
+                    semantic_threshold=self.semantic_threshold,
+                    semantic_max_neighbors=self.semantic_max_neighbors,
                 ).to(self.device)
                 val_edge_index = val_graph_data.edge_index
                 val_edge_attr = val_graph_data.edge_attr
@@ -628,6 +663,9 @@ class GNNTrainer:
                 "num_nodes_with_positives": len(nodes_with_positives),
                 "gradient_clip_val": self.gradient_clip_val,
                 "log_every_n_batches": self.log_every_n_batches,
+                "include_semantic_edges": self.include_semantic_edges,
+                "semantic_threshold": self.semantic_threshold,
+                "semantic_max_neighbors": self.semantic_max_neighbors,
             }
             if val_cutoff_year is not None:
                 config["num_val_nodes_with_positives"] = len(val_nodes_with_positives)

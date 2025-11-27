@@ -78,6 +78,10 @@ class SimpleIncrementalEvaluator:
         mode: EvaluatorMode = "citation_pairs",
         top_k: int = 10000,
         graph_type: str = "homogeneous",
+        # Semantic edge parameters (for homogeneous graphs)
+        include_semantic_edges: bool = False,
+        semantic_threshold: float = 0.7,
+        semantic_max_neighbors: int = 10,
     ):
         self.gnn_model = gnn_model
         self.preprocessed_dir = preprocessed_dir
@@ -88,6 +92,10 @@ class SimpleIncrementalEvaluator:
         self.top_k = top_k
         self.graph_type = graph_type
         self.is_hetero = graph_type == "heterogeneous"
+        # Semantic edge settings
+        self.include_semantic_edges = include_semantic_edges
+        self.semantic_threshold = semantic_threshold
+        self.semantic_max_neighbors = semantic_max_neighbors
 
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -97,6 +105,10 @@ class SimpleIncrementalEvaluator:
 
         print(f"Using device: {self.device}")
         print(f"Using graph type: {self.graph_type}")
+        if include_semantic_edges and not self.is_hetero:
+            print(
+                f"  Semantic edges enabled (threshold={semantic_threshold}, max_neighbors={semantic_max_neighbors})"
+            )
 
         # Load preprocessed data based on graph type
         graph_data: Data | HeteroData
@@ -109,7 +121,10 @@ class SimpleIncrementalEvaluator:
         else:
             graph_data = HomogeneousGraphBuilder(preprocessed_dir).build_graph(
                 include_only_citing=(self.mode == "citation_pairs"),
-                add_reverse_edges=True,  # Enable edge direction features
+                add_reverse_edges=True,
+                include_semantic_edges=include_semantic_edges,
+                semantic_threshold=semantic_threshold,
+                semantic_max_neighbors=semantic_max_neighbors,
             )
             # Don't use ToUndirected for homogeneous since we handle it in build_graph
         self.graph_data = graph_data
@@ -329,13 +344,31 @@ class SimpleIncrementalEvaluator:
             else:
                 # For homogeneous graphs
                 src, tgt = sub.edge_index
-                edge_mask = ~((src < num_nodes) | (tgt < num_nodes))
-                masked_edge_index = sub.edge_index[:, edge_mask]
+                edge_attr = sub.edge_attr if hasattr(sub, "edge_attr") else None
 
-                # Also mask edge_attr if present
-                masked_edge_attr = None
-                if hasattr(sub, "edge_attr") and sub.edge_attr is not None:
-                    masked_edge_attr = sub.edge_attr[edge_mask]
+                # Mask edges to prevent leakage:
+                # 1. All outgoing edges from anchors (src < num_nodes)
+                # 2. Citation edges (type 0, 1) incoming to anchors (tgt < num_nodes)
+                # Keep semantic edges (type 2) incoming to anchors
+                outgoing_from_anchor = src < num_nodes
+                incoming_to_anchor = tgt < num_nodes
+
+                if edge_attr is not None:
+                    # Citation edges (type 0=cites, 1=cited_by): mask both directions
+                    is_citation_edge = (edge_attr == 0) | (edge_attr == 1)
+                    # Semantic edges (type 2): only mask outgoing from anchor
+                    leakage_mask = outgoing_from_anchor | (
+                        incoming_to_anchor & is_citation_edge
+                    )
+                else:
+                    # No edge types, mask all edges involving anchors
+                    leakage_mask = outgoing_from_anchor | incoming_to_anchor
+
+                keep_mask = ~leakage_mask
+                masked_edge_index = sub.edge_index[:, keep_mask]
+                masked_edge_attr = (
+                    edge_attr[keep_mask] if edge_attr is not None else None
+                )
 
                 # Create combined feature matrix
                 x = sub.x.clone()

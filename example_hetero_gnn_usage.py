@@ -87,7 +87,7 @@ def train_homo_example() -> None:
         # gradient_clip_val=3.0,
         eval_every_n_epochs=2,
         warmup_epochs=3,
-        x_similarity_threshold=0.8,
+        include_semantic_edges=True,
     )
     # Train on paragraph pairs
     cutoff_year = 2018
