@@ -98,7 +98,8 @@ class CaseLinkTrainer:
         Process a batch for CaseLink-style training.
 
         Key difference: we only compute loss on paragraph nodes,
-        not article nodes.
+        not article nodes. Citation edges (type 4) are completely masked
+        during forward pass to prevent information leakage.
         """
         batch_size = batch.batch_size
         x = batch.x.clone()
@@ -114,33 +115,57 @@ class CaseLinkTrainer:
         edge_attr = batch.edge_attr if hasattr(batch, "edge_attr") else None
         node_type = batch.node_type if hasattr(batch, "node_type") else None
 
-        # For CaseLink, we only want citation edges (type 0) for the contrastive loss
-        # Other edges help with message passing but aren't used for loss
+        # Citation pairs need to be remapped from global to local subgraph indices
+        # n_id maps local index -> global index
+        n_id = batch.n_id if hasattr(batch, "n_id") else None
+        citation_pairs_local = None
 
-        # Mask edges to prevent leakage:
-        # 1. Mask all outgoing edges from anchor (src is anchor)
-        # 2. Mask incoming citation edges to anchor (tgt is anchor AND citation edge)
-        # Keep incoming non-citation edges for one-directional info flow
+        if hasattr(batch, "citation_pairs") and n_id is not None:
+            citation_pairs = batch.citation_pairs
+            # Create reverse mapping: global index -> local index
+            global_to_local = {
+                int(global_idx): local_idx
+                for local_idx, global_idx in enumerate(n_id.tolist())
+            }
+
+            # Remap citation pairs to local indices, keeping only those in subgraph
+            local_src = []
+            local_tgt = []
+            for i in range(citation_pairs.size(1)):
+                src_global = int(citation_pairs[0, i])
+                tgt_global = int(citation_pairs[1, i])
+                if src_global in global_to_local and tgt_global in global_to_local:
+                    local_src.append(global_to_local[src_global])
+                    local_tgt.append(global_to_local[tgt_global])
+
+            if local_src:
+                citation_pairs_local = torch.tensor(
+                    [local_src, local_tgt],
+                    dtype=torch.long,
+                    device=batch.x.device,
+                )
+
+        # Mask edges to prevent info leakage:
+        # 1. Mask ALL citation edges (type 4) - they're only for neighbor sampling
+        # 2. Mask outgoing edges from anchors
         src, tgt = edge_index
         outgoing_from_anchor = src < batch_size
-        incoming_to_anchor = tgt < batch_size
-        is_citation = (
-            (edge_attr == 0)
+        is_citation_edge = (
+            edge_attr == 4
             if edge_attr is not None
-            else torch.ones(
+            else torch.zeros(
                 edge_index.size(1), dtype=torch.bool, device=edge_index.device
             )
         )
-        incoming_citation_to_anchor = incoming_to_anchor & is_citation
-        leakage_mask = ~(outgoing_from_anchor | incoming_citation_to_anchor)
+        leakage_mask = ~(outgoing_from_anchor | is_citation_edge)
         masked_edge_index = edge_index[:, leakage_mask]
         masked_edge_attr = edge_attr[leakage_mask] if edge_attr is not None else None
 
         return {
             "batch_size": batch_size,
             "x": x,
-            "edge_index": batch.edge_index,  # Full edges for finding positives
-            "masked_edge_index": masked_edge_index,  # Masked edges for GNN
+            "edge_index": batch.edge_index,
+            "masked_edge_index": masked_edge_index,
             "edge_attr": edge_attr,
             "masked_edge_attr": masked_edge_attr,
             "node_type": node_type,
@@ -150,6 +175,8 @@ class CaseLinkTrainer:
                 batch.date_feature if hasattr(batch, "date_feature") else None
             ),
             "num_par_nodes_total": num_par_nodes_total,
+            "citation_pairs": citation_pairs_local,
+            "n_id": n_id,
         }
 
     def _compute_loss(
@@ -160,10 +187,8 @@ class CaseLinkTrainer:
     ):
         """Compute CaseLink-style loss with degree regularization."""
         batch_size = batch_data["batch_size"]
-        edge_index = batch_data["edge_index"]
-        edge_attr = batch_data.get("edge_attr")
         all_times = batch_data.get("all_times")
-        num_par_nodes = batch_data.get("num_par_nodes_total", batch_data["x"].size(0))
+        citation_pairs = batch_data.get("citation_pairs")
 
         # Forward pass through GNN
         embeddings = model(
@@ -174,30 +199,29 @@ class CaseLinkTrainer:
             node_type=batch_data.get("node_type"),
         )
 
-        # Find citation edges where source is in input batch
-        # Only use "cites" edges (type 0) for contrastive loss
-        src, tgt = edge_index
+        # Citation pairs are already remapped to local subgraph indices
+        if citation_pairs is None or citation_pairs.size(1) == 0:
+            return (None, None) if return_stats else None
 
-        if edge_attr is not None:
-            # Only use forward citation edges (type 0)
-            cites_mask = edge_attr == 0
-            input_mask = (src < batch_size) & cites_mask
-        else:
-            input_mask = src < batch_size
+        # citation_pairs[0] = citing paragraphs (anchors) in local indices
+        # citation_pairs[1] = cited paragraphs (positives) in local indices
+        cite_src, cite_tgt = citation_pairs
 
-        # Also ensure we're only looking at paragraph-to-paragraph edges
+        # Filter to pairs where source (anchor) is in the input batch (first batch_size nodes)
+        input_mask = cite_src < batch_size
+
+        # Ensure both source and target are paragraphs (node_type is also in local indices)
         node_type = batch_data.get("node_type")
         if node_type is not None:
-            # Both source and target should be paragraphs (type 0)
-            src_is_par = node_type[src] == 0
-            tgt_is_par = node_type[tgt] == 0
+            src_is_par = node_type[cite_src] == 0
+            tgt_is_par = node_type[cite_tgt] == 0
             input_mask = input_mask & src_is_par & tgt_is_par
 
         if input_mask.sum() == 0:
             return (None, None) if return_stats else None
 
-        batch_src = src[input_mask]
-        batch_tgt = tgt[input_mask]
+        batch_src = cite_src[input_mask]
+        batch_tgt = cite_tgt[input_mask]
 
         anchor_emb = embeddings[batch_src]
         positive_emb = embeddings[batch_tgt]
@@ -378,13 +402,12 @@ class CaseLinkTrainer:
 
         num_par_nodes = train_graph.num_par_nodes
 
-        # Filter to nodes with citation edges (for training)
-        edge_attr = train_graph.edge_attr
-        cites_mask = edge_attr == 0
-        cites_edges = train_graph.edge_index[:, cites_mask]
-        nodes_with_positives = cites_edges[0].unique()
+        # Get citing nodes from citation_pairs (for training)
+        # citation_pairs[0] = citing paragraphs (anchors)
+        citation_pairs = train_graph.citation_pairs
+        nodes_with_positives = citation_pairs[0].unique()
 
-        # Only include paragraph nodes (not articles)
+        # Only include paragraph nodes (not articles) - should already be paragraphs
         node_type = train_graph.node_type
         par_mask = node_type[nodes_with_positives] == 0
         nodes_with_positives = nodes_with_positives[par_mask]
@@ -408,10 +431,8 @@ class CaseLinkTrainer:
             ).to(self.device)
 
             val_num_par_nodes = val_graph.num_par_nodes
-            val_edge_attr = val_graph.edge_attr
-            val_cites_mask = val_edge_attr == 0
-            val_cites_edges = val_graph.edge_index[:, val_cites_mask]
-            val_nodes_with_positives = val_cites_edges[0].unique()
+            val_citation_pairs = val_graph.citation_pairs
+            val_nodes_with_positives = val_citation_pairs[0].unique()
 
             val_node_type = val_graph.node_type
             val_par_mask = val_node_type[val_nodes_with_positives] == 0
@@ -595,7 +616,7 @@ if __name__ == "__main__":
         output_path="output/caselink",
         batch_size=2048,
         epochs=50,
-        learning_rate=1e-3,
+        learning_rate=1e-4,
         degree_reg_weight=1e-3,
         include_semantic_edges=True,
         include_article_nodes=True,
@@ -612,7 +633,7 @@ if __name__ == "__main__":
         hidden_dim=384,
         output_dim=384,
         num_layers=1,
-        num_edge_types=6,
+        num_edge_types=5,
     )
 
     # Train

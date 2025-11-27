@@ -238,13 +238,12 @@ class CaseLinkEvaluator:
             # Get nodes at current time
             nodes_at_time = mask.nonzero(as_tuple=True)[0]
 
-            # Find which nodes have outgoing citation edges
-            edge_attr = self.graph_data.edge_attr
-            cites_mask = edge_attr == 0  # Edge type 0 = cites
-            source_nodes = self.graph_data.edge_index[0, cites_mask]
+            # Find which nodes have outgoing citations (from citation_pairs)
+            citation_pairs = self.graph_data.citation_pairs
+            citing_nodes = citation_pairs[0]  # Source nodes that cite
 
             nodes_with_out_edges = nodes_at_time[
-                torch.isin(nodes_at_time, source_nodes)
+                torch.isin(nodes_at_time, citing_nodes)
             ]
 
             if len(nodes_with_out_edges) == 0:
@@ -264,29 +263,26 @@ class CaseLinkEvaluator:
             )
             sub: Data = next(iter(loader))
 
-            # Mask edges to prevent leakage:
-            # 1. Mask all outgoing edges from anchor (src is anchor)
-            # 2. Mask incoming citation edges to anchor (tgt is anchor AND citation edge)
-            # Keep incoming non-citation edges for one-directional info flow
+            # Mask edges to prevent info leakage:
+            # 1. Mask ALL citation edges (type 4) - they're only for neighbor sampling
+            # 2. Mask outgoing edges from anchors
             src, tgt = sub.edge_index
             outgoing_from_anchor = src < num_nodes
-            incoming_to_anchor = tgt < num_nodes
             sub_edge_attr = (
                 sub.edge_attr
                 if hasattr(sub, "edge_attr") and sub.edge_attr is not None
                 else None
             )
-            is_citation = (
-                (sub_edge_attr == 0)
+            is_citation_edge = (
+                sub_edge_attr == 4
                 if sub_edge_attr is not None
-                else torch.ones(
+                else torch.zeros(
                     sub.edge_index.size(1),
                     dtype=torch.bool,
                     device=sub.edge_index.device,
                 )
             )
-            incoming_citation_to_anchor = incoming_to_anchor & is_citation
-            edge_mask = ~(outgoing_from_anchor | incoming_citation_to_anchor)
+            edge_mask = ~(outgoing_from_anchor | is_citation_edge)
             masked_edge_index = sub.edge_index[:, edge_mask]
             masked_edge_attr = (
                 sub_edge_attr[edge_mask] if sub_edge_attr is not None else None
@@ -408,7 +404,7 @@ if __name__ == "__main__":
         hidden_dim=384,
         output_dim=384,
         num_layers=1,
-        num_edge_types=6,
+        num_edge_types=5,
     )
 
     # Load trained weights if available

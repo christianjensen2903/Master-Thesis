@@ -42,12 +42,14 @@ class CaseLinkGraphBuilder:
     - Multiple edge types encoded in edge_attr
 
     Edge types:
-    - 0: paragraph cites paragraph (forward)
-    - 1: paragraph cited_by paragraph (reverse)
-    - 2: paragraph references article
-    - 3: article referenced_by paragraph
-    - 4: paragraph similar_to paragraph (semantic similarity)
-    - 5: article similar_to article (co-citation similarity)
+    - 0: paragraph references article
+    - 1: article referenced_by paragraph
+    - 2: paragraph similar_to paragraph (semantic similarity)
+    - 3: article similar_to article (cosine similarity)
+    - 4: paragraph cites paragraph (for neighbor sampling only, masked during forward pass)
+
+    Citation pairs are also stored in graph_data.citation_pairs for loss computation.
+    Edge type 4 is used for neighbor sampling but should be masked during message passing.
     """
 
     def __init__(self, preprocessed_dir: str):
@@ -444,25 +446,29 @@ class CaseLinkGraphBuilder:
         edge_list = []
         edge_attr_list = []
 
-        # Edge type 0: paragraph cites paragraph (forward)
-        # Edge type 1: paragraph cited_by paragraph (reverse)
-        par_par_edges = 0
+        # Collect paragraph citation pairs and add as edges (type 4)
+        # These edges are used for neighbor sampling but masked during forward pass
+        # Also stored separately in citation_pairs for loss computation
+        citation_src_list = []
+        citation_tgt_list = []
         for src_id, tgt_id in self.citations:
             if src_id in par_node_id_to_idx and tgt_id in par_node_id_to_idx:
                 src_idx = par_node_id_to_idx[src_id]
                 tgt_idx = par_node_id_to_idx[tgt_id]
-                # Forward: src cites tgt
+                citation_src_list.append(src_idx)
+                citation_tgt_list.append(tgt_idx)
+                # Add bidirectional citation edges (type 4) for neighbor sampling
                 edge_list.append([src_idx, tgt_idx])
-                edge_attr_list.append(0)
-                # Reverse: tgt cited_by src
+                edge_attr_list.append(4)
                 edge_list.append([tgt_idx, src_idx])
-                edge_attr_list.append(1)
-                par_par_edges += 1
+                edge_attr_list.append(4)
 
-        print(f"  Paragraph-paragraph edges: {par_par_edges} (bidirectional)")
+        print(
+            f"  Paragraph citation edges (type 4, for sampling): {len(citation_src_list)} (bidirectional)"
+        )
 
-        # Edge type 2: paragraph references article
-        # Edge type 3: article referenced_by paragraph
+        # Edge type 0: paragraph references article
+        # Edge type 1: article referenced_by paragraph
         if include_article_nodes and len(art_node_id_to_idx) > 0:
             par_art_edges = 0
             for src_id, tgt_id in self.citations:
@@ -470,14 +476,14 @@ class CaseLinkGraphBuilder:
                     par_idx = par_node_id_to_idx[src_id]
                     art_idx = num_par_nodes + art_node_id_to_idx[tgt_id]
                     edge_list.append([par_idx, art_idx])
-                    edge_attr_list.append(2)
+                    edge_attr_list.append(0)
                     edge_list.append([art_idx, par_idx])
-                    edge_attr_list.append(3)
+                    edge_attr_list.append(1)
                     par_art_edges += 1
 
             print(f"  Paragraph-article edges: {par_art_edges} (bidirectional)")
 
-        # Edge type 4: paragraph similar_to paragraph (semantic)
+        # Edge type 2: paragraph similar_to paragraph (semantic)
         if include_semantic_edges:
             print("Computing semantic similarity edges with FAISS...")
             par_embeddings = np.array(par_doc_embeddings_list)
@@ -492,40 +498,29 @@ class CaseLinkGraphBuilder:
             )
             for src_idx, tgt_idx in semantic_edges:
                 edge_list.append([src_idx, tgt_idx])
-                edge_attr_list.append(4)
+                edge_attr_list.append(2)
             print(f"  Semantic similarity edges: {len(semantic_edges)}")
 
-        # Edge type 5: article similar_to article (co-citation)
+        # Edge type 3: article similar_to article (cosine similarity)
         if include_article_nodes and len(art_node_id_to_idx) > 1:
-            # Build co-citation matrix: two articles are similar if cited by same paragraph
-            par_to_arts: dict[int, list[int]] = defaultdict(list)
-            for src_id, tgt_id in self.citations:
-                if src_id in par_node_id_to_idx and tgt_id in art_node_id_to_idx:
-                    par_idx = par_node_id_to_idx[src_id]
-                    art_local_idx = art_node_id_to_idx[tgt_id]
-                    par_to_arts[par_idx].append(art_local_idx)
+            print("Computing article similarity edges with FAISS...")
+            art_emb_array = np.array(art_embeddings_list)
 
-            # Count co-citations
-            co_citation_count: dict[tuple[int, int], int] = defaultdict(int)
-            for par_idx, arts in par_to_arts.items():
-                for i, a1 in enumerate(arts):
-                    for a2 in arts[i + 1 :]:
-                        key = (min(a1, a2), max(a1, a2))
-                        co_citation_count[key] += 1
-
-            # Add edges for articles with >= 2 co-citations
-            art_art_edges = 0
-            for (a1, a2), count in co_citation_count.items():
-                if count >= 2:
-                    global_a1 = num_par_nodes + a1
-                    global_a2 = num_par_nodes + a2
-                    edge_list.append([global_a1, global_a2])
-                    edge_attr_list.append(5)
-                    edge_list.append([global_a2, global_a1])
-                    edge_attr_list.append(5)
-                    art_art_edges += 1
+            # Use same method as paragraph similarity (no temporal constraint for articles)
+            article_semantic_edges = self._compute_semantic_similarity_edges(
+                art_emb_array,
+                times=None,  # Articles don't have temporal constraints
+                threshold=semantic_threshold,
+                max_neighbors=semantic_max_neighbors,
+                use_temporal_constraint=False,
+            )
+            for src_idx, tgt_idx in article_semantic_edges:
+                global_src = num_par_nodes + src_idx
+                global_tgt = num_par_nodes + tgt_idx
+                edge_list.append([global_src, global_tgt])
+                edge_attr_list.append(3)
             print(
-                f"  Article-article co-citation edges: {art_art_edges} (bidirectional)"
+                f"  Article-article cosine similarity edges: {len(article_semantic_edges)}"
             )
 
         # Create tensors
@@ -558,6 +553,14 @@ class CaseLinkGraphBuilder:
             edge_index = torch.empty((2, 0), dtype=torch.long)
             edge_attr = torch.empty((0,), dtype=torch.long)
 
+        # Store citation pairs for training (not as graph edges)
+        if citation_src_list:
+            citation_pairs = torch.tensor(
+                [citation_src_list, citation_tgt_list], dtype=torch.long
+            )
+        else:
+            citation_pairs = torch.empty((2, 0), dtype=torch.long)
+
         graph_data = Data(
             x=x_doc,
             x_query=x_query,
@@ -569,6 +572,7 @@ class CaseLinkGraphBuilder:
             num_par_nodes=num_par_nodes,
             num_art_nodes=num_art_nodes,
             time=time_tensor,
+            citation_pairs=citation_pairs,  # [2, num_citations] - src cites tgt
         )
 
         print(f"\nBuilt CaseLink-style graph:")
@@ -576,8 +580,9 @@ class CaseLinkGraphBuilder:
             f"  Total nodes: {total_nodes} ({num_par_nodes} paragraphs, {num_art_nodes} articles)"
         )
         print(f"  Total edges: {edge_index.shape[1]}")
+        print(f"  Citation pairs for training: {citation_pairs.shape[1]}")
         print(
-            f"  Edge types: 0=cites, 1=cited_by, 2=references, 3=referenced_by, 4=similar, 5=co-cited"
+            f"  Edge types: 0=references, 1=referenced_by, 2=par_similar, 3=art_similar, 4=cites (masked)"
         )
 
         return graph_data
