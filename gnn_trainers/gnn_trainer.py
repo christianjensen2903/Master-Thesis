@@ -902,25 +902,14 @@ class GNNTrainer:
 
                 wandb.log(log_dict)
 
-            # Save best model based on validation loss if available, otherwise training loss
-            if val_loss is not None:
-                if val_loss < best_val_loss:
-                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                    print(
-                        f"  ✓ New best validation loss: {best_val_loss:.4f} -> {val_loss:.4f}"
-                    )
-                    best_val_loss = val_loss
-                    if self.wandb_project is not None:
-                        wandb.run.summary["best_val_loss"] = best_val_loss
-            else:
-                if train_loss < best_train_loss:
-                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                    print(
-                        f"  ✓ New best training loss: {best_train_loss:.4f} -> {train_loss:.4f}"
-                    )
-                    best_train_loss = train_loss
-                    if self.wandb_project is not None:
-                        wandb.run.summary["best_train_loss"] = best_train_loss
+            if val_loss is not None and val_loss < best_val_loss:
+                torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
+                print(
+                    f"  ✓ New best validation loss: {best_val_loss:.4f} -> {val_loss:.4f}"
+                )
+                best_val_loss = val_loss
+                if self.wandb_project is not None:
+                    wandb.run.summary["best_val_loss"] = best_val_loss
 
             if (epoch + 1) % self.checkpoint_interval == 0:
                 checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}.pt")
