@@ -28,7 +28,7 @@ class EmbeddingPreprocessor:
         self.encoder_name = encoder_name
         self.batch_size = batch_size
         self.mask_token = mask_token
-        self.encoder = SentenceTransformer(encoder_name)
+        self.encoder = SentenceTransformer(encoder_name, trust_remote_code=True)
 
     def process_judgments(
         self,
