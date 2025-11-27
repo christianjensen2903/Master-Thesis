@@ -973,6 +973,7 @@ def info_nce_loss_with_degree_reg(
 
     # Add degree regularization if edge_index is provided
     total_loss = nce_loss
+    deg_reg = None
     if edge_index is not None and degree_reg_weight > 0:
         # USE all_embeddings if provided, otherwise fall back to concat
         if all_embeddings is not None:
@@ -988,6 +989,11 @@ def info_nce_loss_with_degree_reg(
 
     # Compute statistics
     stats = {}
+    stats["nce_loss"] = nce_loss.item()
+    if deg_reg is not None:
+        stats["deg_reg"] = deg_reg.item()
+        stats["deg_reg_weighted"] = (degree_reg_weight * deg_reg).item()
+    stats["total_loss"] = total_loss.item()
     positive_sims = torch.diagonal(sim_matrix)
     stats["pos_sim_mean"] = positive_sims.mean().item()
     stats["pos_sim_std"] = positive_sims.std().item()

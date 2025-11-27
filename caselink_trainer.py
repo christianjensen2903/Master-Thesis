@@ -544,6 +544,11 @@ class CaseLinkTrainer:
             print(f"\nEpoch {epoch + 1}/{self.epochs}")
             print(f"  Train Loss: {train_loss:.4f}")
             if train_stats:
+                print(f"  NCE Loss: {train_stats.get('nce_loss', 0):.4f}")
+                if "deg_reg" in train_stats:
+                    print(
+                        f"  Deg Reg: {train_stats.get('deg_reg', 0):.4f} (weighted: {train_stats.get('deg_reg_weighted', 0):.4f})"
+                    )
                 print(f"  Pos Sim: {train_stats.get('pos_sim_mean', 0):.3f}")
                 print(f"  Neg Sim: {train_stats.get('neg_sim_mean', 0):.3f}")
                 print(f"  Acc@1: {train_stats.get('acc@1', 0):.2%}")
@@ -557,6 +562,11 @@ class CaseLinkTrainer:
                 )
                 print(f"  Val Loss: {val_loss:.4f}")
                 if val_stats:
+                    print(f"  Val NCE Loss: {val_stats.get('nce_loss', 0):.4f}")
+                    if "deg_reg" in val_stats:
+                        print(
+                            f"  Val Deg Reg: {val_stats.get('deg_reg', 0):.4f} (weighted: {val_stats.get('deg_reg_weighted', 0):.4f})"
+                        )
                     print(f"  Val Acc@1: {val_stats.get('acc@1', 0):.2%}")
 
             # Log to wandb
