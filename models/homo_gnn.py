@@ -103,3 +103,97 @@ class CitationGNN(nn.Module):
         x = F.normalize(x, p=2, dim=1)
 
         return x
+
+
+class DualEncoderGNN(nn.Module):
+    """Dual encoder with separate query encoder (MLP) and document encoder (GNN)."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int | None = None,
+        num_layers: int = 3,
+        dropout: float = 0.5,
+        num_heads: int = 4,
+        degree_embed_dim: int = 32,
+        num_edge_types: int = 3,
+    ):
+        super().__init__()
+        if output_dim is None:
+            output_dim = input_dim
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+
+        # Query encoder: MLP (no graph structure needed since edges are masked)
+        self.query_encoder = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, output_dim),
+        )
+
+        # Document encoder: GNN (uses graph structure)
+        self.degree_encoder = nn.Sequential(
+            nn.Linear(2, degree_embed_dim),
+            nn.GELU(),
+            nn.Linear(degree_embed_dim, input_dim),
+        )
+
+        self.edge_type_embedding = nn.Embedding(num_edge_types, input_dim)
+
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for _ in range(num_layers):
+            self.convs.append(SAGEConv(input_dim, input_dim, aggr="mean"))
+            self.norms.append(nn.LayerNorm(input_dim))
+
+        self.doc_projector = nn.Linear(input_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def compute_degree_features(
+        self, edge_index: torch.Tensor, num_nodes: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        in_degree = torch.zeros(num_nodes, device=edge_index.device)
+        out_degree = torch.zeros(num_nodes, device=edge_index.device)
+
+        ones = torch.ones(edge_index.size(1), device=edge_index.device)
+        in_degree.scatter_add_(0, edge_index[1], ones)
+        out_degree.scatter_add_(0, edge_index[0], ones)
+
+        return in_degree, out_degree
+
+    def encode_query(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode query nodes using MLP (no graph structure)."""
+        out = self.query_encoder(x)
+        return F.normalize(out, p=2, dim=1)
+
+    def encode_document(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Encode document nodes using GNN (with graph structure)."""
+
+        for i, conv in enumerate(self.convs):
+            x = self.norms[i](x)
+            x_new = conv(x, edge_index)
+            x_new = F.gelu(x_new)
+            x_new = self.dropout(x_new)
+            x = x + x_new
+
+        x = self.doc_projector(x)
+        return F.normalize(x, p=2, dim=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        date_feature: torch.Tensor | None = None,
+        edge_attr: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass encoding all nodes as documents (for compatibility)."""
+        return self.encode_document(x, edge_index, edge_attr)

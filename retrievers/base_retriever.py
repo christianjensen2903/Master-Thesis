@@ -1,72 +1,47 @@
 from abc import ABC, abstractmethod
 import numpy as np
+from numpy.typing import NDArray
 
 
 class BaseRetriever(ABC):
-    """Base class for all retriever implementations."""
+    """Base class for all retriever implementations with iterative evaluation support."""
 
     @abstractmethod
-    def fit(self, texts: np.ndarray, mask: np.ndarray | None = None) -> None:
-        """
-        Fit the retriever on a collection of texts.
-
-        Args:
-            texts: Array of paragraph texts
-            mask: Optional boolean mask indicating which texts to fit on (e.g., train set)
-        """
+    def fit(self, texts: NDArray, mask: NDArray | None = None) -> None:
+        """Fit the retriever on a collection of texts."""
         pass
 
     @abstractmethod
     def transform(
-        self, texts: np.ndarray, paragraph_ids: list[tuple[str, int]] | None = None
-    ) -> np.ndarray:
-        """
-        Transform texts into their vector representations.
+        self, texts: NDArray, paragraph_ids: list[tuple[str, int]] | None = None
+    ) -> NDArray:
+        """Transform texts into their vector representations."""
+        pass
 
-        Args:
-            texts: Array of paragraph texts
-            paragraph_ids: Optional list of (celex, number) tuples for each text.
-                          Used to look up precomputed embeddings if available.
+    @abstractmethod
+    def create_index(self, dim: int) -> None:
+        """Create an empty index for iterative building."""
+        pass
+
+    @abstractmethod
+    def add_to_index(self, embeddings: NDArray, indices: NDArray) -> None:
+        """Add embeddings to the index with their original indices."""
+        pass
+
+    @abstractmethod
+    def search_index(
+        self, query_embeddings: NDArray, top_k: int
+    ) -> tuple[NDArray, NDArray]:
+        """
+        Search the index for nearest neighbors.
 
         Returns:
-            Matrix of shape (n_texts, n_features)
+            original_indices: Shape (n_queries, top_k) - original paragraph indices
+            scores: Shape (n_queries, top_k) - similarity scores
         """
         pass
 
     @abstractmethod
-    def retrieve(
-        self,
-        query_embedding: np.ndarray,
-        embeddings: np.ndarray,
-        candidate_indices: np.ndarray,
-        top_k: int | None = None,
-    ) -> np.ndarray:
-        """
-        Retrieve and rank candidate paragraphs for a given query.
-
-        Args:
-            query_embedding: Embedding vector of the query
-            embeddings: Full embedding matrix of all paragraphs
-            candidate_indices: Indices of candidate paragraphs to rank
-            top_k: If provided, only return top k results (faster)
-
-        Returns:
-            Array of candidate indices sorted by relevance (most relevant first)
-        """
+    def reset_index(self) -> None:
+        """Reset the index to empty state."""
         pass
-
-    def fit_transform(
-        self, texts: np.ndarray, mask: np.ndarray | None = None
-    ) -> np.ndarray:
-        """
-        Fit on texts and transform them in one step.
-
-        Args:
-            texts: Array of paragraph texts
-            mask: Optional boolean mask for fitting
-
-        Returns:
-            Transformed embeddings
-        """
-        self.fit(texts, mask)
-        return self.transform(texts)

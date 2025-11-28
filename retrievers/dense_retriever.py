@@ -1,15 +1,23 @@
 import os
+
+# Fix OpenMP conflict on macOS (FAISS and PyTorch may use different OpenMP runtimes)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import pickle
 from pathlib import Path
 import numpy as np
+from numpy.typing import NDArray
 from sentence_transformers import SentenceTransformer  # type: ignore
+import faiss  # type: ignore
+
+# Set FAISS to single-threaded mode to avoid segmentation faults
+faiss.omp_set_num_threads(1)
 
 from .base_retriever import BaseRetriever
-import faiss  # type: ignore
 
 
 class DenseRetriever(BaseRetriever):
-    """Dense retriever using sentence transformers for semantic similarity."""
+    """Dense retriever using sentence transformers with FAISS incremental index."""
 
     def __init__(
         self,
@@ -29,31 +37,31 @@ class DenseRetriever(BaseRetriever):
         self.preprocessed_dir = preprocessed_dir
         self.save_embeddings_path = save_embeddings_path
 
-        # Precomputed embeddings (loaded if preprocessed_dir is provided)
-        self.precomputed_doc_embeddings: np.ndarray | None = None
-        self.precomputed_query_embeddings: np.ndarray | None = None
+        # Precomputed embeddings
+        self.precomputed_doc_embeddings: NDArray | None = None
+        self.precomputed_query_embeddings: NDArray | None = None
         self.par_id_to_idx: dict[str, int] | None = None
         self.par_metadata: list[dict] | None = None
 
-        # Load precomputed embeddings if directory is provided
+        # FAISS index for iterative evaluation
+        self._index: faiss.IndexFlatIP | None = None
+        self._index_to_original: list[int] = []
+
         if preprocessed_dir:
             self._load_precomputed_embeddings()
         else:
-            # Only initialize model if not using precomputed embeddings
             self.model = SentenceTransformer(model_name)
             if max_seq_length is not None:
                 self.model.max_seq_length = max_seq_length
 
-        self._is_fitted = True  # Dense models don't need explicit fitting
+        self._is_fitted = True
 
     def _load_precomputed_embeddings(self) -> None:
-        """Load precomputed embeddings from preprocessed directory."""
         if self.preprocessed_dir is None:
             return
 
         preprocessed_path = Path(self.preprocessed_dir)
 
-        # Load document embeddings
         doc_emb_path = preprocessed_path / "paragraph_embeddings_doc.npy"
         if not doc_emb_path.exists():
             raise FileNotFoundError(
@@ -61,61 +69,39 @@ class DenseRetriever(BaseRetriever):
                 "Run precompute_embeddings.py first."
             )
 
-        self.precomputed_doc_embeddings = np.load(doc_emb_path)
-        print(
-            f"Loaded precomputed document embeddings: {self.precomputed_doc_embeddings.shape}"
-        )
+        doc_embeddings = np.load(doc_emb_path)
+        self.precomputed_doc_embeddings = doc_embeddings
+        print(f"Loaded precomputed document embeddings: {doc_embeddings.shape}")
 
-        # Load query embeddings
         query_emb_path = preprocessed_path / "paragraph_embeddings_query.npy"
         if query_emb_path.exists():
-            self.precomputed_query_embeddings = np.load(query_emb_path)
-            print(
-                f"Loaded precomputed query embeddings: {self.precomputed_query_embeddings.shape}"
-            )
+            query_embeddings = np.load(query_emb_path)
+            self.precomputed_query_embeddings = query_embeddings
+            print(f"Loaded precomputed query embeddings: {query_embeddings.shape}")
 
-        # Load metadata to create mapping
         metadata_path = preprocessed_path / "paragraph_metadata.pkl"
         if metadata_path.exists():
             with open(metadata_path, "rb") as f:
-                self.par_metadata = pickle.load(f)
-            self.par_id_to_idx = {m["id"]: i for i, m in enumerate(self.par_metadata)}
-            print(f"Loaded metadata for {len(self.par_metadata)} paragraphs")
+                metadata: list[dict] = pickle.load(f)
+            self.par_metadata = metadata
+            self.par_id_to_idx = {m["id"]: i for i, m in enumerate(metadata)}
+            print(f"Loaded metadata for {len(metadata)} paragraphs")
 
     def _get_paragraph_id(self, celex: str, number: int) -> str:
-        """Convert (celex, number) to paragraph ID format used in precomputed embeddings."""
         return f"par:{celex}:{number}"
 
-    def fit(self, texts: np.ndarray, mask: np.ndarray | None = None) -> None:
-        # Dense retrievers use pre-trained models, no fitting needed
-        # If using precomputed embeddings, nothing to fit
+    def fit(self, texts: NDArray, mask: NDArray | None = None) -> None:
         if self.precomputed_doc_embeddings is not None:
             return
 
-        # Only initialize model if not already initialized
         if not hasattr(self, "model"):
             self.model = SentenceTransformer(self.model_name)
             if self.max_seq_length is not None:
                 self.model.max_seq_length = self.max_seq_length
 
     def transform(
-        self, texts: np.ndarray, paragraph_ids: list[tuple[str, int]] | None = None
-    ) -> np.ndarray:
-        """
-        Transform texts into embeddings.
-
-        If precomputed embeddings are available and paragraph_ids are provided,
-        uses precomputed embeddings. Otherwise, encodes texts using the model.
-
-        Args:
-            texts: Array of paragraph texts
-            paragraph_ids: Optional list of (celex, number) tuples for each text.
-                          Required if using precomputed embeddings.
-
-        Returns:
-            Matrix of shape (n_texts, n_features)
-        """
-        # Use precomputed embeddings if available and paragraph_ids provided
+        self, texts: NDArray, paragraph_ids: list[tuple[str, int]] | None = None
+    ) -> NDArray:
         if self.precomputed_doc_embeddings is not None and paragraph_ids is not None:
             if len(paragraph_ids) != len(texts):
                 raise ValueError(
@@ -123,11 +109,8 @@ class DenseRetriever(BaseRetriever):
                 )
 
             if self.par_id_to_idx is None:
-                raise ValueError(
-                    "Metadata not loaded. Cannot map paragraph IDs to embeddings."
-                )
+                raise ValueError("Metadata not loaded.")
 
-            # Map paragraph IDs to embedding indices
             embedding_indices = []
             missing = []
             for celex, number in paragraph_ids:
@@ -139,19 +122,15 @@ class DenseRetriever(BaseRetriever):
 
             if missing:
                 print(
-                    f"Warning: {len(missing)} paragraphs not found in precomputed embeddings. "
-                    f"Falling back to encoding. First missing: {missing[0]}"
+                    f"Warning: {len(missing)} paragraphs not found. Falling back to encoding."
                 )
-                # Fall back to encoding for missing paragraphs
                 return self._encode_texts(texts)
 
             return self.precomputed_doc_embeddings[embedding_indices]
 
-        # Fall back to encoding
         return self._encode_texts(texts)
 
-    def _encode_texts(self, texts: np.ndarray) -> np.ndarray:
-        """Encode texts using the sentence transformer model."""
+    def _encode_texts(self, texts: NDArray) -> NDArray:
         if not hasattr(self, "model"):
             self.model = SentenceTransformer(self.model_name)
             if self.max_seq_length is not None:
@@ -168,24 +147,9 @@ class DenseRetriever(BaseRetriever):
 
     def transform_queries(
         self,
-        query_texts: np.ndarray,
+        query_texts: NDArray,
         paragraph_ids: list[tuple[str, int]] | None = None,
-    ) -> np.ndarray:
-        """
-        Transform query texts into embeddings.
-
-        If precomputed query embeddings are available and paragraph_ids are provided,
-        uses precomputed query embeddings. Otherwise, encodes texts using the model.
-
-        Args:
-            query_texts: Array of query texts
-            paragraph_ids: Optional list of (celex, number) tuples for each query.
-                          Required if using precomputed query embeddings.
-
-        Returns:
-            Matrix of shape (n_queries, n_features)
-        """
-        # Use precomputed query embeddings if available
+    ) -> NDArray:
         if self.precomputed_query_embeddings is not None and paragraph_ids is not None:
             if len(paragraph_ids) != len(query_texts):
                 raise ValueError(
@@ -193,11 +157,8 @@ class DenseRetriever(BaseRetriever):
                 )
 
             if self.par_id_to_idx is None:
-                raise ValueError(
-                    "Metadata not loaded. Cannot map paragraph IDs to embeddings."
-                )
+                raise ValueError("Metadata not loaded.")
 
-            # Map paragraph IDs to embedding indices
             embedding_indices = []
             missing = []
             for celex, number in paragraph_ids:
@@ -209,23 +170,62 @@ class DenseRetriever(BaseRetriever):
 
             if missing:
                 print(
-                    f"Warning: {len(missing)} queries not found in precomputed embeddings. "
-                    f"Falling back to encoding. First missing: {missing[0]}"
+                    f"Warning: {len(missing)} queries not found. Falling back to encoding."
                 )
                 return self._encode_texts(query_texts)
 
             return self.precomputed_query_embeddings[embedding_indices]
 
-        # Fall back to encoding
         return self._encode_texts(query_texts)
 
-    def load_embeddings(self, path: str | None = None) -> np.ndarray | None:
-        """Load embeddings from disk using numpy's load format."""
-        load_path = path or self.save_embeddings_path
-        if load_path is None:
-            return None
+    # --- Iterative index methods ---
 
-        if not os.path.exists(load_path):
+    def create_index(self, dim: int) -> None:
+        self._index = faiss.IndexFlatIP(dim)
+        self._index_to_original = []
+
+    def add_to_index(self, embeddings: NDArray, indices: NDArray) -> None:
+        if self._index is None:
+            raise RuntimeError("Index not created. Call create_index first.")
+
+        embeddings = np.ascontiguousarray(embeddings.astype(np.float32))
+        self._index.add(embeddings)
+        self._index_to_original.extend(indices.tolist())
+
+    def search_index(
+        self, query_embeddings: NDArray, top_k: int
+    ) -> tuple[NDArray, NDArray]:
+        if self._index is None or self._index.ntotal == 0:
+            n_queries = len(query_embeddings)
+            return np.full((n_queries, 0), -1, dtype=np.int64), np.zeros(
+                (n_queries, 0), dtype=np.float32
+            )
+
+        query_embeddings = np.ascontiguousarray(query_embeddings.astype(np.float32))
+        k = min(top_k, self._index.ntotal)
+
+        scores, faiss_indices = self._index.search(query_embeddings, k)
+
+        # Map FAISS indices back to original indices
+        original_indices = np.array(
+            [
+                [self._index_to_original[idx] if idx >= 0 else -1 for idx in row]
+                for row in faiss_indices
+            ],
+            dtype=np.int64,
+        )
+
+        return original_indices, scores
+
+    def reset_index(self) -> None:
+        self._index = None
+        self._index_to_original = []
+
+    # --- Legacy methods for compatibility ---
+
+    def load_embeddings(self, path: str | None = None) -> NDArray | None:
+        load_path = path or self.save_embeddings_path
+        if load_path is None or not os.path.exists(load_path):
             return None
 
         try:
@@ -236,8 +236,7 @@ class DenseRetriever(BaseRetriever):
             print(f"Failed to load embeddings from {load_path}: {e}")
             return None
 
-    def save_embeddings(self, embeddings: np.ndarray, path: str | None = None) -> None:
-        """Save embeddings to disk using numpy's save format."""
+    def save_embeddings(self, embeddings: NDArray, path: str | None = None) -> None:
         save_path = path or self.save_embeddings_path
         if save_path is None:
             return
@@ -247,27 +246,3 @@ class DenseRetriever(BaseRetriever):
             os.makedirs(dir_path, exist_ok=True)
         np.save(save_path, embeddings)
         print(f"Saved embeddings to {save_path} (shape: {embeddings.shape})")
-
-    def retrieve(
-        self,
-        query_embedding: np.ndarray,
-        embeddings: np.ndarray,
-        candidate_indices: np.ndarray,
-        top_k: int | None = None,
-    ) -> np.ndarray:
-        """Create temporary index with only candidates - efficient for flat indices."""
-        # Extract candidate embeddings
-        candidate_embeddings = embeddings[candidate_indices]
-
-        # Build temporary index
-        temp_index = faiss.IndexFlatIP(embeddings.shape[1])
-        temp_index.add(candidate_embeddings)
-
-        # Search
-        query_vec = query_embedding.reshape(1, -1)
-        k = top_k if top_k is not None else len(candidate_indices)
-
-        _, local_indices = temp_index.search(query_vec, k)
-
-        # Map back to original indices
-        return candidate_indices[local_indices[0]]
