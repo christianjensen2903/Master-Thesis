@@ -118,14 +118,18 @@ class DualEncoderGNN(nn.Module):
         # Scale but don't project - preserves cos(Δt) relative time in dot products
         return self.date_scale * date_embed
 
+    def _encode_node(
+        self, x: torch.Tensor, date_feature: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if date_feature is not None:
+            x = x + self._encode_date(date_feature)
+        return x
+
     def encode_query(
         self, x: torch.Tensor, date_feature: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Encode query nodes using MLP (no graph structure)."""
-        # Add date embedding if provided
-        date_embed = self._encode_date(date_feature)
-        if date_embed is not None:
-            x = x + date_embed
+        x = self._encode_node(x, date_feature)
         return F.normalize(x, p=2, dim=1)
 
     def encode_document(
@@ -136,10 +140,7 @@ class DualEncoderGNN(nn.Module):
         edge_attr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode document nodes using GNN (with graph structure)."""
-        # Add date embedding if provided
-        date_embed = self._encode_date(date_feature)
-        if date_embed is not None:
-            x = x + date_embed
+        x = self._encode_node(x, date_feature)
 
         x = self.dropout(x)
 
