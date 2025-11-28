@@ -62,7 +62,7 @@ class DualEncoderGNN(nn.Module):
         num_layers: int = 3,
         dropout: float = 0.5,
         num_heads: int = 4,
-        num_date_features: int = 2,
+        num_date_features: int = 3,
     ):
         super().__init__()
         if output_dim is None:
@@ -77,7 +77,8 @@ class DualEncoderGNN(nn.Module):
         # Each encodes to input_dim to preserve relative-time property in dot products
         self.date_encoder = SinusoidalDateEncoder(input_dim, num_dates=1)
         # Learnable scales for each date type - starts small, model learns to amplify
-        self.date_scales = nn.Parameter(torch.tensor([0.1, 0.0]))
+        # [judgment_date, application_date, duration]
+        self.date_scales = nn.Parameter(torch.tensor([0.1, 0.0, 0.0]))
 
         # Query encoder: MLP (no graph structure needed since edges are masked)
         self.query_encoder = nn.Sequential(

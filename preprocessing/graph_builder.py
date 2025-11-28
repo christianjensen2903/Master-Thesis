@@ -207,10 +207,25 @@ class BaseGraphBuilder(ABC):
     def _extract_date_features(
         self, date_str: str | None, application_date_str: str | None = None
     ) -> np.ndarray:
-        """Extract date features: [judgment_date, application_date] normalized to [0, 1]."""
+        """Extract date features: [judgment_date, application_date, duration] normalized."""
         judgment_norm = self._normalize_date(date_str)
         application_norm = self._normalize_date(application_date_str)
-        return np.array([judgment_norm, application_norm], dtype=np.float32)
+
+        # Duration between application and judgment (case processing time)
+        duration_norm = 0.0
+        if date_str and application_date_str:
+            try:
+                judgment_dt = datetime.fromisoformat(date_str)
+                application_dt = datetime.fromisoformat(application_date_str)
+                duration_days = (judgment_dt - application_dt).days
+                # Normalize: 0 days = 0, ~5 years (1825 days) = 1, clamp to [0, 1]
+                duration_norm = max(0.0, min(1.0, duration_days / 1825))
+            except (ValueError, AttributeError):
+                pass
+
+        return np.array(
+            [judgment_norm, application_norm, duration_norm], dtype=np.float32
+        )
 
     def _compute_relative_positions(self, selected_pars: list[int]) -> dict[int, float]:
         """Compute relative paragraph positions within each case.
