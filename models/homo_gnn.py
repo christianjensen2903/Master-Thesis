@@ -62,8 +62,6 @@ class DualEncoderGNN(nn.Module):
         num_layers: int = 3,
         dropout: float = 0.5,
         num_heads: int = 4,
-        degree_embed_dim: int = 32,
-        num_edge_types: int = 3,
         num_date_features: int = 2,
     ):
         super().__init__()
@@ -79,7 +77,6 @@ class DualEncoderGNN(nn.Module):
         # Each encodes to input_dim to preserve relative-time property in dot products
         self.date_encoder = SinusoidalDateEncoder(input_dim, num_dates=1)
         # Learnable scales for each date type - starts small, model learns to amplify
-        # Initialize application_date scale to 0 since it's often missing
         self.date_scales = nn.Parameter(torch.tensor([0.1, 0.0]))
 
         # Query encoder: MLP (no graph structure needed since edges are masked)
@@ -90,15 +87,6 @@ class DualEncoderGNN(nn.Module):
             nn.Linear(input_dim, output_dim),
         )
 
-        # Document encoder: GNN (uses graph structure)
-        self.degree_encoder = nn.Sequential(
-            nn.Linear(2, degree_embed_dim),
-            nn.GELU(),
-            nn.Linear(degree_embed_dim, input_dim),
-        )
-
-        self.edge_type_embedding = nn.Embedding(num_edge_types, input_dim)
-
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
@@ -108,18 +96,6 @@ class DualEncoderGNN(nn.Module):
 
         self.doc_projector = nn.Linear(input_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
-
-    def compute_degree_features(
-        self, edge_index: torch.Tensor, num_nodes: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        in_degree = torch.zeros(num_nodes, device=edge_index.device)
-        out_degree = torch.zeros(num_nodes, device=edge_index.device)
-
-        ones = torch.ones(edge_index.size(1), device=edge_index.device)
-        in_degree.scatter_add_(0, edge_index[1], ones)
-        out_degree.scatter_add_(0, edge_index[0], ones)
-
-        return in_degree, out_degree
 
     def _encode_date(self, date_feature: torch.Tensor | None) -> torch.Tensor | None:
         """Encode dates and sum them with learnable scales. Preserves relative-time property."""
@@ -138,14 +114,9 @@ class DualEncoderGNN(nn.Module):
 
         for i in range(min(date_feature.size(-1), self.num_date_features)):
             date_col = date_feature[:, i]  # (N,)
-            # Create mask for non-zero dates (0.0 = missing)
-            valid_mask = date_col > 0
-            if valid_mask.any():
-                # Encode only valid dates
-                date_emb = self.date_encoder(date_col)  # (N, input_dim)
-                # Apply scale and mask out missing dates
-                scaled_emb = self.date_scales[i] * date_emb
-                result = result + scaled_emb * valid_mask.unsqueeze(-1)
+            date_emb = self.date_encoder(date_col)  # (N, input_dim)
+            scaled_emb = self.date_scales[i] * date_emb
+            result = result + scaled_emb
 
         return result
 
