@@ -507,7 +507,9 @@ class GNNTrainer:
             print(f"  Nodes with citations: {len(nodes)} / {graph_data.num_nodes}")
             return nodes, nodes
 
-    def _create_loader(self, graph_data, input_nodes) -> NeighborLoader:
+    def _create_loader(
+        self, graph_data, input_nodes, shuffle: bool = True
+    ) -> NeighborLoader:
         """Create a NeighborLoader."""
         num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
         return NeighborLoader(
@@ -515,7 +517,7 @@ class GNNTrainer:
             num_neighbors=num_neighbors,
             batch_size=self.batch_size,
             input_nodes=input_nodes,
-            shuffle=True,
+            shuffle=shuffle,
             time_attr="time",
             subgraph_type="bidirectional",
         )
@@ -592,7 +594,7 @@ class GNNTrainer:
                 val_input_nodes = val_nodes_with_positives
                 print(f"  Val nodes after filtering: {len(val_nodes_with_positives)}")
 
-            val_loader = self._create_loader(val_graph, val_input_nodes)
+            val_loader = self._create_loader(val_graph, val_input_nodes, shuffle=False)
 
         # Initialize wandb
         if self.wandb_project:
