@@ -8,10 +8,11 @@ that can be reused for various GNN training, evaluation, and analysis tasks.
 import json
 import pickle
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from datetime import datetime
 import pandas as pd  # type: ignore
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer  # type: ignore
 from tqdm import tqdm  # type: ignore
 
@@ -24,11 +25,21 @@ class EmbeddingPreprocessor:
         encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         batch_size: int = 32,
         mask_token: str = "[MASK]",
+        precision: Literal["fp32", "fp16", "bf16"] = "fp32",
     ):
         self.encoder_name = encoder_name
         self.batch_size = batch_size
         self.mask_token = mask_token
+        self.precision = precision
         self.encoder = SentenceTransformer(encoder_name, trust_remote_code=True)
+
+        # Apply precision
+        if precision == "fp16":
+            self.encoder.half()
+            print(f"Using fp16 (float16) precision")
+        elif precision == "bf16":
+            self.encoder.to(torch.bfloat16)
+            print(f"Using bf16 (bfloat16) precision")
 
     def process_judgments(
         self,
@@ -433,11 +444,19 @@ def main():
         default=32,
         help="Batch size for encoding",
     )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["fp32", "fp16", "bf16"],
+        default="fp32",
+        help="Model precision: fp32 (default), fp16 (faster on GPU), bf16 (faster on newer GPUs)",
+    )
     args = parser.parse_args()
 
     preprocessor = EmbeddingPreprocessor(
         encoder_name=args.encoder,
         batch_size=args.batch_size,
+        precision=args.precision,
     )
 
     # Process paragraphs
