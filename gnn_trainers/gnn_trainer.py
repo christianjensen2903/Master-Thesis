@@ -171,6 +171,8 @@ class GNNTrainer:
         semantic_threshold: float = 0.7,
         semantic_max_neighbors: int = 10,
         num_hard_negatives: int = 0,
+        early_stopping_patience: int | None = None,
+        early_stopping_min_delta: float = 0.0,
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -192,6 +194,8 @@ class GNNTrainer:
         self.semantic_threshold = semantic_threshold
         self.semantic_max_neighbors = semantic_max_neighbors
         self.num_hard_negatives = num_hard_negatives
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_delta = early_stopping_min_delta
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.is_hetero = graph_type == "heterogeneous"
@@ -625,7 +629,13 @@ class GNNTrainer:
             wandb.watch(model, log="all", log_freq=100)
 
         print(f"\nStarting training for {self.epochs} epochs...")
+        if self.early_stopping_patience is not None:
+            print(
+                f"  Early stopping: patience={self.early_stopping_patience}, min_delta={self.early_stopping_min_delta}"
+            )
+
         best_val_loss = float("inf")
+        epochs_without_improvement = 0
         batch_counter = 0
 
         for epoch in range(self.epochs):
@@ -658,10 +668,25 @@ class GNNTrainer:
                     )
                 wandb.log(log_dict)
 
-            if val_loss is not None and val_loss < best_val_loss:
-                torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                print(f"  ✓ New best val loss: {best_val_loss:.4f} -> {val_loss:.4f}")
-                best_val_loss = val_loss
+            if val_loss is not None:
+                if val_loss < best_val_loss - self.early_stopping_min_delta:
+                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
+                    print(
+                        f"  ✓ New best val loss: {best_val_loss:.4f} -> {val_loss:.4f}"
+                    )
+                    best_val_loss = val_loss
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    if self.early_stopping_patience is not None:
+                        print(
+                            f"  No improvement for {epochs_without_improvement}/{self.early_stopping_patience} epochs"
+                        )
+                        if epochs_without_improvement >= self.early_stopping_patience:
+                            print(
+                                f"\n⚡ Early stopping triggered after {epoch + 1} epochs"
+                            )
+                            break
 
             if (epoch + 1) % self.checkpoint_interval == 0:
                 path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}.pt")
