@@ -310,14 +310,21 @@ class GNNTrainer:
         if is_dual:
             batch_size = batch_data["batch_size"]
             x = batch_data["x"]
+            date_feature = batch_data.get("date_feature")
 
             # Query encoding for anchor nodes (no edges needed)
-            query_emb = model.encode_query(x[:batch_size])
+            query_emb = model.encode_query(
+                x[:batch_size],
+                date_feature=(
+                    date_feature[:batch_size] if date_feature is not None else None
+                ),
+            )
 
             # Document encoding for all nodes (with edges)
             doc_emb = model.encode_document(
                 x,
                 batch_data["masked_edge_index"],
+                date_feature=date_feature,
                 edge_attr=batch_data.get("masked_edge_attr"),
             )
 

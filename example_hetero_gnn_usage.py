@@ -1,5 +1,5 @@
 from gnn_trainers import GNNTrainer
-from models import HeteroGNN, CitationGNN, DualEncoderGNN
+from models import HeteroGNN, DualEncoderGNN
 from preprocessing.graph_builder import HeterogeneousGraphBuilder
 
 
@@ -60,14 +60,6 @@ def train_homo_example() -> None:
     print("=" * 80 + "\n")
 
     in_channels = 384
-
-    # Initialize homogeneous GNN
-    # model = CitationGNN(
-    #     input_dim=384,
-    #     output_dim=384,
-    #     num_layers=2,
-    #     dropout=0.3,
-    # )
 
     model = DualEncoderGNN(
         input_dim=in_channels,

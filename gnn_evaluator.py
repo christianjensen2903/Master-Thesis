@@ -188,6 +188,7 @@ class SimpleIncrementalEvaluator:
                 return self.gnn_model.encode_document(
                     self.graph_data.x,
                     filtered_edges,
+                    date_feature=getattr(self.graph_data, "date_feature", None),
                     edge_attr=filtered_attr,
                 )
             return self.gnn_model(
@@ -259,7 +260,13 @@ class SimpleIncrementalEvaluator:
         with torch.no_grad():
             # Use query encoder for queries if dual encoder
             if hasattr(self.gnn_model, "encode_query"):
-                return self.gnn_model.encode_query(x[:num_nodes])
+                date_feature = getattr(sub, "date_feature", None)
+                return self.gnn_model.encode_query(
+                    x[:num_nodes],
+                    date_feature=(
+                        date_feature[:num_nodes] if date_feature is not None else None
+                    ),
+                )
 
             # Fall back to full model with edge masking
             src, tgt = sub.edge_index
@@ -294,18 +301,20 @@ class SimpleIncrementalEvaluator:
                 embeddings = self.gnn_model(expanded_sub)["paragraph"]
             else:
                 edge_attr = getattr(expanded_sub, "edge_attr", None)
+                date_feature = getattr(expanded_sub, "date_feature", None)
                 # Use document encoder if dual encoder
                 if hasattr(self.gnn_model, "encode_document"):
                     embeddings = self.gnn_model.encode_document(
                         expanded_sub.x,
                         expanded_sub.edge_index,
+                        date_feature=date_feature,
                         edge_attr=edge_attr,
                     )
                 else:
                     embeddings = self.gnn_model(
                         expanded_sub.x,
                         expanded_sub.edge_index,
-                        date_feature=expanded_sub.date_feature,
+                        date_feature=date_feature,
                         edge_attr=edge_attr,
                     )
 

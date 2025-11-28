@@ -1,108 +1,47 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv, GATConv
 
 
-class CitationGNN(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int | None = None,
-        num_layers: int = 3,
-        dropout: float = 0.5,
-        date_feature_dim: int = 1,
-        num_heads: int = 4,
-        edge_dim: int = 16,
-        degree_embed_dim: int = 32,  # Embedding dim for degree features
-        num_edge_types: int = 3,
-    ):
+class SinusoidalDateEncoder(nn.Module):
+    """Encodes a normalized date scalar [0,1] using sinusoidal positional encoding."""
+
+    freqs: torch.Tensor
+
+    def __init__(self, embed_dim: int, max_freq: float = 10.0):
+        """
+        Args:
+            embed_dim: Dimension of the output embedding (must be even)
+            max_freq: Maximum frequency multiplier for the [0,1] input range
+        """
         super().__init__()
-        if output_dim is None:
-            output_dim = input_dim
+        assert embed_dim % 2 == 0, "embed_dim must be even"
+        self.embed_dim = embed_dim
 
-        self.num_heads = num_heads
+        # Log-spaced frequencies from 1 to max_freq (for [0,1] normalized input)
+        half_dim = embed_dim // 2
+        freqs = torch.linspace(0, math.log(max_freq), half_dim).exp() * (2 * math.pi)
+        self.register_buffer("freqs", freqs)
 
-        # Embed in-degree and out-degree counts
-        # Using a small MLP to project [in_degree, out_degree] -> degree_embed_dim
-        self.degree_encoder = nn.Sequential(
-            nn.Linear(2, degree_embed_dim),
-            nn.GELU(),
-            nn.Linear(degree_embed_dim, input_dim),
-        )
-
-        self.edge_type_embedding = nn.Embedding(num_edge_types, input_dim)
-
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
-
-        for i in range(num_layers):
-            # self.convs.append(SAGEConv(input_dim, input_dim, aggr="mean"))
-            self.convs.append(
-                GATConv(
-                    input_dim,
-                    input_dim // num_heads,
-                    heads=num_heads,
-                    add_self_loops=False,
-                )
-            )
-            self.norms.append(nn.LayerNorm(input_dim))
-
-        self.projector = nn.Sequential(
-            nn.Linear(output_dim, output_dim),
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-    def compute_degree_features(
-        self, edge_index: torch.Tensor, num_nodes: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute in-degree and out-degree for each node."""
-        # edge_index[0] = source nodes, edge_index[1] = target nodes
-        # in-degree: count of edges where node is target
-        # out-degree: count of edges where node is source
-
-        in_degree = torch.zeros(num_nodes, device=edge_index.device)
-        out_degree = torch.zeros(num_nodes, device=edge_index.device)
-
-        ones = torch.ones(edge_index.size(1), device=edge_index.device)
-        in_degree.scatter_add_(0, edge_index[1], ones)
-        out_degree.scatter_add_(0, edge_index[0], ones)
-
-        return in_degree, out_degree
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        date_feature: torch.Tensor,
-        edge_attr: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        num_nodes = x.size(0)
-
-        # Compute degree features
-        in_deg, out_deg = self.compute_degree_features(edge_index, num_nodes)
-
-        # Stack and optionally log-transform (helps with skewed distributions)
-        degree_feats = torch.stack([in_deg, out_deg], dim=1)  # [num_nodes, 2]
-        degree_feats = torch.log1p(degree_feats)  # log(1 + x) for stability
-
-        # Encode and add to node features
-        degree_embedding = self.degree_encoder(degree_feats)  # [num_nodes, input_dim]
-        x = x + degree_embedding
-
-        for i, conv in enumerate(self.convs):
-            edge_type_embedding = self.edge_type_embedding(edge_attr)
-            x = self.norms[i](x)
-            x_new = conv(x, edge_index, edge_attr=edge_type_embedding)
-            x_new = F.gelu(x_new)
-            x_new = self.dropout(x_new)
-            x = x + x_new
-
-        x = self.projector(x)
-        x = F.normalize(x, p=2, dim=1)
-
-        return x
+    def forward(self, dates: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            dates: Tensor of shape (N,) or (N, 1) with normalized dates in [0, 1]
+        Returns:
+            Tensor of shape (N, embed_dim) with sinusoidal embeddings
+        """
+        # Handle both (N,) and (N, 1) input shapes
+        if dates.dim() == 2:
+            dates = dates.squeeze(-1)
+        # dates: (N,) -> (N, 1)
+        dates = dates.unsqueeze(-1)
+        # Compute angles: (N, half_dim)
+        angles = dates * self.freqs
+        # Sinusoidal encoding: (N, embed_dim)
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
 
 
 class DualEncoderGNN(nn.Module):
@@ -125,6 +64,12 @@ class DualEncoderGNN(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.num_heads = num_heads
+
+        # Shared date encoder for both query and document
+        # Use same dim as input so we can add directly (preserves relative-time dot product)
+        self.date_encoder = SinusoidalDateEncoder(input_dim)
+        # Learnable scale - starts small so date is subtle, model learns to amplify
+        self.date_scale = nn.Parameter(torch.tensor(0.1))
 
         # Query encoder: MLP (no graph structure needed since edges are masked)
         self.query_encoder = nn.Sequential(
@@ -165,18 +110,36 @@ class DualEncoderGNN(nn.Module):
 
         return in_degree, out_degree
 
-    def encode_query(self, x: torch.Tensor) -> torch.Tensor:
+    def _encode_date(self, date_feature: torch.Tensor | None) -> torch.Tensor | None:
+        """Shared date encoding for both query and document."""
+        if date_feature is None:
+            return None
+        date_embed = self.date_encoder(date_feature)
+        # Scale but don't project - preserves cos(Δt) relative time in dot products
+        return self.date_scale * date_embed
+
+    def encode_query(
+        self, x: torch.Tensor, date_feature: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Encode query nodes using MLP (no graph structure)."""
-        # out = self.query_encoder(x)
+        # Add date embedding if provided
+        date_embed = self._encode_date(date_feature)
+        if date_embed is not None:
+            x = x + date_embed
         return F.normalize(x, p=2, dim=1)
 
     def encode_document(
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
+        date_feature: torch.Tensor | None = None,
         edge_attr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode document nodes using GNN (with graph structure)."""
+        # Add date embedding if provided
+        date_embed = self._encode_date(date_feature)
+        if date_embed is not None:
+            x = x + date_embed
 
         x = self.dropout(x)
 
@@ -187,7 +150,6 @@ class DualEncoderGNN(nn.Module):
             x_new = self.dropout(x_new)
             x = x + x_new
 
-        # x = self.doc_projector(x)
         return F.normalize(x, p=2, dim=1)
 
     def forward(
@@ -198,4 +160,4 @@ class DualEncoderGNN(nn.Module):
         edge_attr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass encoding all nodes as documents (for compatibility)."""
-        return self.encode_document(x, edge_index, edge_attr)
+        return self.encode_document(x, edge_index, date_feature, edge_attr)
