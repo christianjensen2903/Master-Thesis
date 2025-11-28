@@ -190,24 +190,27 @@ class BaseGraphBuilder(ABC):
 
         return selected_pars
 
-    def _extract_date_features(self, date_str: str | None) -> np.ndarray:
-        """Extract date feature: normalized days since 1954-01-01 (max 2025-12-31)."""
+    def _normalize_date(self, date_str: str | None) -> float:
+        """Normalize date to [0, 1] range based on days since 1954-01-01."""
         if not date_str:
-            # Return zero for missing dates
-            return np.array([0.0], dtype=np.float32)
+            return 0.0
         try:
             dt = datetime.fromisoformat(date_str)
-            # Calculate days since 1954-01-01
             base_date = datetime(1954, 1, 1)
             max_date = datetime(2025, 12, 31)
             days_since_base = (dt - base_date).days
             max_days = (max_date - base_date).days
-
-            # Normalize to [0, 1] range, clamping values outside range
-            time_norm = max(0.0, min(1.0, days_since_base / max_days))
-            return np.array([time_norm], dtype=np.float32)
+            return max(0.0, min(1.0, days_since_base / max_days))
         except (ValueError, AttributeError):
-            return np.array([0.0], dtype=np.float32)
+            return 0.0
+
+    def _extract_date_features(
+        self, date_str: str | None, application_date_str: str | None = None
+    ) -> np.ndarray:
+        """Extract date features: [judgment_date, application_date] normalized to [0, 1]."""
+        judgment_norm = self._normalize_date(date_str)
+        application_norm = self._normalize_date(application_date_str)
+        return np.array([judgment_norm, application_norm], dtype=np.float32)
 
     def _compute_relative_positions(self, selected_pars: list[int]) -> dict[int, float]:
         """Compute relative paragraph positions within each case.
@@ -456,8 +459,11 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             doc_emb = self.par_embeddings_doc[par_idx]
             query_emb = self.par_embeddings_query[par_idx]
 
-            # Store date feature separately instead of concatenating
-            date_feature = self._extract_date_features(meta.get("date"))
+            # Store date features separately: [judgment_date, application_date]
+            case_meta = meta.get("meta", {})
+            date_feature = self._extract_date_features(
+                meta.get("date"), case_meta.get("application_date")
+            )
 
             doc_embeddings_list.append(doc_emb)
             query_embeddings_list.append(query_emb)

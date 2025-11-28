@@ -104,20 +104,27 @@ class CaseLinkGraphBuilder:
         except (ValueError, AttributeError):
             return 0
 
-    def _extract_date_features(self, date_str: str | None) -> np.ndarray:
-        """Extract normalized date feature."""
+    def _normalize_date(self, date_str: str | None) -> float:
+        """Normalize date to [0, 1] range based on days since 1954-01-01."""
         if not date_str:
-            return np.array([0.0], dtype=np.float32)
+            return 0.0
         try:
             dt = datetime.fromisoformat(date_str)
             base_date = datetime(1954, 1, 1)
             max_date = datetime(2025, 12, 31)
             days_since_base = (dt - base_date).days
             max_days = (max_date - base_date).days
-            time_norm = max(0.0, min(1.0, days_since_base / max_days))
-            return np.array([time_norm], dtype=np.float32)
+            return max(0.0, min(1.0, days_since_base / max_days))
         except (ValueError, AttributeError):
-            return np.array([0.0], dtype=np.float32)
+            return 0.0
+
+    def _extract_date_features(
+        self, date_str: str | None, application_date_str: str | None = None
+    ) -> np.ndarray:
+        """Extract date features: [judgment_date, application_date] normalized to [0, 1]."""
+        judgment_norm = self._normalize_date(date_str)
+        application_norm = self._normalize_date(application_date_str)
+        return np.array([judgment_norm, application_norm], dtype=np.float32)
 
     def _filter_paragraphs(
         self, include_only_citing: bool, train_cutoff_year: int | None
@@ -374,7 +381,12 @@ class CaseLinkGraphBuilder:
             par_node_id_to_idx[node_id] = current_idx
             par_doc_embeddings_list.append(self.par_embeddings_doc[par_idx])
             par_query_embeddings_list.append(self.par_embeddings_query[par_idx])
-            par_date_features_list.append(self._extract_date_features(meta.get("date")))
+            case_meta = meta.get("meta", {})
+            par_date_features_list.append(
+                self._extract_date_features(
+                    meta.get("date"), case_meta.get("application_date")
+                )
+            )
             par_times.append(self._date_to_timestamp(meta.get("date")))
 
         num_par_nodes = len(par_node_id_to_idx)

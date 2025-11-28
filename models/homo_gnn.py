@@ -7,19 +7,21 @@ from torch_geometric.nn import SAGEConv, GATConv
 
 
 class SinusoidalDateEncoder(nn.Module):
-    """Encodes a normalized date scalar [0,1] using sinusoidal positional encoding."""
+    """Encodes normalized date scalars [0,1] using sinusoidal positional encoding."""
 
     freqs: torch.Tensor
 
-    def __init__(self, embed_dim: int, max_freq: float = 10.0):
+    def __init__(self, embed_dim: int, num_dates: int = 1, max_freq: float = 10.0):
         """
         Args:
-            embed_dim: Dimension of the output embedding (must be even)
+            embed_dim: Dimension of the output embedding per date (must be even)
+            num_dates: Number of date features to encode (e.g., 2 for judgment + application)
             max_freq: Maximum frequency multiplier for the [0,1] input range
         """
         super().__init__()
         assert embed_dim % 2 == 0, "embed_dim must be even"
         self.embed_dim = embed_dim
+        self.num_dates = num_dates
 
         # Log-spaced frequencies from 1 to max_freq (for [0,1] normalized input)
         half_dim = embed_dim // 2
@@ -29,19 +31,25 @@ class SinusoidalDateEncoder(nn.Module):
     def forward(self, dates: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            dates: Tensor of shape (N,) or (N, 1) with normalized dates in [0, 1]
+            dates: Tensor of shape (N,), (N, 1), or (N, num_dates) with normalized dates
         Returns:
-            Tensor of shape (N, embed_dim) with sinusoidal embeddings
+            Tensor of shape (N, embed_dim * num_dates) with sinusoidal embeddings
         """
-        # Handle both (N,) and (N, 1) input shapes
-        if dates.dim() == 2:
-            dates = dates.squeeze(-1)
-        # dates: (N,) -> (N, 1)
-        dates = dates.unsqueeze(-1)
-        # Compute angles: (N, half_dim)
-        angles = dates * self.freqs
-        # Sinusoidal encoding: (N, embed_dim)
-        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+        # Handle (N,) input shape -> (N, 1)
+        if dates.dim() == 1:
+            dates = dates.unsqueeze(-1)
+
+        # dates: (N, num_dates) -> process each date column
+        embeddings = []
+        for i in range(dates.size(-1)):
+            date_col = dates[:, i : i + 1]  # (N, 1)
+            angles = date_col * self.freqs  # (N, half_dim)
+            emb = torch.cat(
+                [torch.sin(angles), torch.cos(angles)], dim=-1
+            )  # (N, embed_dim)
+            embeddings.append(emb)
+
+        return torch.cat(embeddings, dim=-1)  # (N, embed_dim * num_dates)
 
 
 class DualEncoderGNN(nn.Module):
@@ -56,6 +64,7 @@ class DualEncoderGNN(nn.Module):
         num_heads: int = 4,
         degree_embed_dim: int = 32,
         num_edge_types: int = 3,
+        num_date_features: int = 2,
     ):
         super().__init__()
         if output_dim is None:
@@ -64,12 +73,14 @@ class DualEncoderGNN(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.num_heads = num_heads
+        self.num_date_features = num_date_features
 
-        # Shared date encoder for both query and document
-        # Use same dim as input so we can add directly (preserves relative-time dot product)
-        self.date_encoder = SinusoidalDateEncoder(input_dim)
-        # Learnable scale - starts small so date is subtle, model learns to amplify
-        self.date_scale = nn.Parameter(torch.tensor(0.1))
+        # Separate date encoder for each date type (judgment_date, application_date)
+        # Each encodes to input_dim to preserve relative-time property in dot products
+        self.date_encoder = SinusoidalDateEncoder(input_dim, num_dates=1)
+        # Learnable scales for each date type - starts small, model learns to amplify
+        # Initialize application_date scale to 0 since it's often missing
+        self.date_scales = nn.Parameter(torch.tensor([0.1, 0.0]))
 
         # Query encoder: MLP (no graph structure needed since edges are masked)
         self.query_encoder = nn.Sequential(
@@ -111,18 +122,40 @@ class DualEncoderGNN(nn.Module):
         return in_degree, out_degree
 
     def _encode_date(self, date_feature: torch.Tensor | None) -> torch.Tensor | None:
-        """Shared date encoding for both query and document."""
+        """Encode dates and sum them with learnable scales. Preserves relative-time property."""
         if date_feature is None:
             return None
-        date_embed = self.date_encoder(date_feature)
-        # Scale but don't project - preserves cos(Δt) relative time in dot products
-        return self.date_scale * date_embed
+
+        # Handle (N,) -> (N, 1) for backward compatibility
+        if date_feature.dim() == 1:
+            date_feature = date_feature.unsqueeze(-1)
+
+        # Encode each date separately and sum with scales
+        # This preserves cos(Δt) property in dot products for each date type
+        result = torch.zeros(
+            date_feature.size(0), self.input_dim, device=date_feature.device
+        )
+
+        for i in range(min(date_feature.size(-1), self.num_date_features)):
+            date_col = date_feature[:, i]  # (N,)
+            # Create mask for non-zero dates (0.0 = missing)
+            valid_mask = date_col > 0
+            if valid_mask.any():
+                # Encode only valid dates
+                date_emb = self.date_encoder(date_col)  # (N, input_dim)
+                # Apply scale and mask out missing dates
+                scaled_emb = self.date_scales[i] * date_emb
+                result = result + scaled_emb * valid_mask.unsqueeze(-1)
+
+        return result
 
     def _encode_node(
         self, x: torch.Tensor, date_feature: torch.Tensor | None = None
     ) -> torch.Tensor:
         if date_feature is not None:
-            x = x + self._encode_date(date_feature)
+            date_emb = self._encode_date(date_feature)
+            assert date_emb is not None  # Always true when date_feature is not None
+            x = x + date_emb
         return x
 
     def encode_query(
