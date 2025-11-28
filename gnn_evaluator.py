@@ -169,7 +169,7 @@ class SimpleIncrementalEvaluator:
             return self.gnn_model(modified)["paragraph"]
 
     def _compute_homo_embeddings(self, cutoff_ts: float) -> torch.Tensor:
-        """Compute embeddings for homogeneous graph."""
+        """Compute embeddings for homogeneous graph (document embeddings for corpus)."""
         edge_index = self.graph_data.edge_index
         times = self.graph_data.time
 
@@ -183,6 +183,13 @@ class SimpleIncrementalEvaluator:
         )
 
         with torch.no_grad():
+            # Use document encoder for corpus embeddings if dual encoder
+            if hasattr(self.gnn_model, "encode_document"):
+                return self.gnn_model.encode_document(
+                    self.graph_data.x,
+                    filtered_edges,
+                    edge_attr=filtered_attr,
+                )
             return self.gnn_model(
                 self.graph_data.x,
                 filtered_edges,
@@ -244,35 +251,39 @@ class SimpleIncrementalEvaluator:
 
     def _process_homo_subgraph(self, sub: Data, num_nodes: int) -> torch.Tensor:
         """Process homogeneous subgraph."""
-        src, tgt = sub.edge_index
-        edge_attr = getattr(sub, "edge_attr", None)
-
-        # Mask edges to prevent leakage
-        outgoing = src < num_nodes
-        incoming = tgt < num_nodes
-
-        if edge_attr is not None:
-            is_citation = (edge_attr == 0) | (edge_attr == 1)
-            leakage_mask = outgoing | (incoming & is_citation)
-        else:
-            leakage_mask = outgoing | incoming
-
-        masked_edges = sub.edge_index[:, ~leakage_mask]
-        masked_attr = edge_attr[~leakage_mask] if edge_attr is not None else None
-
         # Use query features for anchor nodes
         x = sub.x.clone()
         if hasattr(sub, "x_query"):
             x[:num_nodes] = sub.x_query[:num_nodes]
 
         with torch.no_grad():
+            # Use query encoder for queries if dual encoder
+            if hasattr(self.gnn_model, "encode_query"):
+                return self.gnn_model.encode_query(x[:num_nodes])
+
+            # Fall back to full model with edge masking
+            src, tgt = sub.edge_index
+            edge_attr = getattr(sub, "edge_attr", None)
+
+            outgoing = src < num_nodes
+            incoming = tgt < num_nodes
+
+            if edge_attr is not None:
+                is_citation = (edge_attr == 0) | (edge_attr == 1)
+                leakage_mask = outgoing | (incoming & is_citation)
+            else:
+                leakage_mask = outgoing | incoming
+
+            masked_edges = sub.edge_index[:, ~leakage_mask]
+            masked_attr = edge_attr[~leakage_mask] if edge_attr is not None else None
+
             embeddings = self.gnn_model(
                 x, masked_edges, date_feature=sub.date_feature, edge_attr=masked_attr
             )
-        return embeddings[:num_nodes]
+            return embeddings[:num_nodes]
 
     def _update_embeddings(self, sub: Data | HeteroData, sub_n_id: torch.Tensor):
-        """Update embeddings for nodes in the subgraph."""
+        """Update embeddings for nodes in the subgraph (document embeddings)."""
         loader = self._create_loader(
             ("paragraph", sub_n_id) if self.is_hetero else sub_n_id
         )
@@ -283,12 +294,20 @@ class SimpleIncrementalEvaluator:
                 embeddings = self.gnn_model(expanded_sub)["paragraph"]
             else:
                 edge_attr = getattr(expanded_sub, "edge_attr", None)
-                embeddings = self.gnn_model(
-                    expanded_sub.x,
-                    expanded_sub.edge_index,
-                    date_feature=expanded_sub.date_feature,
-                    edge_attr=edge_attr,
-                )
+                # Use document encoder if dual encoder
+                if hasattr(self.gnn_model, "encode_document"):
+                    embeddings = self.gnn_model.encode_document(
+                        expanded_sub.x,
+                        expanded_sub.edge_index,
+                        edge_attr=edge_attr,
+                    )
+                else:
+                    embeddings = self.gnn_model(
+                        expanded_sub.x,
+                        expanded_sub.edge_index,
+                        date_feature=expanded_sub.date_feature,
+                        edge_attr=edge_attr,
+                    )
 
         self.embeddings[sub_n_id] = embeddings[: len(sub_n_id)]
 
@@ -388,9 +407,9 @@ class SimpleIncrementalEvaluator:
 
 
 if __name__ == "__main__":
-    from models import CitationGNN
+    from models import DualEncoderGNN
 
-    model = CitationGNN(input_dim=384, output_dim=384, num_layers=2)
+    model = DualEncoderGNN(input_dim=384, output_dim=384, num_layers=1)
     model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
 
     evaluator = SimpleIncrementalEvaluator(
@@ -398,7 +417,7 @@ if __name__ == "__main__":
         preprocessed_dir="data/preprocessed",
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
-        k_hops=2,
+        k_hops=1,
         device="cuda" if torch.cuda.is_available() else "cpu",
         top_k=1000,
         graph_type="homogeneous",

@@ -292,11 +292,36 @@ class GNNTrainer:
             "all_times": getattr(batch, "time", None),
         }
 
-    def _get_embeddings(self, model: nn.Module, batch_data: dict) -> torch.Tensor:
-        """Get embeddings from the model."""
+    def _get_embeddings(
+        self, model: nn.Module, batch_data: dict
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Get embeddings from the model.
+
+        For dual encoders, returns (query_embeddings, doc_embeddings).
+        For single encoders, returns all embeddings.
+        """
         if self.is_hetero:
             out = model(batch_data["modified_batch"])
             return out["paragraph"] if isinstance(out, dict) else out
+
+        # Check if model is a dual encoder
+        is_dual = hasattr(model, "encode_query") and hasattr(model, "encode_document")
+
+        if is_dual:
+            batch_size = batch_data["batch_size"]
+            x = batch_data["x"]
+
+            # Query encoding for anchor nodes (no edges needed)
+            query_emb = model.encode_query(x[:batch_size])
+
+            # Document encoding for all nodes (with edges)
+            doc_emb = model.encode_document(
+                x,
+                batch_data["masked_edge_index"],
+                edge_attr=batch_data.get("masked_edge_attr"),
+            )
+
+            return query_emb, doc_emb
         else:
             out = model(
                 batch_data["x"],
@@ -353,7 +378,14 @@ class GNNTrainer:
         edge_attr = batch_data.get("edge_attr")
         all_times = batch_data.get("all_times")
 
-        embeddings = self._get_embeddings(model, batch_data)
+        emb_result = self._get_embeddings(model, batch_data)
+
+        # Check if dual encoder (returns tuple) or single encoder
+        is_dual = isinstance(emb_result, tuple)
+        if is_dual:
+            query_emb, doc_emb = emb_result
+        else:
+            doc_emb = emb_result
 
         # Find training pairs (only "cites" edges from anchor nodes)
         src, tgt = edge_index
@@ -366,7 +398,15 @@ class GNNTrainer:
             return (None, None) if return_stats else None
 
         batch_src, batch_tgt = src[input_mask], tgt[input_mask]
-        anchor_emb, positive_emb = embeddings[batch_src], embeddings[batch_tgt]
+
+        if is_dual:
+            # For dual encoder: query embeddings for anchors, doc embeddings for positives
+            # batch_src are indices into the first batch_size nodes (which are queries)
+            anchor_emb = query_emb[batch_src]
+            positive_emb = doc_emb[batch_tgt]
+        else:
+            anchor_emb = doc_emb[batch_src]
+            positive_emb = doc_emb[batch_tgt]
 
         pair_times = (
             (all_times[batch_src], all_times[batch_tgt])
@@ -378,7 +418,7 @@ class GNNTrainer:
         hard_negatives, hard_negative_times = None, None
         if self.num_hard_negatives > 0 and edge_attr is not None:
             hard_negatives, hard_negative_times = self._get_semantic_hard_negatives(
-                embeddings, edge_index, edge_attr, batch_size, batch_tgt, all_times
+                doc_emb, edge_index, edge_attr, batch_size, batch_tgt, all_times
             )
 
         result = info_nce_loss(
@@ -396,8 +436,10 @@ class GNNTrainer:
 
         if return_stats:
             loss, stats = result
-            stats["emb_norm_mean"] = embeddings.norm(dim=1).mean().item()
-            stats["emb_norm_std"] = embeddings.norm(dim=1).std().item()
+            stats["emb_norm_mean"] = doc_emb.norm(dim=1).mean().item()
+            stats["emb_norm_std"] = doc_emb.norm(dim=1).std().item()
+            if is_dual:
+                stats["query_emb_norm_mean"] = query_emb.norm(dim=1).mean().item()
             stats["num_pairs"] = input_mask.sum().item()
             return loss, stats
         return result

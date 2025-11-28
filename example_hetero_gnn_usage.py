@@ -1,5 +1,5 @@
 from gnn_trainers import GNNTrainer
-from models import HeteroGNN, CitationGNN
+from models import HeteroGNN, CitationGNN, DualEncoderGNN
 from preprocessing.graph_builder import HeterogeneousGraphBuilder
 
 
@@ -60,14 +60,19 @@ def train_homo_example() -> None:
     print("=" * 80 + "\n")
 
     in_channels = 384
-    hidden_dim = 384
-    out_channels = 384
 
     # Initialize homogeneous GNN
-    model = CitationGNN(
-        input_dim=384,
-        output_dim=384,
-        num_layers=2,
+    # model = CitationGNN(
+    #     input_dim=384,
+    #     output_dim=384,
+    #     num_layers=2,
+    #     dropout=0.3,
+    # )
+
+    model = DualEncoderGNN(
+        input_dim=in_channels,
+        output_dim=in_channels,
+        num_layers=1,
         dropout=0.3,
     )
 
@@ -85,9 +90,10 @@ def train_homo_example() -> None:
         graph_type="homogeneous",  # Use homogeneous graph
         wandb_project="homo-gnn-training",
         # gradient_clip_val=3.0,
-        eval_every_n_epochs=2,
+        eval_every_n_epochs=1,
         warmup_epochs=3,
-        include_semantic_edges=True,
+        include_semantic_edges=False,
+        early_stopping_patience=5,
     )
     # Train on paragraph pairs
     cutoff_year = 2018

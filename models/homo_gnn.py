@@ -167,8 +167,8 @@ class DualEncoderGNN(nn.Module):
 
     def encode_query(self, x: torch.Tensor) -> torch.Tensor:
         """Encode query nodes using MLP (no graph structure)."""
-        out = self.query_encoder(x)
-        return F.normalize(out, p=2, dim=1)
+        # out = self.query_encoder(x)
+        return F.normalize(x, p=2, dim=1)
 
     def encode_document(
         self,
@@ -178,6 +178,8 @@ class DualEncoderGNN(nn.Module):
     ) -> torch.Tensor:
         """Encode document nodes using GNN (with graph structure)."""
 
+        x = self.dropout(x)
+
         for i, conv in enumerate(self.convs):
             x = self.norms[i](x)
             x_new = conv(x, edge_index)
@@ -185,7 +187,7 @@ class DualEncoderGNN(nn.Module):
             x_new = self.dropout(x_new)
             x = x + x_new
 
-        x = self.doc_projector(x)
+        # x = self.doc_projector(x)
         return F.normalize(x, p=2, dim=1)
 
     def forward(
