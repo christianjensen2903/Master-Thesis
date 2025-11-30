@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv, GATConv
 
+from preprocessing.graph_builder import NUM_LANGUAGES
+
 
 class SinusoidalDateEncoder(nn.Module):
     """Encodes normalized date scalars [0,1] using sinusoidal positional encoding."""
@@ -53,7 +55,17 @@ class SinusoidalDateEncoder(nn.Module):
 
 
 class DualEncoderGNN(nn.Module):
-    """Dual encoder with separate query encoder (MLP) and document encoder (GNN)."""
+    """Dual encoder with separate query encoder (MLP) and document encoder (GNN).
+
+    Language is handled via concatenation: [content_emb, language_emb].
+    This is self-contained in the embedding space:
+
+        dot([content, lang], [content', lang']) = content_sim + lang_sim
+
+    The model learns language embeddings where:
+    - Same-language pairs have high dot product (homophily)
+    - Some languages may have higher norms (citation hubs)
+    """
 
     def __init__(
         self,
@@ -63,6 +75,8 @@ class DualEncoderGNN(nn.Module):
         dropout: float = 0.5,
         num_heads: int = 4,
         num_date_features: int = 3,
+        use_language: bool = True,
+        language_embed_dim: int = 16,
     ):
         super().__init__()
         if output_dim is None:
@@ -72,6 +86,8 @@ class DualEncoderGNN(nn.Module):
         self.output_dim = output_dim
         self.num_heads = num_heads
         self.num_date_features = num_date_features
+        self.use_language = use_language
+        self.language_embed_dim = language_embed_dim if use_language else 0
 
         # Separate date encoder for each date type (judgment_date, application_date)
         # Each encodes to input_dim to preserve relative-time property in dot products
@@ -79,6 +95,11 @@ class DualEncoderGNN(nn.Module):
         # Learnable scales for each date type - starts small, model learns to amplify
         # [judgment_date, application_date, duration]
         self.date_scales = nn.Parameter(torch.tensor([0.1, 0.0, 0.0]))
+
+        # Language embedding - concatenated to content (not added)
+        if use_language:
+            self.language_doc_proj = nn.Linear(NUM_LANGUAGES, language_embed_dim)
+            self.language_query_proj = nn.Linear(NUM_LANGUAGES, language_embed_dim)
 
         # Query encoder: MLP (no graph structure needed since edges are masked)
         self.query_encoder = nn.Sequential(
@@ -122,19 +143,30 @@ class DualEncoderGNN(nn.Module):
         return result
 
     def _encode_node(
-        self, x: torch.Tensor, date_feature: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        date_feature: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Encode content features with optional date encoding."""
         if date_feature is not None:
             date_emb = self._encode_date(date_feature)
-            assert date_emb is not None  # Always true when date_feature is not None
+            assert date_emb is not None
             x = x + date_emb
+
         return x
 
     def encode_query(
-        self, x: torch.Tensor, date_feature: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        date_feature: torch.Tensor | None = None,
+        language: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Encode query nodes using MLP (no graph structure)."""
+        """Encode query nodes. Returns [content, language] normalized."""
         x = self._encode_node(x, date_feature)
+        if self.use_language and language is not None:
+            # Language is already multihot encoded (N, NUM_LANGUAGES)
+            lang_emb = self.language_query_proj(language)  # (N, lang_dim)
+            x = torch.cat([x, lang_emb], dim=1)  # (N, content_dim + lang_dim)
         return F.normalize(x, p=2, dim=1)
 
     def encode_document(
@@ -143,18 +175,24 @@ class DualEncoderGNN(nn.Module):
         edge_index: torch.Tensor,
         date_feature: torch.Tensor | None = None,
         edge_attr: torch.Tensor | None = None,
+        language: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Encode document nodes using GNN (with graph structure)."""
+        """Encode document nodes using GNN. Returns [content, language] normalized."""
         x = self._encode_node(x, date_feature)
-
         x = self.dropout(x)
 
+        # GNN layers operate on content (384 dims)
         for i, conv in enumerate(self.convs):
             x = self.norms[i](x)
             x_new = conv(x, edge_index)
             x_new = F.gelu(x_new)
             x_new = self.dropout(x_new)
             x = x + x_new
+
+        if self.use_language and language is not None:
+            # Language is already multihot encoded (N, NUM_LANGUAGES)
+            lang_emb = self.language_doc_proj(language)  # (N, lang_dim)
+            x = torch.cat([x, lang_emb], dim=1)  # (N, content_dim + lang_dim)
 
         return F.normalize(x, p=2, dim=1)
 
@@ -164,6 +202,7 @@ class DualEncoderGNN(nn.Module):
         edge_index: torch.Tensor,
         date_feature: torch.Tensor | None = None,
         edge_attr: torch.Tensor | None = None,
+        language: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass encoding all nodes as documents (for compatibility)."""
-        return self.encode_document(x, edge_index, date_feature, edge_attr)
+        return self.encode_document(x, edge_index, date_feature, edge_attr, language)

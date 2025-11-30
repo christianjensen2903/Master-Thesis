@@ -288,6 +288,7 @@ class GNNTrainer:
             "masked_edge_attr": edge_attr[keep_mask] if edge_attr is not None else None,
             "edge_attr": edge_attr,
             "date_feature": batch.date_feature,
+            "language": getattr(batch, "language", None),
             "anchor_times": anchor_times,
             "all_times": getattr(batch, "time", None),
         }
@@ -311,6 +312,7 @@ class GNNTrainer:
             batch_size = batch_data["batch_size"]
             x = batch_data["x"]
             date_feature = batch_data.get("date_feature")
+            language = batch_data.get("language")
 
             # Query encoding for anchor nodes (no edges needed)
             query_emb = model.encode_query(
@@ -318,6 +320,7 @@ class GNNTrainer:
                 date_feature=(
                     date_feature[:batch_size] if date_feature is not None else None
                 ),
+                language=language[:batch_size] if language is not None else None,
             )
 
             # Document encoding for all nodes (with edges)
@@ -326,6 +329,7 @@ class GNNTrainer:
                 batch_data["masked_edge_index"],
                 date_feature=date_feature,
                 edge_attr=batch_data.get("masked_edge_attr"),
+                language=language,
             )
 
             return query_emb, doc_emb
@@ -335,6 +339,7 @@ class GNNTrainer:
                 batch_data["masked_edge_index"],
                 date_feature=batch_data.get("date_feature"),
                 edge_attr=batch_data.get("masked_edge_attr"),
+                language=batch_data.get("language"),
             )
             return out["paragraph"] if isinstance(out, dict) else out
 
@@ -448,6 +453,11 @@ class GNNTrainer:
             if is_dual:
                 stats["query_emb_norm_mean"] = query_emb.norm(dim=1).mean().item()
             stats["num_pairs"] = input_mask.sum().item()
+            # Log language embedding stats
+            if hasattr(model, "language_embedding") and model.use_language:
+                lang_emb_weight = model.language_embedding.embedding.weight
+                stats["lang_emb_norm_mean"] = lang_emb_weight.norm(dim=1).mean().item()
+                stats["lang_emb_norm_std"] = lang_emb_weight.norm(dim=1).std().item()
             return loss, stats
         return result
 

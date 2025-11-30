@@ -18,6 +18,72 @@ import faiss  # type: ignore
 # Set FAISS to single-threaded mode to avoid segmentation faults
 faiss.omp_set_num_threads(1)
 
+# Language vocabulary for authentic language feature
+# Based on frequency analysis of training data (year < 2018):
+# Only includes languages with >= 500 training samples (sufficient to learn embeddings)
+# UNKNOWN: missing, invalid, or rare languages (<500 samples: MLT, HRV)
+LANGUAGE_VOCAB = [
+    "UNKNOWN",  # Index 0: Unknown/None/rare languages
+    "MULTI",  # Index 1: Multi-language cases (~1.5%)
+    "DEU",  # Index 2: German (23.06%)
+    "FRA",  # Index 3: French (18.22%)
+    "ENG",  # Index 4: English (14.27%)
+    "NLD",  # Index 5: Dutch (10.87%)
+    "ITA",  # Index 6: Italian (10.43%)
+    "SPA",  # Index 7: Spanish (5.56%)
+    "ELL",  # Index 8: Greek (3.15%)
+    "POR",  # Index 9: Portuguese (2.12%)
+    "DAN",  # Index 10: Danish (1.68%)
+    "POL",  # Index 11: Polish (1.47%)
+    "SWE",  # Index 12: Swedish (1.37%)
+    "FIN",  # Index 13: Finnish (1.21%)
+    "HUN",  # Index 14: Hungarian (1.18%)
+    "BUL",  # Index 15: Bulgarian (0.93%)
+    "RON",  # Index 16: Romanian (0.60%)
+    "CES",  # Index 17: Czech (0.52%)
+    "LAV",  # Index 18: Latvian (0.51%)
+    "LIT",  # Index 19: Lithuanian (0.44%)
+    "SLK",  # Index 20: Slovak (0.35%)
+    "SLV",  # Index 21: Slovenian (0.25%)
+    "EST",  # Index 22: Estonian (0.24%)
+]
+LANGUAGE_TO_IDX = {lang: idx for idx, lang in enumerate(LANGUAGE_VOCAB)}
+NUM_LANGUAGES = len(LANGUAGE_VOCAB)
+
+
+def encode_language(authentic_language: list[str] | str | None) -> np.ndarray:
+    """Encode authentic language to multihot vector.
+
+    Args:
+        authentic_language: List of language codes, single code, or None
+
+    Returns:
+        Multihot vector of shape (NUM_LANGUAGES,) where UNKNOWN is all zeros
+    """
+    multihot = np.zeros(NUM_LANGUAGES, dtype=np.float32)
+
+    if authentic_language is None:
+        return multihot  # UNKNOWN: all zeros
+
+    # Handle string input (single language)
+    if isinstance(authentic_language, str):
+        idx = LANGUAGE_TO_IDX.get(authentic_language)
+        if idx is not None and idx != LANGUAGE_TO_IDX["UNKNOWN"]:
+            multihot[idx] = 1.0
+        return multihot
+
+    # Handle list input
+    if not authentic_language:  # Empty list
+        return multihot  # UNKNOWN: all zeros
+
+    # For multiple languages, set all of them to 1
+    for lang in authentic_language:
+        idx = LANGUAGE_TO_IDX.get(lang)
+        if idx is not None and idx != LANGUAGE_TO_IDX["UNKNOWN"]:
+            multihot[idx] = 1.0
+
+    return multihot
+
 
 class BaseGraphBuilder(ABC):
     """Base class for graph builders."""
@@ -459,6 +525,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         doc_embeddings_list = []
         query_embeddings_list = []
         date_features_list = []
+        language_multihot_list = []
         node_times = []
         node_ids = []
 
@@ -484,6 +551,10 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             query_embeddings_list.append(query_emb)
             date_features_list.append(date_feature)
             node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
+
+            # Add language multihot encoding
+            authentic_language = case_meta.get("authentic_language")
+            language_multihot_list.append(encode_language(authentic_language))
 
             # Add timestamp (convert date to Unix timestamp)
             date_str = meta.get("date")
@@ -551,11 +622,15 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
         node_times_tensor = torch.tensor(node_times, dtype=torch.long)
         node_ids_tensor = torch.stack(node_ids)
+        language_tensor = torch.tensor(
+            np.array(language_multihot_list), dtype=torch.float32
+        )
 
         graph_data = Data(
             x=x_doc,  # Default to document embeddings for backward compatibility
             x_query=x_query,  # Query embeddings (for citing paragraphs)
             date_feature=date_features,  # Date features stored separately
+            language=language_tensor,  # Language indices for embedding lookup
             edge_index=edge_index,
             edge_attr=edge_attr,  # Edge direction: 0=cites, 1=cited_by
             num_nodes=len(doc_embeddings_list),
@@ -583,6 +658,14 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         similar_count = (edge_attr == 2).sum().item()
         print(
             f"  Edge types: 0=cites ({cites_count}), 1=cited_by ({cited_by_count}), 2=similar_to ({similar_count})"
+        )
+
+        # Report language distribution
+        unknown_count = (language_tensor.sum(dim=1) == 0).sum().item()
+        multi_count = (language_tensor.sum(dim=1) > 1).sum().item()
+        known_count = len(language_multihot_list) - unknown_count - multi_count
+        print(
+            f"  Languages: {known_count} known, {multi_count} multi, {unknown_count} unknown"
         )
 
         return graph_data
@@ -629,6 +712,7 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         par_query_embeddings_list = []
         par_times = []
         par_node_ids = []
+        par_language_multihot_list = []
         case_to_par_indices: dict[str, list[int]] = defaultdict(list)
 
         for par_idx in selected_pars:
@@ -645,6 +729,11 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             # Convert date to Unix timestamp
             date_str = meta.get("date")
             par_times.append(self._date_to_timestamp(date_str))
+
+            # Add language multihot encoding
+            case_meta = meta.get("meta", {})
+            authentic_language = case_meta.get("authentic_language")
+            par_language_multihot_list.append(encode_language(authentic_language))
 
             # Track which paragraphs belong to each case
             celex = meta["celex"]
@@ -727,11 +816,15 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         x_doc = torch.tensor(np.array(par_doc_embeddings_list), dtype=torch.float32)
         x_query = torch.tensor(np.array(par_query_embeddings_list), dtype=torch.float32)
         par_node_ids_tensor = torch.stack(par_node_ids)
+        par_language_tensor = torch.tensor(
+            np.array(par_language_multihot_list), dtype=torch.float32
+        )
 
         data["paragraph"].x = x_doc  # Default to document embeddings
         data["paragraph"].x_query = x_query  # Query embeddings
         data["paragraph"].time = torch.tensor(par_times, dtype=torch.long)
         data["paragraph"].node_id_hash = par_node_ids_tensor  # Hashed node IDs
+        data["paragraph"].language = par_language_tensor  # Language indices
 
         data["article"].x = torch.tensor(
             np.array(art_embeddings_list), dtype=torch.float32

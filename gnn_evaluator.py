@@ -181,6 +181,7 @@ class SimpleIncrementalEvaluator:
             and self.graph_data.edge_attr is not None
             else None
         )
+        language = getattr(self.graph_data, "language", None)
 
         with torch.no_grad():
             # Use document encoder for corpus embeddings if dual encoder
@@ -190,12 +191,14 @@ class SimpleIncrementalEvaluator:
                     filtered_edges,
                     date_feature=getattr(self.graph_data, "date_feature", None),
                     edge_attr=filtered_attr,
+                    language=language,
                 )
             return self.gnn_model(
                 self.graph_data.x,
                 filtered_edges,
                 date_feature=self.graph_data.date_feature,
                 edge_attr=filtered_attr,
+                language=language,
             )
 
     def _get_graph_attrs(self) -> tuple:
@@ -261,16 +264,19 @@ class SimpleIncrementalEvaluator:
             # Use query encoder for queries if dual encoder
             if hasattr(self.gnn_model, "encode_query"):
                 date_feature = getattr(sub, "date_feature", None)
+                language = getattr(sub, "language", None)
                 return self.gnn_model.encode_query(
                     x[:num_nodes],
                     date_feature=(
                         date_feature[:num_nodes] if date_feature is not None else None
                     ),
+                    language=language[:num_nodes] if language is not None else None,
                 )
 
             # Fall back to full model with edge masking
             src, tgt = sub.edge_index
             edge_attr = getattr(sub, "edge_attr", None)
+            language = getattr(sub, "language", None)
 
             outgoing = src < num_nodes
             incoming = tgt < num_nodes
@@ -285,7 +291,11 @@ class SimpleIncrementalEvaluator:
             masked_attr = edge_attr[~leakage_mask] if edge_attr is not None else None
 
             embeddings = self.gnn_model(
-                x, masked_edges, date_feature=sub.date_feature, edge_attr=masked_attr
+                x,
+                masked_edges,
+                date_feature=sub.date_feature,
+                edge_attr=masked_attr,
+                language=language,
             )
             return embeddings[:num_nodes]
 
@@ -302,6 +312,7 @@ class SimpleIncrementalEvaluator:
             else:
                 edge_attr = getattr(expanded_sub, "edge_attr", None)
                 date_feature = getattr(expanded_sub, "date_feature", None)
+                language = getattr(expanded_sub, "language", None)
                 # Use document encoder if dual encoder
                 if hasattr(self.gnn_model, "encode_document"):
                     embeddings = self.gnn_model.encode_document(
@@ -309,6 +320,7 @@ class SimpleIncrementalEvaluator:
                         expanded_sub.edge_index,
                         date_feature=date_feature,
                         edge_attr=edge_attr,
+                        language=language,
                     )
                 else:
                     embeddings = self.gnn_model(
@@ -316,6 +328,7 @@ class SimpleIncrementalEvaluator:
                         expanded_sub.edge_index,
                         date_feature=date_feature,
                         edge_attr=edge_attr,
+                        language=language,
                     )
 
         self.embeddings[sub_n_id] = embeddings[: len(sub_n_id)]
@@ -362,8 +375,9 @@ class SimpleIncrementalEvaluator:
             sub = next(iter(self._create_loader(input_nodes)))
             query_emb = self._process_subgraph(sub, num_nodes)
 
-            # Compute similarities and rank
+            # Compute similarities (language is already in embeddings via concatenation)
             sim = torch.matmul(query_emb, cand_emb.T)
+
             k = min(self.top_k, sim.size(1))
             _, sim_ord = torch.topk(sim, k=k, dim=1, largest=True, sorted=True)
 
