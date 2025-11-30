@@ -529,6 +529,11 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         node_times = []
         node_ids = []
 
+        # Prepare case metadata lists if available
+        subject_matter_list = []
+        keywords_list = []
+        case_law_about_list = []
+
         for par_idx in selected_pars:
             meta = self.par_metadata[par_idx]
             node_id = meta["id"]
@@ -559,6 +564,30 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             # Add timestamp (convert date to Unix timestamp)
             date_str = meta.get("date")
             node_times.append(self._date_to_timestamp(date_str))
+
+            # Add case metadata embeddings (per-paragraph, from case level)
+            if self.has_case_metadata:
+                celex = meta["celex"]
+                if celex in self.celex_to_case_idx:
+                    case_idx = self.celex_to_case_idx[celex]
+                    subject_matter_list.append(
+                        self.case_embeddings_subject_matter[case_idx]
+                    )
+                    keywords_list.append(self.case_embeddings_keywords[case_idx])
+                    case_law_about_list.append(
+                        self.case_embeddings_case_law_about[case_idx]
+                    )
+                else:
+                    # Use zero vectors for missing cases
+                    subject_matter_list.append(
+                        np.zeros_like(self.case_embeddings_subject_matter[0])
+                    )
+                    keywords_list.append(
+                        np.zeros_like(self.case_embeddings_keywords[0])
+                    )
+                    case_law_about_list.append(
+                        np.zeros_like(self.case_embeddings_case_law_about[0])
+                    )
 
         # Build citation edges with edge attributes
         # Edge type 0 = "cites" (forward direction: src cites tgt)
@@ -626,6 +655,19 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             np.array(language_multihot_list), dtype=torch.float32
         )
 
+        # Prepare case metadata tensors
+        case_metadata_kwargs = {}
+        if self.has_case_metadata and subject_matter_list:
+            case_metadata_kwargs["subject_matter"] = torch.tensor(
+                np.array(subject_matter_list), dtype=torch.float32
+            )
+            case_metadata_kwargs["keywords"] = torch.tensor(
+                np.array(keywords_list), dtype=torch.float32
+            )
+            case_metadata_kwargs["case_law_about"] = torch.tensor(
+                np.array(case_law_about_list), dtype=torch.float32
+            )
+
         graph_data = Data(
             x=x_doc,  # Default to document embeddings for backward compatibility
             x_query=x_query,  # Query embeddings (for citing paragraphs)
@@ -636,18 +678,17 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             num_nodes=len(doc_embeddings_list),
             time=node_times_tensor,  # For temporal sampling
             node_id_hash=node_ids_tensor,  # Hashed node IDs
+            **case_metadata_kwargs,  # Case-level metadata embeddings
         )
 
         # Report embedding dimensions
-        if self.has_case_metadata:
+        if self.has_case_metadata and subject_matter_list:
             base_dim = self.par_embeddings_doc.shape[1]
-            metadata_dim = (
-                self.case_embeddings_subject_matter.shape[1]
-                + self.case_embeddings_keywords.shape[1]
-                + self.case_embeddings_case_law_about.shape[1]
-            )
+            print(f"Node embedding dim: {base_dim}")
             print(
-                f"Node embedding dim: {base_dim} (base) + {metadata_dim} (metadata) = {x_doc.shape[1]}"
+                f"  + Case metadata: subject_matter ({self.case_embeddings_subject_matter.shape[1]}), "
+                f"keywords ({self.case_embeddings_keywords.shape[1]}), "
+                f"case_law_about ({self.case_embeddings_case_law_about.shape[1]})"
             )
 
         print(

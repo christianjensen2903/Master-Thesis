@@ -291,6 +291,10 @@ class GNNTrainer:
             "language": getattr(batch, "language", None),
             "anchor_times": anchor_times,
             "all_times": getattr(batch, "time", None),
+            # Case metadata embeddings
+            "subject_matter": getattr(batch, "subject_matter", None),
+            "keywords": getattr(batch, "keywords", None),
+            "case_law_about": getattr(batch, "case_law_about", None),
         }
 
     def _get_embeddings(
@@ -313,6 +317,9 @@ class GNNTrainer:
             x = batch_data["x"]
             date_feature = batch_data.get("date_feature")
             language = batch_data.get("language")
+            subject_matter = batch_data.get("subject_matter")
+            keywords = batch_data.get("keywords")
+            case_law_about = batch_data.get("case_law_about")
 
             # Query encoding for anchor nodes (no edges needed)
             query_emb = model.encode_query(
@@ -321,6 +328,13 @@ class GNNTrainer:
                     date_feature[:batch_size] if date_feature is not None else None
                 ),
                 language=language[:batch_size] if language is not None else None,
+                subject_matter=(
+                    subject_matter[:batch_size] if subject_matter is not None else None
+                ),
+                keywords=keywords[:batch_size] if keywords is not None else None,
+                case_law_about=(
+                    case_law_about[:batch_size] if case_law_about is not None else None
+                ),
             )
 
             # Document encoding for all nodes (with edges)
@@ -330,6 +344,9 @@ class GNNTrainer:
                 date_feature=date_feature,
                 edge_attr=batch_data.get("masked_edge_attr"),
                 language=language,
+                subject_matter=subject_matter,
+                keywords=keywords,
+                case_law_about=case_law_about,
             )
 
             return query_emb, doc_emb
@@ -340,6 +357,9 @@ class GNNTrainer:
                 date_feature=batch_data.get("date_feature"),
                 edge_attr=batch_data.get("masked_edge_attr"),
                 language=batch_data.get("language"),
+                subject_matter=batch_data.get("subject_matter"),
+                keywords=batch_data.get("keywords"),
+                case_law_about=batch_data.get("case_law_about"),
             )
             return out["paragraph"] if isinstance(out, dict) else out
 

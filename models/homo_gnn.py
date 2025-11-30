@@ -8,6 +8,88 @@ from torch_geometric.nn import SAGEConv, GATConv
 from preprocessing.graph_builder import NUM_LANGUAGES
 
 
+class CaseMetadataEncoder(nn.Module):
+    """Encodes case-level metadata (subject_matter, keywords, case_law_about) via concatenation.
+
+    Projects each metadata type to a smaller dimension and concatenates them.
+    This keeps the original content embedding intact and adds metadata as separate dimensions,
+    similar to how language embeddings are handled.
+
+    Output: [content, metadata_proj] where metadata_proj is the concatenated projected metadata.
+    """
+
+    def __init__(
+        self,
+        metadata_dim: int = 384,
+        output_dim_per_type: int = 128,
+    ):
+        """
+        Args:
+            metadata_dim: Dimension of each input metadata embedding
+            output_dim_per_type: Output dimension for each metadata type (total = 3 * this)
+        """
+        super().__init__()
+        self.metadata_dim = metadata_dim
+        self.output_dim_per_type = output_dim_per_type
+        self.total_output_dim = output_dim_per_type * 3
+
+        # Project each metadata type to smaller dimension
+        self.subject_matter_proj = nn.Linear(metadata_dim, output_dim_per_type)
+        self.keywords_proj = nn.Linear(metadata_dim, output_dim_per_type)
+        self.case_law_about_proj = nn.Linear(metadata_dim, output_dim_per_type)
+
+    def forward(
+        self,
+        subject_matter: torch.Tensor | None = None,
+        keywords: torch.Tensor | None = None,
+        case_law_about: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """
+        Encode and concatenate metadata embeddings.
+
+        Args:
+            subject_matter: Subject matter embeddings (N, metadata_dim) or None
+            keywords: Keywords embeddings (N, metadata_dim) or None
+            case_law_about: Case law about embeddings (N, metadata_dim) or None
+
+        Returns:
+            Concatenated metadata embeddings (N, total_output_dim) or None if all inputs are None
+        """
+        if subject_matter is None and keywords is None and case_law_about is None:
+            return None
+
+        # Get batch size from first non-None input
+        batch_size = (
+            subject_matter
+            if subject_matter is not None
+            else keywords if keywords is not None else case_law_about
+        ).size(0)
+        device = (
+            subject_matter
+            if subject_matter is not None
+            else keywords if keywords is not None else case_law_about
+        ).device
+
+        # Project each metadata type (use zeros if None)
+        if subject_matter is not None:
+            sm_proj = self.subject_matter_proj(subject_matter)
+        else:
+            sm_proj = torch.zeros(batch_size, self.output_dim_per_type, device=device)
+
+        if keywords is not None:
+            kw_proj = self.keywords_proj(keywords)
+        else:
+            kw_proj = torch.zeros(batch_size, self.output_dim_per_type, device=device)
+
+        if case_law_about is not None:
+            cla_proj = self.case_law_about_proj(case_law_about)
+        else:
+            cla_proj = torch.zeros(batch_size, self.output_dim_per_type, device=device)
+
+        # Concatenate all projected metadata
+        return torch.cat([sm_proj, kw_proj, cla_proj], dim=-1)
+
+
 class SinusoidalDateEncoder(nn.Module):
     """Encodes normalized date scalars [0,1] using sinusoidal positional encoding."""
 
@@ -58,13 +140,13 @@ class DualEncoderGNN(nn.Module):
     """Dual encoder with separate query encoder (MLP) and document encoder (GNN).
 
     Language is handled via concatenation: [content_emb, language_emb].
-    This is self-contained in the embedding space:
+    Case metadata (subject_matter, keywords, case_law_about) is also concatenated.
 
-        dot([content, lang], [content', lang']) = content_sim + lang_sim
+    Final embedding structure: [content, language, metadata]
 
-    The model learns language embeddings where:
-    - Same-language pairs have high dot product (homophily)
-    - Some languages may have higher norms (citation hubs)
+    This concatenation approach preserves the original content signal while
+    adding auxiliary information as separate dimensions. The dot product
+    becomes: content_sim + lang_sim + metadata_sim
     """
 
     def __init__(
@@ -77,6 +159,9 @@ class DualEncoderGNN(nn.Module):
         num_date_features: int = 3,
         use_language: bool = True,
         language_embed_dim: int = 16,
+        use_case_metadata: bool = True,
+        metadata_dim: int = 384,
+        metadata_output_dim_per_type: int = 128,
     ):
         super().__init__()
         if output_dim is None:
@@ -88,6 +173,10 @@ class DualEncoderGNN(nn.Module):
         self.num_date_features = num_date_features
         self.use_language = use_language
         self.language_embed_dim = language_embed_dim if use_language else 0
+        self.use_case_metadata = use_case_metadata
+        self.metadata_output_dim = (
+            metadata_output_dim_per_type * 3 if use_case_metadata else 0
+        )
 
         # Separate date encoder for each date type (judgment_date, application_date)
         # Each encodes to input_dim to preserve relative-time property in dot products
@@ -100,6 +189,13 @@ class DualEncoderGNN(nn.Module):
         if use_language:
             self.language_doc_proj = nn.Linear(NUM_LANGUAGES, language_embed_dim)
             self.language_query_proj = nn.Linear(NUM_LANGUAGES, language_embed_dim)
+
+        # Case metadata encoder - projects and concatenates metadata
+        if use_case_metadata:
+            self.metadata_encoder = CaseMetadataEncoder(
+                metadata_dim=metadata_dim,
+                output_dim_per_type=metadata_output_dim_per_type,
+            )
 
         # Query encoder: MLP (no graph structure needed since edges are masked)
         self.query_encoder = nn.Sequential(
@@ -160,13 +256,39 @@ class DualEncoderGNN(nn.Module):
         x: torch.Tensor,
         date_feature: torch.Tensor | None = None,
         language: torch.Tensor | None = None,
+        subject_matter: torch.Tensor | None = None,
+        keywords: torch.Tensor | None = None,
+        case_law_about: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Encode query nodes. Returns [content, language] normalized."""
+        """Encode query nodes. Returns [content, language, metadata] normalized."""
         x = self._encode_node(x, date_feature)
+
+        # Concatenate language embedding
         if self.use_language and language is not None:
-            # Language is already multihot encoded (N, NUM_LANGUAGES)
             lang_emb = self.language_query_proj(language)  # (N, lang_dim)
-            x = torch.cat([x, lang_emb], dim=1)  # (N, content_dim + lang_dim)
+            x = torch.cat([x, lang_emb], dim=1)
+
+        # Concatenate metadata embedding (keeps content intact)
+        if self.use_case_metadata:
+            metadata_emb = self.metadata_encoder(
+                subject_matter=subject_matter,
+                keywords=keywords,
+                case_law_about=case_law_about,
+            )
+            if metadata_emb is not None:
+                x = torch.cat([x, metadata_emb], dim=1)
+            else:
+                # Pad with zeros if no metadata
+                x = torch.cat(
+                    [
+                        x,
+                        torch.zeros(
+                            x.size(0), self.metadata_output_dim, device=x.device
+                        ),
+                    ],
+                    dim=1,
+                )
+
         return F.normalize(x, p=2, dim=1)
 
     def encode_document(
@@ -176,12 +298,15 @@ class DualEncoderGNN(nn.Module):
         date_feature: torch.Tensor | None = None,
         edge_attr: torch.Tensor | None = None,
         language: torch.Tensor | None = None,
+        subject_matter: torch.Tensor | None = None,
+        keywords: torch.Tensor | None = None,
+        case_law_about: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Encode document nodes using GNN. Returns [content, language] normalized."""
+        """Encode document nodes using GNN. Returns [content, language, metadata] normalized."""
         x = self._encode_node(x, date_feature)
         x = self.dropout(x)
 
-        # GNN layers operate on content (384 dims)
+        # GNN layers operate on content only (preserves semantic signal)
         for i, conv in enumerate(self.convs):
             x = self.norms[i](x)
             x_new = conv(x, edge_index)
@@ -189,10 +314,31 @@ class DualEncoderGNN(nn.Module):
             x_new = self.dropout(x_new)
             x = x + x_new
 
+        # Concatenate language embedding after GNN
         if self.use_language and language is not None:
-            # Language is already multihot encoded (N, NUM_LANGUAGES)
             lang_emb = self.language_doc_proj(language)  # (N, lang_dim)
-            x = torch.cat([x, lang_emb], dim=1)  # (N, content_dim + lang_dim)
+            x = torch.cat([x, lang_emb], dim=1)
+
+        # Concatenate metadata embedding after GNN (keeps content intact)
+        if self.use_case_metadata:
+            metadata_emb = self.metadata_encoder(
+                subject_matter=subject_matter,
+                keywords=keywords,
+                case_law_about=case_law_about,
+            )
+            if metadata_emb is not None:
+                x = torch.cat([x, metadata_emb], dim=1)
+            else:
+                # Pad with zeros if no metadata
+                x = torch.cat(
+                    [
+                        x,
+                        torch.zeros(
+                            x.size(0), self.metadata_output_dim, device=x.device
+                        ),
+                    ],
+                    dim=1,
+                )
 
         return F.normalize(x, p=2, dim=1)
 
@@ -203,6 +349,18 @@ class DualEncoderGNN(nn.Module):
         date_feature: torch.Tensor | None = None,
         edge_attr: torch.Tensor | None = None,
         language: torch.Tensor | None = None,
+        subject_matter: torch.Tensor | None = None,
+        keywords: torch.Tensor | None = None,
+        case_law_about: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass encoding all nodes as documents (for compatibility)."""
-        return self.encode_document(x, edge_index, date_feature, edge_attr, language)
+        return self.encode_document(
+            x,
+            edge_index,
+            date_feature,
+            edge_attr,
+            language,
+            subject_matter,
+            keywords,
+            case_law_about,
+        )
