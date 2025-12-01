@@ -8,6 +8,88 @@ from torch_geometric.nn import SAGEConv, GATConv
 from preprocessing.graph_builder import NUM_LANGUAGES
 
 
+class CrossAttentionFusion(nn.Module):
+    """Fuses multiple embeddings using multi-head cross-attention.
+
+    Each embedding attends to all other embeddings, creating rich
+    contextualized representations before final fusion.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_embeddings: int = 4,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_embeddings = num_embeddings
+        self.num_heads = num_heads
+
+        # Project each embedding to output_dim
+        self.input_projs = nn.ModuleList(
+            [nn.Linear(input_dim, output_dim) for _ in range(num_embeddings)]
+        )
+
+        # Multi-head cross-attention: each embedding attends to all others
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=output_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        # Layer norm and feedforward for post-attention processing
+        self.norm1 = nn.LayerNorm(output_dim)
+        self.norm2 = nn.LayerNorm(output_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(output_dim, output_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(output_dim * 2, output_dim),
+            nn.Dropout(dropout),
+        )
+
+        # Final fusion: aggregate attended embeddings
+        self.fusion_weights = nn.Parameter(torch.ones(num_embeddings) / num_embeddings)
+
+    def forward(self, *embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            *embeddings: Variable number of embeddings, each (N, input_dim)
+        Returns:
+            Fused embedding (N, output_dim)
+        """
+        assert len(embeddings) == self.num_embeddings
+
+        # Project all embeddings: list of (N, output_dim)
+        projected = [proj(emb) for proj, emb in zip(self.input_projs, embeddings)]
+
+        # Stack as sequence: (N, num_embeddings, output_dim)
+        stacked = torch.stack(projected, dim=1)
+
+        # Cross-attention: each position attends to all positions
+        attended, _ = self.cross_attention(stacked, stacked, stacked)
+        attended = self.norm1(stacked + attended)
+
+        # Feedforward with residual
+        ffn_out = self.ffn(attended)
+        attended = self.norm2(attended + ffn_out)
+
+        # Weighted fusion of attended embeddings
+        weights = F.softmax(self.fusion_weights, dim=0)
+        output = torch.einsum("nkd,k->nd", attended, weights)
+
+        return output
+
+    def get_weights(self, *embeddings: torch.Tensor) -> torch.Tensor:
+        """Return the fusion weights (for analysis/logging)."""
+        return F.softmax(self.fusion_weights, dim=0).detach()
+
+
 class WeightedEmbeddingFusion(nn.Module):
     """Fuses multiple embeddings using learned weights.
 
@@ -173,7 +255,7 @@ class DualEncoderGNN(nn.Module):
         use_language: bool = True,
         language_embed_dim: int = 16,
         use_case_metadata: bool = True,
-        fusion_mode: str = "attention",
+        fusion_mode: str = "cross_attention",
     ):
         super().__init__()
         if output_dim is None:
@@ -195,14 +277,22 @@ class DualEncoderGNN(nn.Module):
         # [judgment_date, application_date, duration]
         self.date_scales = nn.Parameter(torch.tensor([0.1, 0.0, 0.0]))
 
-        # Weighted fusion: output = w1*text + w2*keywords + w3*subject + w4*caselaw
-        # Preserves embedding space structure since all inputs from same encoder
-        self.embedding_fusion = WeightedEmbeddingFusion(
-            input_dim=input_dim,
-            output_dim=output_dim,
-            num_embeddings=4,
-            mode=fusion_mode,
-        )
+        # Embedding fusion: combine text, keywords, subject, caselaw
+        if fusion_mode == "cross_attention":
+            self.embedding_fusion = CrossAttentionFusion(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                num_embeddings=4,
+                num_heads=num_heads,
+                dropout=dropout,
+            )
+        else:
+            self.embedding_fusion = WeightedEmbeddingFusion(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                num_embeddings=4,
+                mode=fusion_mode,
+            )
 
         # Language embedding - concatenated to content (not added)
         if use_language:
