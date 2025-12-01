@@ -88,9 +88,10 @@ class CaseLinkEvaluator:
         top_k: int = 10000,
         # CaseLink-specific
         include_semantic_edges: bool = True,
-        semantic_threshold: float = 0.7,
+        semantic_threshold: float = 0.3,  # Lower threshold for TF-IDF
         semantic_max_neighbors: int = 10,
         include_article_nodes: bool = True,
+        judgments_path: str = "data/judgments_cleaned.json",
     ):
         self.gnn_model = gnn_model
         self.preprocessed_dir = preprocessed_dir
@@ -104,6 +105,7 @@ class CaseLinkEvaluator:
         self.semantic_threshold = semantic_threshold
         self.semantic_max_neighbors = semantic_max_neighbors
         self.include_article_nodes = include_article_nodes
+        self.judgments_path = judgments_path
 
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,7 +119,9 @@ class CaseLinkEvaluator:
         print(f"  include_article_nodes: {include_article_nodes}")
 
         # Build graph using CaseLinkGraphBuilder
-        self.builder = CaseLinkGraphBuilder(preprocessed_dir)
+        self.builder = CaseLinkGraphBuilder(
+            preprocessed_dir, judgments_path=judgments_path
+        )
         self.graph_data = self.builder.build_graph(
             include_only_citing=True,  # Only paragraphs involved in citations
             include_semantic_edges=include_semantic_edges,
@@ -404,8 +408,8 @@ if __name__ == "__main__":
         hidden_dim=384,
         output_dim=384,
         num_layers=1,
-        num_edge_types=5,
-        use_attention=True,
+        dropout=0.2,
+        num_heads=1,
     )
 
     # Load trained weights if available

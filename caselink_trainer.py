@@ -60,9 +60,10 @@ class CaseLinkTrainer:
         # CaseLink-specific
         degree_reg_weight: float = 0.1,
         include_semantic_edges: bool = True,
-        semantic_threshold: float = 0.7,
+        semantic_threshold: float = 0.3,  # Lower threshold for TF-IDF
         semantic_max_neighbors: int = 10,
         include_article_nodes: bool = True,
+        judgments_path: str = "data/judgments_cleaned.json",
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -86,6 +87,7 @@ class CaseLinkTrainer:
         self.semantic_threshold = semantic_threshold
         self.semantic_max_neighbors = semantic_max_neighbors
         self.include_article_nodes = include_article_nodes
+        self.judgments_path = judgments_path
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -390,7 +392,9 @@ class CaseLinkTrainer:
         print("=" * 80)
 
         # Build training graph
-        builder = CaseLinkGraphBuilder(self.preprocessed_dir)
+        builder = CaseLinkGraphBuilder(
+            self.preprocessed_dir, judgments_path=self.judgments_path
+        )
         train_graph = builder.build_graph(
             train_cutoff_year=train_cutoff_year,
             include_only_citing=True,
