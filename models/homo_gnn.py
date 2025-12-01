@@ -321,14 +321,6 @@ class DualEncoderGNN(nn.Module):
             self.language_doc_proj = nn.Linear(NUM_LANGUAGES, language_embed_dim)
             self.language_query_proj = nn.Linear(NUM_LANGUAGES, language_embed_dim)
 
-        # Query encoder: MLP (no graph structure needed since edges are masked)
-        self.query_encoder = nn.Sequential(
-            nn.Linear(output_dim, output_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(output_dim, output_dim),
-        )
-
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
@@ -336,7 +328,6 @@ class DualEncoderGNN(nn.Module):
             self.convs.append(SAGEConv(output_dim, output_dim, aggr="mean"))
             self.norms.append(nn.LayerNorm(output_dim))
 
-        self.doc_projector = nn.Linear(output_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
 
     def _encode_date(self, date_feature: torch.Tensor | None) -> torch.Tensor | None:

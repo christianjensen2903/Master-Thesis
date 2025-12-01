@@ -192,6 +192,9 @@ class SimpleIncrementalEvaluator:
                     date_feature=getattr(self.graph_data, "date_feature", None),
                     edge_attr=filtered_attr,
                     language=language,
+                    subject_matter=getattr(self.graph_data, "subject_matter", None),
+                    keywords=getattr(self.graph_data, "keywords", None),
+                    case_law_about=getattr(self.graph_data, "case_law_about", None),
                 )
             return self.gnn_model(
                 self.graph_data.x,
@@ -265,12 +268,26 @@ class SimpleIncrementalEvaluator:
             if hasattr(self.gnn_model, "encode_query"):
                 date_feature = getattr(sub, "date_feature", None)
                 language = getattr(sub, "language", None)
+                subject_matter = getattr(sub, "subject_matter", None)
+                keywords = getattr(sub, "keywords", None)
+                case_law_about = getattr(sub, "case_law_about", None)
                 return self.gnn_model.encode_query(
                     x[:num_nodes],
                     date_feature=(
                         date_feature[:num_nodes] if date_feature is not None else None
                     ),
                     language=language[:num_nodes] if language is not None else None,
+                    subject_matter=(
+                        subject_matter[:num_nodes]
+                        if subject_matter is not None
+                        else None
+                    ),
+                    keywords=keywords[:num_nodes] if keywords is not None else None,
+                    case_law_about=(
+                        case_law_about[:num_nodes]
+                        if case_law_about is not None
+                        else None
+                    ),
                 )
 
             # Fall back to full model with edge masking
@@ -313,6 +330,9 @@ class SimpleIncrementalEvaluator:
                 edge_attr = getattr(expanded_sub, "edge_attr", None)
                 date_feature = getattr(expanded_sub, "date_feature", None)
                 language = getattr(expanded_sub, "language", None)
+                subject_matter = getattr(expanded_sub, "subject_matter", None)
+                keywords = getattr(expanded_sub, "keywords", None)
+                case_law_about = getattr(expanded_sub, "case_law_about", None)
                 # Use document encoder if dual encoder
                 if hasattr(self.gnn_model, "encode_document"):
                     embeddings = self.gnn_model.encode_document(
@@ -321,6 +341,9 @@ class SimpleIncrementalEvaluator:
                         date_feature=date_feature,
                         edge_attr=edge_attr,
                         language=language,
+                        subject_matter=subject_matter,
+                        keywords=keywords,
+                        case_law_about=case_law_about,
                     )
                 else:
                     embeddings = self.gnn_model(
@@ -432,7 +455,9 @@ class SimpleIncrementalEvaluator:
 if __name__ == "__main__":
     from models import DualEncoderGNN
 
-    model = DualEncoderGNN(input_dim=384, output_dim=384, num_layers=1)
+    layers = 1
+
+    model = DualEncoderGNN(input_dim=384, output_dim=384, num_layers=layers)
     model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
 
     evaluator = SimpleIncrementalEvaluator(
@@ -440,7 +465,7 @@ if __name__ == "__main__":
         preprocessed_dir="data/preprocessed",
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
-        k_hops=1,
+        k_hops=layers,
         device="cuda" if torch.cuda.is_available() else "cpu",
         top_k=1000,
         graph_type="homogeneous",

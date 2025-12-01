@@ -61,10 +61,12 @@ def train_homo_example() -> None:
 
     in_channels = 384
 
+    layers = 1
+
     model = DualEncoderGNN(
         input_dim=in_channels,
         output_dim=in_channels,
-        num_layers=1,
+        num_layers=layers,
         dropout=0.3,
     )
 
@@ -72,12 +74,12 @@ def train_homo_example() -> None:
     trainer = GNNTrainer(
         preprocessed_dir="data/preprocessed",
         output_path="checkpoints/homo_gnn",
-        batch_size=2048,
+        batch_size=512,
         epochs=50,
         learning_rate=1e-3,
-        weight_decay=5e-4,
+        weight_decay=1e-3,
         temperature=0.05,
-        num_hops=2,
+        num_hops=layers,
         checkpoint_interval=10,
         graph_type="homogeneous",  # Use homogeneous graph
         wandb_project="homo-gnn-training",
