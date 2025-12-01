@@ -78,24 +78,14 @@ def info_nce_loss(
     positive_times: torch.Tensor | None = None,
     anchor_indices: torch.Tensor | None = None,
     positive_indices: torch.Tensor | None = None,
-    hard_negatives: torch.Tensor | None = None,
-    hard_negative_times: torch.Tensor | None = None,
     return_stats: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict]:
     """In-batch contrastive loss with temporal filtering and false negative masking."""
     sim_matrix = torch.mm(anchor, positive.t()) / temperature
     batch_size = sim_matrix.size(0)
 
-    # Add hard negatives if provided
-    num_hard_neg = 0
-    if hard_negatives is not None and hard_negatives.size(0) > 0:
-        num_hard_neg = hard_negatives.size(0)
-        hard_neg_sim = torch.mm(anchor, hard_negatives.t()) / temperature
-        sim_matrix = torch.cat([sim_matrix, hard_neg_sim], dim=1)
-
-    total_cols = sim_matrix.size(1)
     diagonal_mask = torch.eye(
-        batch_size, total_cols, dtype=torch.bool, device=sim_matrix.device
+        batch_size, batch_size, dtype=torch.bool, device=sim_matrix.device
     )
 
     # Mask false negatives (same source pointing to same target)
@@ -104,36 +94,11 @@ def info_nce_loss(
         same_target = positive_indices.unsqueeze(1) == positive_indices.unsqueeze(0)
         fn_mask = (same_anchor.float() @ same_target.float()) > 0
 
-        if num_hard_neg > 0:
-            fn_mask = torch.cat(
-                [
-                    fn_mask,
-                    torch.zeros(
-                        batch_size,
-                        num_hard_neg,
-                        dtype=torch.bool,
-                        device=sim_matrix.device,
-                    ),
-                ],
-                dim=1,
-            )
-
         sim_matrix = sim_matrix.masked_fill(fn_mask & ~diagonal_mask, float("-inf"))
 
     # Apply temporal masking
     if anchor_times is not None and positive_times is not None:
         time_mask = positive_times.unsqueeze(0) < anchor_times.unsqueeze(1)
-
-        if num_hard_neg > 0:
-            if hard_negative_times is not None:
-                hard_time_mask = hard_negative_times.unsqueeze(
-                    0
-                ) < anchor_times.unsqueeze(1)
-            else:
-                hard_time_mask = torch.ones(
-                    batch_size, num_hard_neg, dtype=torch.bool, device=sim_matrix.device
-                )
-            time_mask = torch.cat([time_mask, hard_time_mask], dim=1)
 
         sim_matrix = sim_matrix.masked_fill(~(time_mask | diagonal_mask), float("-inf"))
 
@@ -144,7 +109,6 @@ def info_nce_loss(
         return loss
 
     stats = compute_contrastive_stats(sim_matrix, diagonal_mask)
-    stats["num_hard_negatives"] = num_hard_neg
     return loss, stats
 
 
@@ -167,10 +131,6 @@ class GNNTrainer:
         eval_every_n_epochs: int = 1,
         gradient_clip_val: float | None = None,
         log_every_n_batches: int = 100,
-        include_semantic_edges: bool = False,
-        semantic_threshold: float = 0.7,
-        semantic_max_neighbors: int = 10,
-        num_hard_negatives: int = 0,
         early_stopping_patience: int | None = None,
         early_stopping_min_delta: float = 0.0,
     ):
@@ -190,10 +150,6 @@ class GNNTrainer:
         self.eval_every_n_epochs = eval_every_n_epochs
         self.gradient_clip_val = gradient_clip_val
         self.log_every_n_batches = log_every_n_batches
-        self.include_semantic_edges = include_semantic_edges
-        self.semantic_threshold = semantic_threshold
-        self.semantic_max_neighbors = semantic_max_neighbors
-        self.num_hard_negatives = num_hard_negatives
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_min_delta = early_stopping_min_delta
 
@@ -202,12 +158,6 @@ class GNNTrainer:
 
         print(f"Using device: {self.device}")
         print(f"Using graph type: {self.graph_type}")
-        if include_semantic_edges and not self.is_hetero:
-            print(
-                f"  Semantic edges: threshold={semantic_threshold}, max_neighbors={semantic_max_neighbors}"
-            )
-        if num_hard_negatives > 0:
-            print(f"  Hard negatives: max={num_hard_negatives}")
 
     def _process_hetero_batch(self, batch: HeteroData) -> dict | None:
         """Process a heterogeneous batch."""
@@ -363,41 +313,6 @@ class GNNTrainer:
             )
             return out["paragraph"] if isinstance(out, dict) else out
 
-    def _get_semantic_hard_negatives(
-        self,
-        embeddings: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
-        batch_size: int,
-        positive_indices: torch.Tensor,
-        all_times: torch.Tensor | None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Get hard negatives from semantic similarity edges (edge_attr == 2)."""
-        src, tgt = edge_index
-        valid_mask = (edge_attr == 2) & (src < batch_size)
-
-        if not valid_mask.any():
-            return None, None
-
-        semantic_targets = tgt[valid_mask]
-        semantic_targets = semantic_targets[
-            ~torch.isin(semantic_targets, positive_indices.unique())
-        ]
-
-        if len(semantic_targets) == 0:
-            return None, None
-
-        unique_indices = semantic_targets.unique()
-        if len(unique_indices) > self.num_hard_negatives:
-            unique_indices = unique_indices[: self.num_hard_negatives]
-
-        hard_negatives = embeddings[unique_indices]
-        hard_negative_times = (
-            all_times[unique_indices] if all_times is not None else None
-        )
-
-        return hard_negatives, hard_negative_times
-
     def _compute_loss(
         self,
         model: nn.Module,
@@ -446,13 +361,6 @@ class GNNTrainer:
             else (None, None)
         )
 
-        # Get hard negatives if enabled
-        hard_negatives, hard_negative_times = None, None
-        if self.num_hard_negatives > 0 and edge_attr is not None:
-            hard_negatives, hard_negative_times = self._get_semantic_hard_negatives(
-                doc_emb, edge_index, edge_attr, batch_size, batch_tgt, all_times
-            )
-
         result = info_nce_loss(
             anchor_emb,
             positive_emb,
@@ -461,8 +369,6 @@ class GNNTrainer:
             positive_times=pair_times[1],
             anchor_indices=batch_src,
             positive_indices=batch_tgt,
-            hard_negatives=hard_negatives,
-            hard_negative_times=hard_negative_times,
             return_stats=return_stats,
         )
 
@@ -563,9 +469,6 @@ class GNNTrainer:
                 train_cutoff_year=cutoff_year,
                 include_only_citing=True,
                 add_reverse_edges=True,
-                include_semantic_edges=self.include_semantic_edges,
-                semantic_threshold=self.semantic_threshold,
-                semantic_max_neighbors=self.semantic_max_neighbors,
             )
             return graph.to(self.device)
 

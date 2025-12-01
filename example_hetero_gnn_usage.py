@@ -86,7 +86,6 @@ def train_homo_example() -> None:
         # gradient_clip_val=3.0,
         eval_every_n_epochs=1,
         warmup_epochs=3,
-        include_semantic_edges=False,
         early_stopping_patience=5,
     )
     # Train on paragraph pairs

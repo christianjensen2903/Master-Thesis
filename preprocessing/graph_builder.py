@@ -10,14 +10,6 @@ import torch
 from torch_geometric.data import Data, HeteroData  # type: ignore
 from torch_geometric.utils import add_self_loops  # type: ignore
 
-# Fix OpenMP conflict on macOS (FAISS and PyTorch may use different OpenMP runtimes)
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
-import faiss  # type: ignore
-
-# Set FAISS to single-threaded mode to avoid segmentation faults
-faiss.omp_set_num_threads(1)
-
 # Language vocabulary for authentic language feature
 # Based on frequency analysis of training data (year < 2018):
 # Only includes languages with >= 500 training samples (sufficient to learn embeddings)
@@ -328,126 +320,6 @@ class BaseGraphBuilder(ABC):
 
         return relative_positions
 
-    def _compute_semantic_edges(
-        self,
-        embeddings: np.ndarray,
-        times: np.ndarray | None = None,
-        threshold: float = 0.7,
-        max_neighbors: int = 10,
-        batch_size: int = 1024,
-        use_temporal_constraint: bool = False,
-    ) -> list[tuple[int, int]]:
-        """
-        Compute semantic similarity edges using FAISS.
-
-        Args:
-            embeddings: Node embeddings, shape (n, d)
-            times: Timestamps for each node. If provided with use_temporal_constraint,
-                   only links to nodes with earlier timestamps are created.
-            threshold: Cosine similarity threshold for creating an edge
-            max_neighbors: Maximum number of neighbors per node
-            batch_size: Batch size for FAISS queries
-            use_temporal_constraint: If True, only link to earlier nodes
-
-        Returns:
-            List of (source_idx, target_idx) edges
-        """
-        if max_neighbors <= 0:
-            return []
-
-        n, d = embeddings.shape
-        print(f"  Computing semantic edges for {n} nodes using FAISS...")
-
-        # Normalize embeddings for cosine similarity
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms = np.where(norms > 1e-10, norms, 1.0)
-        embeddings_normalized = (embeddings / norms).astype(np.float32)
-
-        if not embeddings_normalized.flags["C_CONTIGUOUS"]:
-            embeddings_normalized = np.ascontiguousarray(embeddings_normalized)
-
-        edges = self._compute_edges_temporal(
-            embeddings_normalized, times, threshold, max_neighbors, batch_size
-        )
-
-        print(f"  Found {len(edges)} semantic similarity edges")
-        return edges
-
-    def _compute_edges_temporal(
-        self,
-        embeddings: np.ndarray,
-        times: np.ndarray,
-        threshold: float,
-        max_neighbors: int,
-        batch_size: int,
-    ) -> list[tuple[int, int]]:
-        """
-        Compute edges with temporal constraints.
-
-        Process nodes in chronological order, building up the index incrementally.
-        Each node can only find neighbors among nodes with earlier timestamps.
-        """
-        n, d = embeddings.shape
-
-        time_to_indices: dict[int, list[int]] = defaultdict(list)
-        for idx in range(n):
-            time_to_indices[times[idx]].append(idx)
-
-        unique_times = sorted(time_to_indices.keys())
-        print(f"  Processing {len(unique_times)} time groups chronologically...")
-
-        index = faiss.IndexFlatIP(d)
-        faiss_to_orig: list[int] = []
-
-        edges = []
-        nodes_processed = 0
-
-        for time_idx, t in enumerate(unique_times):
-            group_indices = time_to_indices[t]
-            group_size = len(group_indices)
-
-            if index.ntotal > 0 and group_size > 0:
-                group_embs = embeddings[group_indices]
-
-                if not group_embs.flags["C_CONTIGUOUS"]:
-                    group_embs = np.ascontiguousarray(group_embs)
-
-                for batch_start in range(0, group_size, batch_size):
-                    batch_end = min(batch_start + batch_size, group_size)
-                    batch_indices = group_indices[batch_start:batch_end]
-                    batch_embs = group_embs[batch_start:batch_end]
-
-                    if not batch_embs.flags["C_CONTIGUOUS"]:
-                        batch_embs = np.ascontiguousarray(batch_embs)
-
-                    k = min(max_neighbors, index.ntotal)
-                    similarities, faiss_neighbors = index.search(batch_embs, k)
-
-                    for i, orig_idx in enumerate(batch_indices):
-                        for j in range(k):
-                            sim = similarities[i, j]
-                            if sim >= threshold:
-                                faiss_idx = faiss_neighbors[i, j]
-                                neighbor_orig_idx = faiss_to_orig[faiss_idx]
-                                edges.append((orig_idx, neighbor_orig_idx))
-
-            if group_size > 0:
-                group_embs = embeddings[group_indices]
-                if not group_embs.flags["C_CONTIGUOUS"]:
-                    group_embs = np.ascontiguousarray(group_embs)
-                index.add(group_embs)
-                faiss_to_orig.extend(group_indices)
-
-            nodes_processed += group_size
-
-            if (time_idx + 1) % max(1, len(unique_times) // 10) == 0:
-                pct = 100 * (time_idx + 1) / len(unique_times)
-                print(
-                    f"    {pct:.0f}% complete ({nodes_processed}/{n} nodes, {len(edges)} edges)"
-                )
-
-        return edges
-
 
 def parse_celex(celex):
     """Parse CELEX into components (CJ only)"""
@@ -479,12 +351,11 @@ def decode_celex(tensor):
 
 class HomogeneousGraphBuilder(BaseGraphBuilder):
     """
-    Homogeneous graph builder with citation and optional semantic edges.
+    Homogeneous graph builder with citation edges.
 
     Edge types:
     - 0: "cites" (forward direction: src cites tgt)
     - 1: "cited_by" (reverse direction: tgt is cited by src)
-    - 2: "similar_to" (semantic similarity edges)
 
     Returns PyTorch Geometric Data object.
     """
@@ -495,9 +366,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         include_only_citing: bool = True,
         include_self_loops: bool = False,
         add_reverse_edges: bool = True,
-        include_semantic_edges: bool = False,
-        semantic_threshold: float = 0.7,
-        semantic_max_neighbors: int = 10,
     ) -> Data:
         """
         Build homogeneous citation graph.
@@ -507,9 +375,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             include_only_citing: Only include paragraphs involved in citations
             include_self_loops: Whether to add self loops to all nodes
             add_reverse_edges: Whether to add reverse edges with different edge type
-            include_semantic_edges: Whether to add semantic similarity edges
-            semantic_threshold: Cosine similarity threshold for semantic edges
-            semantic_max_neighbors: Max number of semantic neighbors per node
 
         Returns:
             graph_data: PyTorch Geometric Data object
@@ -592,7 +457,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         # Build citation edges with edge attributes
         # Edge type 0 = "cites" (forward direction: src cites tgt)
         # Edge type 1 = "cited_by" (reverse direction: tgt is cited by src)
-        # Edge type 2 = "similar_to" (semantic similarity edges)
         edge_list = []
         edge_attr_list = []
 
@@ -612,23 +476,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
                     # Edge type 1 = "cited_by" direction
                     edge_list.append([tgt_idx, src_idx])
                     edge_attr_list.append(1)  # cited_by edge
-
-        # Add semantic similarity edges (edge type 2)
-        if include_semantic_edges and semantic_max_neighbors > 0:
-            print("Computing semantic similarity edges...")
-            embeddings = np.array(doc_embeddings_list)
-            times_array = np.array(node_times)
-
-            semantic_edges = self._compute_semantic_edges(
-                embeddings,
-                times=times_array,
-                threshold=semantic_threshold,
-                max_neighbors=semantic_max_neighbors,
-            )
-
-            for src_idx, tgt_idx in semantic_edges:
-                edge_list.append([tgt_idx, src_idx])
-                edge_attr_list.append(2)  # similar_to edge
 
         # Create PyTorch Geometric Data
         x_doc = torch.tensor(np.array(doc_embeddings_list), dtype=torch.float32)
@@ -696,10 +543,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         )
         cites_count = (edge_attr == 0).sum().item()
         cited_by_count = (edge_attr == 1).sum().item()
-        similar_count = (edge_attr == 2).sum().item()
-        print(
-            f"  Edge types: 0=cites ({cites_count}), 1=cited_by ({cited_by_count}), 2=similar_to ({similar_count})"
-        )
+        print(f"  Edge types: 0=cites ({cites_count}), 1=cited_by ({cited_by_count})")
 
         # Report language distribution
         unknown_count = (language_tensor.sum(dim=1) == 0).sum().item()

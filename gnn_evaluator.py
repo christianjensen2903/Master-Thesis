@@ -65,9 +65,6 @@ class SimpleIncrementalEvaluator:
         mode: EvaluatorMode = "citation_pairs",
         top_k: int = 10000,
         graph_type: str = "homogeneous",
-        include_semantic_edges: bool = False,
-        semantic_threshold: float = 0.7,
-        semantic_max_neighbors: int = 10,
     ):
         self.preprocessed_dir = preprocessed_dir
         self.par_to_par_path = par_to_par_path
@@ -77,9 +74,6 @@ class SimpleIncrementalEvaluator:
         self.top_k = top_k
         self.graph_type = graph_type
         self.is_hetero = graph_type == "heterogeneous"
-        self.include_semantic_edges = include_semantic_edges
-        self.semantic_threshold = semantic_threshold
-        self.semantic_max_neighbors = semantic_max_neighbors
 
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -89,10 +83,6 @@ class SimpleIncrementalEvaluator:
 
         print(f"Using device: {self.device}")
         print(f"Using graph type: {self.graph_type}")
-        if include_semantic_edges and not self.is_hetero:
-            print(
-                f"  Semantic edges: threshold={semantic_threshold}, max_neighbors={semantic_max_neighbors}"
-            )
 
         self.graph_data = self._build_graph()
         self.embeddings = self._compute_initial_embeddings()
@@ -109,9 +99,6 @@ class SimpleIncrementalEvaluator:
             return HomogeneousGraphBuilder(self.preprocessed_dir).build_graph(
                 include_only_citing=(self.mode == "citation_pairs"),
                 add_reverse_edges=True,
-                include_semantic_edges=self.include_semantic_edges,
-                semantic_threshold=self.semantic_threshold,
-                semantic_max_neighbors=self.semantic_max_neighbors,
             )
 
     def _build_citation_mask(self) -> torch.Tensor | None:
