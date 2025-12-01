@@ -9,85 +9,107 @@ from preprocessing.graph_builder import NUM_LANGUAGES
 
 
 class CrossAttentionFusion(nn.Module):
-    """Fuses multiple embeddings using multi-head cross-attention.
+    """Fuses text embedding with metadata using cross-attention.
 
-    Each embedding attends to all other embeddings, creating rich
-    contextualized representations before final fusion.
+    Text embedding attends to metadata embeddings (keywords, subject, caselaw),
+    allowing the model to learn which metadata is most relevant for each node.
     """
 
     def __init__(
         self,
         input_dim: int,
         output_dim: int,
-        num_embeddings: int = 4,
+        num_embeddings: int = 4,  # text + 3 metadata
         num_heads: int = 4,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.num_embeddings = num_embeddings
         self.num_heads = num_heads
 
-        # Project each embedding to output_dim
-        self.input_projs = nn.ModuleList(
-            [nn.Linear(input_dim, output_dim) for _ in range(num_embeddings)]
-        )
+        # Project text (query) and metadata (key/value) to output_dim
+        self.text_proj = nn.Linear(input_dim, output_dim)
+        self.metadata_proj = nn.Linear(input_dim, output_dim)
 
-        # Multi-head cross-attention: each embedding attends to all others
-        self.cross_attention = nn.MultiheadAttention(
+        # Cross-attention: text attends to metadata
+        self.cross_attn = nn.MultiheadAttention(
             embed_dim=output_dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
 
-        # Layer norm and feedforward for post-attention processing
+        # Layer norms and FFN for post-attention processing
         self.norm1 = nn.LayerNorm(output_dim)
         self.norm2 = nn.LayerNorm(output_dim)
+
         self.ffn = nn.Sequential(
-            nn.Linear(output_dim, output_dim * 2),
+            nn.Linear(output_dim, output_dim * 4),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(output_dim * 2, output_dim),
+            nn.Linear(output_dim * 4, output_dim),
             nn.Dropout(dropout),
         )
 
-        # Final fusion: aggregate attended embeddings
-        self.fusion_weights = nn.Parameter(torch.ones(num_embeddings) / num_embeddings)
+        # Store last attention weights for analysis
+        self._last_attn_weights: torch.Tensor | None = None
 
-    def forward(self, *embeddings: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        text_emb: torch.Tensor,
+        keywords_emb: torch.Tensor,
+        subject_emb: torch.Tensor,
+        caselaw_emb: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
-            *embeddings: Variable number of embeddings, each (N, input_dim)
+            text_emb: (N, input_dim) - main text embedding
+            keywords_emb: (N, input_dim) - keywords embedding
+            subject_emb: (N, input_dim) - subject matter embedding
+            caselaw_emb: (N, input_dim) - case law about embedding
         Returns:
             Fused embedding (N, output_dim)
         """
-        assert len(embeddings) == self.num_embeddings
+        # Project text as query: (N, output_dim) -> (N, 1, output_dim)
+        query = self.text_proj(text_emb).unsqueeze(1)
 
-        # Project all embeddings: list of (N, output_dim)
-        projected = [proj(emb) for proj, emb in zip(self.input_projs, embeddings)]
+        # Project and stack metadata as key/value: (N, 3, output_dim)
+        metadata = torch.stack(
+            [
+                self.metadata_proj(keywords_emb),
+                self.metadata_proj(subject_emb),
+                self.metadata_proj(caselaw_emb),
+            ],
+            dim=1,
+        )
 
-        # Stack as sequence: (N, num_embeddings, output_dim)
-        stacked = torch.stack(projected, dim=1)
+        # Cross-attention: text attends to metadata
+        attn_out, attn_weights = self.cross_attn(
+            query=query,
+            key=metadata,
+            value=metadata,
+        )
+        # attn_out: (N, 1, output_dim), attn_weights: (N, 1, 3)
 
-        # Cross-attention: each position attends to all positions
-        attended, _ = self.cross_attention(stacked, stacked, stacked)
-        attended = self.norm1(stacked + attended)
+        # Store attention weights for analysis
+        self._last_attn_weights = attn_weights.squeeze(1).detach()  # (N, 3)
 
-        # Feedforward with residual
-        ffn_out = self.ffn(attended)
-        attended = self.norm2(attended + ffn_out)
+        # Residual connection and norm
+        x = self.norm1(query + attn_out)
 
-        # Weighted fusion of attended embeddings
-        weights = F.softmax(self.fusion_weights, dim=0)
-        output = torch.einsum("nkd,k->nd", attended, weights)
+        # FFN with residual
+        x = self.norm2(x + self.ffn(x))
 
-        return output
+        # Remove sequence dimension: (N, 1, output_dim) -> (N, output_dim)
+        return x.squeeze(1)
 
     def get_weights(self, *embeddings: torch.Tensor) -> torch.Tensor:
-        """Return the fusion weights (for analysis/logging)."""
-        return F.softmax(self.fusion_weights, dim=0).detach()
+        """Return last attention weights (N, 3) for analysis."""
+        if self._last_attn_weights is not None:
+            return self._last_attn_weights
+        # Return uniform if no forward pass yet
+        return torch.ones(3) / 3
 
 
 class WeightedEmbeddingFusion(nn.Module):
@@ -255,7 +277,7 @@ class DualEncoderGNN(nn.Module):
         use_language: bool = True,
         language_embed_dim: int = 16,
         use_case_metadata: bool = True,
-        fusion_mode: str = "cross_attention",
+        fusion_mode: str = "scalar",
     ):
         super().__init__()
         if output_dim is None:
