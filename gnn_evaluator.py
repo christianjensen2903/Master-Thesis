@@ -181,9 +181,7 @@ class GNNEvaluator:
             modified = modified.to(self.device)
             return self.gnn_model(modified)["paragraph"].cpu()
 
-    def _compute_homo_embeddings(
-        self, cutoff_ts: float, batch_size: int = 4096
-    ) -> torch.Tensor:
+    def _compute_homo_embeddings(self, cutoff_ts: float) -> torch.Tensor:
         """Compute embeddings for homogeneous graph (document embeddings for corpus).
 
         Filters edges by time to ensure only past edges are used for initial embeddings.
@@ -204,118 +202,7 @@ class GNNEvaluator:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-        num_nodes = self.graph_data.x.size(0)
-
-        # Check if model supports batched node-level encoding
-        # DualEncoderGNN has _encode_node, SymmetricGNN has embedding_fusion
-        has_batched_support = hasattr(self.gnn_model, "convs") and (
-            hasattr(self.gnn_model, "_encode_node")
-            or hasattr(self.gnn_model, "embedding_fusion")
-        )
-
-        if has_batched_support:
-            # Batch the node encoding part (embedding fusion), then run GNN on full graph
-            return self._compute_homo_embeddings_batched(
-                filtered_edges, filtered_attr, num_nodes, batch_size
-            )
-
-        # Fallback: process all at once
         return self._compute_homo_embeddings_full(filtered_edges, filtered_attr)
-
-    def _compute_homo_embeddings_batched(
-        self,
-        filtered_edges: torch.Tensor,
-        filtered_attr: torch.Tensor | None,
-        num_nodes: int,
-        batch_size: int,
-    ) -> torch.Tensor:
-        """Batch node encoding, then apply GNN on full graph."""
-        import torch.nn.functional as F
-
-        has_encode_node = hasattr(self.gnn_model, "_encode_node")
-
-        # Step 1: Batch compute node encodings (before GNN)
-        all_node_encodings = []
-        for start_idx in tqdm(range(0, num_nodes, batch_size), desc="Encoding nodes"):
-            end_idx = min(start_idx + batch_size, num_nodes)
-
-            x_batch = self.graph_data.x[start_idx:end_idx].to(self.device)
-
-            date_feature = getattr(self.graph_data, "date_feature", None)
-            date_batch = (
-                date_feature[start_idx:end_idx].to(self.device)
-                if date_feature is not None
-                else None
-            )
-
-            subject_matter = getattr(self.graph_data, "subject_matter", None)
-            subject_batch = (
-                subject_matter[start_idx:end_idx].to(self.device)
-                if subject_matter is not None
-                else None
-            )
-
-            keywords = getattr(self.graph_data, "keywords", None)
-            keywords_batch = (
-                keywords[start_idx:end_idx].to(self.device)
-                if keywords is not None
-                else None
-            )
-
-            case_law_about = getattr(self.graph_data, "case_law_about", None)
-            caselaw_batch = (
-                case_law_about[start_idx:end_idx].to(self.device)
-                if case_law_about is not None
-                else None
-            )
-
-            with torch.no_grad():
-                if has_encode_node:
-                    # DualEncoderGNN path
-                    encoded = self.gnn_model._encode_node(
-                        x_batch,
-                        date_batch,
-                        subject_batch,
-                        keywords_batch,
-                        caselaw_batch,
-                    )
-                else:
-                    # SymmetricGNN path - manual node encoding
-                    encoded = self.gnn_model.embedding_fusion(
-                        x_batch, keywords_batch, subject_batch, caselaw_batch
-                    )
-                    if date_batch is not None:
-                        date_emb = self.gnn_model._encode_date(date_batch)
-                        if date_emb is not None:
-                            encoded = encoded + date_emb
-
-                all_node_encodings.append(encoded.cpu())
-
-        # Concatenate all node encodings
-        x = torch.cat(all_node_encodings, dim=0).to(self.device)
-        x = self.gnn_model.dropout(x)
-
-        # Step 2: Apply GNN layers on full graph (sparse ops are memory efficient)
-        with torch.no_grad():
-            for i, conv in enumerate(self.gnn_model.convs):
-                x = self.gnn_model.norms[i](x)
-                x_new = conv(x, filtered_edges)
-                x_new = F.gelu(x_new)
-                x_new = self.gnn_model.dropout(x_new)
-                x = x + x_new
-
-            # Concatenate language embedding if needed
-            language = getattr(self.graph_data, "language", None)
-            if self.gnn_model.use_language and language is not None:
-                language = language.to(self.device)
-                # DualEncoderGNN uses language_doc_proj, SymmetricGNN uses language_proj
-                if hasattr(self.gnn_model, "language_doc_proj"):
-                    lang_emb = self.gnn_model.language_doc_proj(language)
-                else:
-                    lang_emb = self.gnn_model.language_proj(language)
-                x = torch.cat([x, lang_emb], dim=1)
-
-            return F.normalize(x, p=2, dim=1).cpu()
 
     def _compute_homo_embeddings_full(
         self,
@@ -687,11 +574,11 @@ if __name__ == "__main__":
 
     layers = 1
 
-    model = SymmetricGNN(
+    model = DualEncoderGNN(
         input_dim=384,
         output_dim=384,
         num_layers=layers,
-        fusion_mode="scalar",
+        fusion_mode="cross_attention",
     )
     model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
 
