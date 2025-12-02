@@ -182,6 +182,7 @@ def objective_caselink(trial: optuna.Trial) -> float:
         semantic_threshold=0.0,
         semantic_max_neighbors=semantic_max_neighbors,
         include_article_nodes=False,
+        semantic_cache_path="data/semantic_cache",
     )
 
     model = create_caselink_model(trial)

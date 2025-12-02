@@ -620,6 +620,7 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         use_temporal_constraint: bool = True,
         include_article_nodes: bool = True,
         article_threshold: float = 0.9,
+        semantic_cache_path: str | None = None,
     ):
         """
         Initialize semantic graph builder.
@@ -633,6 +634,7 @@ class SemanticGraphBuilder(BaseGraphBuilder):
             use_temporal_constraint: Only link to earlier paragraphs
             include_article_nodes: Include article nodes in the graph
             article_threshold: Cosine similarity threshold for article edges
+            semantic_cache_path: Path to cache semantic edges (skips recomputation if exists)
         """
         super().__init__(preprocessed_dir)
         self.judgments_path = judgments_path
@@ -642,6 +644,7 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         self.use_temporal_constraint = use_temporal_constraint
         self.include_article_nodes = include_article_nodes
         self.article_threshold = article_threshold
+        self.semantic_cache_path = semantic_cache_path
 
         # TF-IDF state (lazy initialization)
         self.tfidf_vectorizer: TfidfVectorizer | None = None
@@ -692,6 +695,41 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         print(f"Loaded texts for {len(par_texts)} paragraphs")
         return par_texts
 
+    def _get_cache_key(self, par_ids: list[str], use_temporal: bool) -> str:
+        """Generate a cache key based on parameters."""
+        import hashlib
+        # Include all parameters that affect the edges
+        params = f"{self.semantic_threshold}_{self.semantic_max_neighbors}_{use_temporal}"
+        par_ids_hash = hashlib.md5("_".join(sorted(par_ids)).encode()).hexdigest()[:16]
+        return f"semantic_edges_{params}_{par_ids_hash}"
+
+    def _load_cached_edges(self, cache_key: str) -> list[tuple[int, int]] | None:
+        """Load cached semantic edges if available."""
+        if self.semantic_cache_path is None:
+            return None
+
+        cache_dir = Path(self.semantic_cache_path)
+        cache_file = cache_dir / f"{cache_key}.pkl"
+
+        if cache_file.exists():
+            print(f"  Loading cached semantic edges from {cache_file}")
+            with open(cache_file, "rb") as f:
+                return pickle.load(f)
+        return None
+
+    def _save_cached_edges(self, cache_key: str, edges: list[tuple[int, int]]) -> None:
+        """Save computed semantic edges to cache."""
+        if self.semantic_cache_path is None:
+            return
+
+        cache_dir = Path(self.semantic_cache_path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"{cache_key}.pkl"
+
+        print(f"  Saving semantic edges to cache: {cache_file}")
+        with open(cache_file, "wb") as f:
+            pickle.dump(edges, f)
+
     def _compute_tfidf_semantic_edges(
         self,
         par_ids: list[str],
@@ -699,6 +737,15 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         batch_size: int = 512,
     ) -> list[tuple[int, int]]:
         """Compute semantic similarity edges using TF-IDF with temporal constraints."""
+        use_temporal = times is not None and self.use_temporal_constraint
+        cache_key = self._get_cache_key(par_ids, use_temporal)
+
+        # Try to load from cache
+        cached_edges = self._load_cached_edges(cache_key)
+        if cached_edges is not None:
+            print(f"  Loaded {len(cached_edges)} cached TF-IDF semantic edges")
+            return cached_edges
+
         if self.par_texts is None:
             self.par_texts = self._load_paragraph_texts()
 
@@ -723,12 +770,16 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         print("  Transforming texts to TF-IDF vectors...")
         tfidf_matrix = self.tfidf_vectorizer.transform(texts)
 
-        if times is None or not self.use_temporal_constraint:
+        if not use_temporal:
             edges = self._compute_tfidf_edges_no_temporal(tfidf_matrix, batch_size)
         else:
             edges = self._compute_tfidf_edges_temporal(tfidf_matrix, times, batch_size)
 
         print(f"  Found {len(edges)} TF-IDF semantic similarity edges")
+
+        # Save to cache
+        self._save_cached_edges(cache_key, edges)
+
         return edges
 
     def _compute_tfidf_edges_no_temporal(
