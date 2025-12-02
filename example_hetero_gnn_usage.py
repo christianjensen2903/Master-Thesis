@@ -69,7 +69,8 @@ def train_homo_example() -> None:
         output_dim=in_channels,
         num_layers=layers,
         dropout=0.3,
-        fusion_mode="scalar",
+        fusion_mode="cross_attention",
+        use_language=False,
     )
 
     # Initialize trainer with homogeneous graph type
@@ -116,7 +117,9 @@ def train_caselink_example() -> None:
 
     trainer = GNNTrainer(
         graph_builder=SemanticGraphBuilder(
-            "data/preprocessed", "data/judgments_cleaned.json"
+            "data/preprocessed",
+            "data/judgments_cleaned.json",
+            semantic_cache_path="data/semantic_cache",
         ),
         output_path="checkpoints/caselink_gnn",
         batch_size=512,
