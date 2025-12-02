@@ -482,13 +482,18 @@ if __name__ == "__main__":
     hidden_dim = 384
     out_channels = 384
 
-    model = CitationGNN(in_channels, output_dim=out_channels, num_layers=2)
+    model = DualEncoderGNN(
+        input_dim=1024,
+        output_dim=1024 * 2,
+        num_layers=layers,
+        fusion_mode="cross_attention",
+    )
     model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
 
     # Run evaluation
     evaluator = SimpleIncrementalEvaluator(
         gnn_model=model,
-        preprocessed_dir="data/preprocessed",
+        preprocessed_dir="data/preprocessed_new",
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
         k_hops=2,

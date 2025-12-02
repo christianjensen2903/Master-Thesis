@@ -59,24 +59,24 @@ def train_homo_example() -> None:
     print("Training Homogeneous GNN Model")
     print("=" * 80 + "\n")
 
-    in_channels = 384
-    hidden_dim = 384
-    out_channels = 384
+    in_channels = 1024
 
-    # Initialize homogeneous GNN
-    model = CitationGNN(
-        input_dim=384,
-        output_dim=384,
-        num_layers=2,
+    layers = 1
+
+    model = DualEncoderGNN(
+        input_dim=in_channels,
+        output_dim=in_channels * 2,
+        num_layers=layers,
         dropout=0.3,
+        fusion_mode="cross_attention",
     )
 
     # Initialize trainer with homogeneous graph type
     trainer = GNNTrainer(
-        preprocessed_dir="data/preprocessed",
+        preprocessed_dir="data/preprocessed_new",
         output_path="checkpoints/homo_gnn",
-        batch_size=2048,
-        epochs=50,
+        batch_size=512,
+        epochs=75,
         learning_rate=1e-3,
         weight_decay=5e-4,
         temperature=0.05,
@@ -87,7 +87,7 @@ def train_homo_example() -> None:
         # gradient_clip_val=3.0,
         eval_every_n_epochs=2,
         warmup_epochs=3,
-        x_similarity_threshold=0.8,
+        early_stopping_patience=10,
     )
     # Train on paragraph pairs
     cutoff_year = 2018

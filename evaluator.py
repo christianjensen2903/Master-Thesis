@@ -598,29 +598,9 @@ if __name__ == "__main__":
     #     lowercase=True,
     #     stop_words="english",
     # )
-
-    # retriever = DenseRetriever(
-    #     model_name="checkpoints/simcse_citation_model",
-    #     max_seq_length=256,
-    # )
-
-    # encoding_model = "checkpoints/simcse_citation_model"
-    # text_encoder = SentenceTransformer(encoding_model)
-
-    # in_channels = text_encoder.get_sentence_embedding_dimension()
-
-    # model = CitationGNN(
-    #     in_channels, hidden_dim=512, output_dim=in_channels, num_layers=3
-    # )
-
-    # model.load_state_dict(torch.load("checkpoints/gnn/best_model.pt"))
-
-    # retriever = GNNRetriever(
-    #     gnn_model=model,
-    #     # model_path="checkpoints/gnn/best_model.pt",
-    #     text_encoder_name=encoding_model,
-    #     batch_size=32,
-    # )
+    retriever = DenseRetriever(
+        preprocessed_dir="data/preprocessed_new",
+    )
 
     evaluator = Evaluator(
         retriever=retriever,
