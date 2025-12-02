@@ -65,6 +65,8 @@ class GNNEvaluator:
         device: str | None = None,
         mode: EvaluatorMode = "citation_pairs",
         top_k: int = 10000,
+        confidence: float = 0.95,
+        n_bootstrap: int = 1000,
     ):
         """
         Initialize the incremental evaluator.
@@ -78,6 +80,8 @@ class GNNEvaluator:
             device: Device to use (cuda/cpu)
             mode: Evaluation mode ("citation_pairs" or other)
             top_k: Number of top candidates to consider
+            confidence: Confidence level for bootstrap intervals (default 0.95)
+            n_bootstrap: Number of bootstrap samples (default 1000)
         """
         self.graph_builder = graph_builder
         self.par_to_par_path = par_to_par_path
@@ -85,7 +89,15 @@ class GNNEvaluator:
         self.k_hops = k_hops
         self.mode = mode
         self.top_k = top_k
+        self.confidence = confidence
+        self.n_bootstrap = n_bootstrap
         self.is_hetero = isinstance(graph_builder, HeterogeneousGraphBuilder)
+
+        # Results storage
+        self.map_score: float | None = None
+        self.recall_scores: dict[int, float] | None = None
+        self.map_ci: tuple[float, float] | None = None
+        self.recall_cis: dict[int, tuple[float, float]] | None = None
 
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -394,6 +406,33 @@ class GNNEvaluator:
 
         self.embeddings[sub_n_id] = embeddings[: len(sub_n_id)].cpu()
 
+    def _bootstrap_confidence_interval(
+        self,
+        values: NDArray,
+        confidence: float | None = None,
+        n_bootstrap: int | None = None,
+    ) -> tuple[float, float]:
+        """Compute bootstrap confidence interval for the mean."""
+        confidence = confidence or self.confidence
+        n_bootstrap = n_bootstrap or self.n_bootstrap
+
+        if len(values) == 0:
+            return 0.0, 0.0
+
+        rng = np.random.default_rng()
+        means = np.empty(n_bootstrap, dtype=np.float64)
+        n = len(values)
+
+        for i in range(n_bootstrap):
+            indices = rng.integers(0, n, size=n)
+            sample = values[indices]
+            means[i] = float(np.mean(sample))
+
+        alpha = 1.0 - confidence
+        lower = float(np.quantile(means, alpha / 2.0))
+        upper = float(np.quantile(means, 1.0 - alpha / 2.0))
+        return lower, upper
+
     def run(self, k_values: list[int] = [5, 10, 100]) -> float:
         """Run full incremental evaluation."""
         df = pd.read_csv(self.par_to_par_path)
@@ -482,12 +521,33 @@ class GNNEvaluator:
             # Update embeddings for future queries
             self._update_embeddings(sub, sub_n_id)
 
-        map_score = float(np.mean(ap_scores))
-        print(f"MAP: {map_score}")
-        for k, recalls in recall_scores.items():
-            print(f"Recall@{k}: {float(np.mean(recalls))}")
+        # Compute metrics and confidence intervals
+        ap_array = np.array(ap_scores, dtype=np.float64)
+        self.map_score = float(np.mean(ap_array))
+        self.map_ci = self._bootstrap_confidence_interval(ap_array)
 
-        return map_score
+        self.recall_scores = {}
+        self.recall_cis = {}
+        for k, recalls in recall_scores.items():
+            recall_array = np.array(recalls, dtype=np.float64)
+            self.recall_scores[k] = float(np.mean(recall_array))
+            self.recall_cis[k] = self._bootstrap_confidence_interval(recall_array)
+
+        # Print results
+        confidence_pct = int(self.confidence * 100)
+        print(
+            f"\nMAP: {self.map_score:.3f} "
+            f"({confidence_pct}% CI [{self.map_ci[0]:.3f}, {self.map_ci[1]:.3f}])"
+        )
+        for k in sorted(self.recall_scores.keys()):
+            recall = self.recall_scores[k]
+            ci = self.recall_cis[k]
+            print(
+                f"Recall@{k}: {recall:.3f} "
+                f"({confidence_pct}% CI [{ci[0]:.3f}, {ci[1]:.3f}])"
+            )
+
+        return self.map_score
 
 
 if __name__ == "__main__":
