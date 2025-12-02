@@ -136,6 +136,48 @@ def train_caselink_example() -> None:
     print("\nTraining complete!")
 
 
+def train_mlp_baseline_example() -> None:
+    """Example: Train an MLP baseline (no graph structure) for comparison."""
+    print("\n" + "=" * 80)
+    print("Training MLP Baseline (No Graph Structure)")
+    print("=" * 80 + "\n")
+    from preprocessing.graph_builder import HomogeneousGraphBuilder
+    from models import MLPBaseline
+
+    in_channels = 384
+    layers = 2  # MLP depth
+
+    model = MLPBaseline(
+        input_dim=in_channels,
+        output_dim=in_channels,
+        num_layers=layers,
+        dropout=0.3,
+        fusion_mode="scalar",
+    )
+
+    # Uses the same graph builder for data loading, but model ignores edges
+    trainer = GNNTrainer(
+        graph_builder=HomogeneousGraphBuilder("data/preprocessed"),
+        output_path="checkpoints/mlp_baseline",
+        batch_size=512,
+        epochs=50,
+        learning_rate=1e-3,
+        weight_decay=1e-3,
+        temperature=0.05,
+        num_hops=0,  # No neighbor sampling needed for MLP
+        checkpoint_interval=10,
+        wandb_project="mlp-baseline-training",
+        eval_every_n_epochs=1,
+        warmup_epochs=3,
+        early_stopping_patience=5,
+    )
+
+    cutoff_year = 2018
+    trainer.train(model, cutoff_year, 2022)
+
+    print("\nTraining complete!")
+
+
 if __name__ == "__main__":
     # Train heterogeneous GNN (uses all edge types)
     # train_hetero_example()
