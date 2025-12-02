@@ -1,17 +1,17 @@
 import os
 import torch
 import matplotlib.pyplot as plt
-import networkx as nx
+import networkx as nx  # type: ignore
 import numpy as np
 from matplotlib.patches import FancyBboxPatch
-from torch_geometric.loader import NeighborLoader
-from torch_geometric.data import Data, HeteroData
+from torch_geometric.loader import NeighborLoader  # type: ignore
+from torch_geometric.data import Data, HeteroData  # type: ignore
 from preprocessing.graph_builder import (
     HomogeneousGraphBuilder,
     HeterogeneousGraphBuilder,
 )
 import torch.nn.functional as F
-from torch_geometric.transforms import ToUndirected
+from torch_geometric.transforms import ToUndirected  # type: ignore
 
 
 class SamplingVisualizer:
