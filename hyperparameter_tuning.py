@@ -38,6 +38,7 @@ PREPROCESSED_DIR = "data/preprocessed_new"
 MAX_TRIALS = 30
 EPOCHS = 50
 EARLY_STOPPING_PATIENCE = 5
+EARLY_STOPPING_MIN_DELTA = 1e-3
 WARMUP_EPOCHS = 5
 
 # Fixed model settings
@@ -120,6 +121,7 @@ def get_training_params(trial: optuna.Trial, model_name: str) -> dict:
         "warmup_epochs": WARMUP_EPOCHS,
         "epochs": EPOCHS,
         "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+        "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
     }
 
     if model_name in ("caselink", "caselink_symmetric"):
