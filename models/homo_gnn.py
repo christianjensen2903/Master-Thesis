@@ -72,14 +72,14 @@ class CrossAttentionFusion(nn.Module):
             Fused embedding (N, output_dim)
         """
         # Project text as query: (N, output_dim) -> (N, 1, output_dim)
-        query = self.text_proj(text_emb).unsqueeze(1)
+        query = text_emb.unsqueeze(1)
 
         # Project and stack metadata as key/value: (N, 3, output_dim)
         metadata = torch.stack(
             [
-                self.metadata_proj(keywords_emb),
-                self.metadata_proj(subject_emb),
-                self.metadata_proj(caselaw_emb),
+                keywords_emb,
+                subject_emb,
+                caselaw_emb,
             ],
             dim=1,
         )
