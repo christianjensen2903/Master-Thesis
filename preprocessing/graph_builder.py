@@ -1,3 +1,4 @@
+import json
 import os
 import pickle
 from abc import ABC, abstractmethod
@@ -5,10 +6,21 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 import re
+
 import numpy as np
+from scipy.sparse import csr_matrix
+from sklearn.feature_extraction.text import TfidfVectorizer
 import torch
 from torch_geometric.data import Data, HeteroData  # type: ignore
 from torch_geometric.utils import add_self_loops  # type: ignore
+
+# Fix OpenMP conflict on macOS (FAISS and PyTorch may use different OpenMP runtimes)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import faiss
+
+# Set FAISS to single-threaded mode to avoid segmentation faults
+faiss.omp_set_num_threads(1)
 
 # Language vocabulary for authentic language feature
 # Based on frequency analysis of training data (year < 2018):
@@ -205,11 +217,34 @@ class BaseGraphBuilder(ABC):
         return metadata_emb
 
     @abstractmethod
-    def build_graph(
-        self, train_cutoff_year: int | None = None, include_only_citing: bool = False
-    ):
-        """Build and return graph data structure."""
+    def build_graph(self, train_cutoff_year: int | None = None):
+        """Build and return graph data structure.
+
+        Args:
+            train_cutoff_year: Only include paragraphs before this year
+        """
         pass
+
+    def mask_edges_for_training(
+        self,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor | None,
+        anchor_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Mask edges to prevent information leakage during training.
+
+        Override in subclasses to implement graph-specific masking strategies.
+
+        Args:
+            edge_index: Edge indices [2, num_edges]
+            edge_attr: Edge attributes/types (optional)
+            anchor_count: Number of anchor/input nodes (first anchor_count nodes)
+
+        Returns:
+            Tuple of (masked_edge_index, masked_edge_attr)
+        """
+        raise NotImplementedError("Subclasses must implement mask_edges_for_training")
 
     def _date_to_timestamp(self, date_str: str | None) -> int:
         """Convert ISO date string to Unix timestamp (seconds since epoch)."""
@@ -351,42 +386,82 @@ def decode_celex(tensor):
 
 class HomogeneousGraphBuilder(BaseGraphBuilder):
     """
-    Homogeneous graph builder with citation edges.
+    Homogeneous graph builder with citation edges only.
 
     Edge types:
     - 0: "cites" (forward direction: src cites tgt)
-    - 1: "cited_by" (reverse direction: tgt is cited by src)
+    - 1: "cited_by" (reverse direction)
 
     Returns PyTorch Geometric Data object.
     """
 
-    def build_graph(
+    def __init__(
         self,
-        train_cutoff_year: int | None = None,
+        preprocessed_dir: str,
         include_only_citing: bool = True,
         include_self_loops: bool = False,
         add_reverse_edges: bool = True,
-    ) -> Data:
+    ):
         """
-        Build homogeneous citation graph.
+        Initialize homogeneous graph builder.
 
         Args:
-            train_cutoff_year: Only include paragraphs before this year
+            preprocessed_dir: Directory containing preprocessed embeddings and metadata
             include_only_citing: Only include paragraphs involved in citations
             include_self_loops: Whether to add self loops to all nodes
             add_reverse_edges: Whether to add reverse edges with different edge type
-
-        Returns:
-            graph_data: PyTorch Geometric Data object
         """
-        # Filter paragraphs
-        selected_pars = self._filter_paragraphs(include_only_citing, train_cutoff_year)
+        super().__init__(preprocessed_dir)
+        self.include_only_citing = include_only_citing
+        self.include_self_loops = include_self_loops
+        self.add_reverse_edges = add_reverse_edges
 
-        relative_positions = self._compute_relative_positions(selected_pars)
+    def mask_edges_for_training(
+        self,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor | None,
+        anchor_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Mask edges to prevent leakage during training.
+
+        Masking strategy:
+        - Mask outgoing edges from anchor nodes (prevent seeing their predictions)
+        - Mask incoming citation edges to anchors (prevent seeing what cites them)
+
+        This ensures anchors don't see the citation relationships we're training on.
+        """
+        src, tgt = edge_index
+        outgoing_from_anchor = src < anchor_count
+        incoming_to_anchor = tgt < anchor_count
+
+        if edge_attr is not None:
+            # Only mask incoming edges that are citations (not reverse edges)
+            is_citation = (edge_attr == 0) | (edge_attr == 1)
+            leakage_mask = outgoing_from_anchor | (incoming_to_anchor & is_citation)
+        else:
+            # Without edge types, mask all incoming/outgoing
+            leakage_mask = outgoing_from_anchor | incoming_to_anchor
+
+        keep_mask = ~leakage_mask
+        masked_edge_index = edge_index[:, keep_mask]
+        masked_edge_attr = edge_attr[keep_mask] if edge_attr is not None else None
+
+        return masked_edge_index, masked_edge_attr
+
+    def build_graph(self, train_cutoff_year: int | None = None) -> Data:
+        """Build homogeneous citation graph.
+
+        Args:
+            train_cutoff_year: Only include paragraphs before this year
+        """
+        selected_pars = self._filter_paragraphs(
+            self.include_only_citing, train_cutoff_year
+        )
+        print(f"Selected {len(selected_pars)} paragraphs")
 
         # Build node mappings
         node_id_to_idx: dict[str, int] = {}
-        idx_to_metadata: dict[int, dict] = {}
         doc_embeddings_list = []
         query_embeddings_list = []
         date_features_list = []
@@ -394,7 +469,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         node_times = []
         node_ids = []
 
-        # Prepare case metadata lists if available
+        # Case metadata lists
         subject_matter_list = []
         keywords_list = []
         case_law_about_list = []
@@ -405,32 +480,21 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             current_idx = len(node_id_to_idx)
 
             node_id_to_idx[node_id] = current_idx
-            idx_to_metadata[current_idx] = meta
+            doc_embeddings_list.append(self.par_embeddings_doc[par_idx])
+            query_embeddings_list.append(self.par_embeddings_query[par_idx])
 
-            # Get base embeddings
-            doc_emb = self.par_embeddings_doc[par_idx]
-            query_emb = self.par_embeddings_query[par_idx]
-
-            # Store date features separately: [judgment_date, application_date]
             case_meta = meta.get("meta", {})
-            date_feature = self._extract_date_features(
-                meta.get("date"), case_meta.get("application_date")
+            date_features_list.append(
+                self._extract_date_features(
+                    meta.get("date"), case_meta.get("application_date")
+                )
             )
-
-            doc_embeddings_list.append(doc_emb)
-            query_embeddings_list.append(query_emb)
-            date_features_list.append(date_feature)
             node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
+            language_multihot_list.append(
+                encode_language(case_meta.get("authentic_language"))
+            )
+            node_times.append(self._date_to_timestamp(meta.get("date")))
 
-            # Add language multihot encoding
-            authentic_language = case_meta.get("authentic_language")
-            language_multihot_list.append(encode_language(authentic_language))
-
-            # Add timestamp (convert date to Unix timestamp)
-            date_str = meta.get("date")
-            node_times.append(self._date_to_timestamp(date_str))
-
-            # Add case metadata embeddings (per-paragraph, from case level)
             if self.has_case_metadata:
                 celex = meta["celex"]
                 if celex in self.celex_to_case_idx:
@@ -443,7 +507,6 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
                         self.case_embeddings_case_law_about[case_idx]
                     )
                 else:
-                    # Use zero vectors for missing cases
                     subject_matter_list.append(
                         np.zeros_like(self.case_embeddings_subject_matter[0])
                     )
@@ -454,9 +517,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
                         np.zeros_like(self.case_embeddings_case_law_about[0])
                     )
 
-        # Build citation edges with edge attributes
-        # Edge type 0 = "cites" (forward direction: src cites tgt)
-        # Edge type 1 = "cited_by" (reverse direction: tgt is cited by src)
+        # Build citation edges
         edge_list = []
         edge_attr_list = []
 
@@ -465,19 +526,14 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
                 src_idx = node_id_to_idx[src_id]
                 tgt_idx = node_id_to_idx[tgt_id]
 
-                # Forward edge: src -> tgt (src cites tgt)
-                # This means information flows from cited (tgt) to citing (src)
-                # Edge type 0 = "cites" direction
                 edge_list.append([src_idx, tgt_idx])
-                edge_attr_list.append(0)  # citing edge
+                edge_attr_list.append(0)  # cites
 
-                if add_reverse_edges:
-                    # Reverse edge: tgt -> src (tgt is cited by src)
-                    # Edge type 1 = "cited_by" direction
+                if self.add_reverse_edges:
                     edge_list.append([tgt_idx, src_idx])
-                    edge_attr_list.append(1)  # cited_by edge
+                    edge_attr_list.append(1)  # cited_by
 
-        # Create PyTorch Geometric Data
+        # Create tensors
         x_doc = torch.tensor(np.array(doc_embeddings_list), dtype=torch.float32)
         x_query = torch.tensor(np.array(query_embeddings_list), dtype=torch.float32)
         date_features = torch.tensor(np.array(date_features_list), dtype=torch.float32)
@@ -489,8 +545,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             edge_index = torch.empty((2, 0), dtype=torch.long)
             edge_attr = torch.empty((0,), dtype=torch.long)
 
-        # Add self loops if requested
-        if include_self_loops:
+        if self.include_self_loops:
             num_nodes = len(doc_embeddings_list)
             edge_index, edge_attr = add_self_loops(
                 edge_index, edge_attr, num_nodes=num_nodes
@@ -502,7 +557,7 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             np.array(language_multihot_list), dtype=torch.float32
         )
 
-        # Prepare case metadata tensors
+        # Case metadata tensors
         case_metadata_kwargs = {}
         if self.has_case_metadata and subject_matter_list:
             case_metadata_kwargs["subject_matter"] = torch.tensor(
@@ -516,42 +571,612 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             )
 
         graph_data = Data(
-            x=x_doc,  # Default to document embeddings for backward compatibility
-            x_query=x_query,  # Query embeddings (for citing paragraphs)
-            date_feature=date_features,  # Date features stored separately
-            language=language_tensor,  # Language indices for embedding lookup
+            x=x_doc,
+            x_query=x_query,
+            date_feature=date_features,
+            language=language_tensor,
             edge_index=edge_index,
-            edge_attr=edge_attr,  # Edge direction: 0=cites, 1=cited_by
+            edge_attr=edge_attr,
             num_nodes=len(doc_embeddings_list),
-            time=node_times_tensor,  # For temporal sampling
-            node_id_hash=node_ids_tensor,  # Hashed node IDs
-            **case_metadata_kwargs,  # Case-level metadata embeddings
+            time=node_times_tensor,
+            node_id_hash=node_ids_tensor,
+            **case_metadata_kwargs,
         )
 
-        # Report embedding dimensions
-        if self.has_case_metadata and subject_matter_list:
-            base_dim = self.par_embeddings_doc.shape[1]
-            print(f"Node embedding dim: {base_dim}")
-            print(
-                f"  + Case metadata: subject_matter ({self.case_embeddings_subject_matter.shape[1]}), "
-                f"keywords ({self.case_embeddings_keywords.shape[1]}), "
-                f"case_law_about ({self.case_embeddings_case_law_about.shape[1]})"
-            )
-
-        print(
-            f"Built homogeneous graph: {len(doc_embeddings_list)} nodes, {edge_index.shape[1]} edges"
-        )
         cites_count = (edge_attr == 0).sum().item()
         cited_by_count = (edge_attr == 1).sum().item()
+        print(
+            f"Built homogeneous graph: {len(doc_embeddings_list)} nodes, "
+            f"{edge_index.shape[1]} edges"
+        )
         print(f"  Edge types: 0=cites ({cites_count}), 1=cited_by ({cited_by_count})")
 
-        # Report language distribution
-        unknown_count = (language_tensor.sum(dim=1) == 0).sum().item()
-        multi_count = (language_tensor.sum(dim=1) > 1).sum().item()
-        known_count = len(language_multihot_list) - unknown_count - multi_count
+        return graph_data
+
+
+class SemanticGraphBuilder(BaseGraphBuilder):
+    """
+    Semantic graph builder with TF-IDF similarity edges (CaseLink-style).
+
+    Uses TF-IDF semantic similarity for edges instead of citations.
+    Optionally includes article nodes with embedding-based similarity edges.
+
+    Edge types:
+    - 0: "similar_to" - TF-IDF semantic similarity between paragraphs
+    - 1: "references_article" - paragraph references article (if article nodes enabled)
+    - 2: "referenced_by_article" - reverse of above
+    - 3: "article_similar" - article to article similarity
+
+    Citations are stored separately in `citation_pairs` for contrastive loss computation.
+    """
+
+    def __init__(
+        self,
+        preprocessed_dir: str,
+        judgments_path: str,
+        include_only_citing: bool = True,
+        semantic_threshold: float = 0.3,
+        semantic_max_neighbors: int = 10,
+        use_temporal_constraint: bool = True,
+        include_article_nodes: bool = True,
+        article_threshold: float = 0.9,
+    ):
+        """
+        Initialize semantic graph builder.
+
+        Args:
+            preprocessed_dir: Directory containing preprocessed embeddings and metadata
+            judgments_path: Path to judgments JSON file (required for TF-IDF)
+            include_only_citing: Only include paragraphs involved in citations
+            semantic_threshold: TF-IDF cosine similarity threshold
+            semantic_max_neighbors: Max neighbors per node for semantic edges
+            use_temporal_constraint: Only link to earlier paragraphs
+            include_article_nodes: Include article nodes in the graph
+            article_threshold: Cosine similarity threshold for article edges
+        """
+        super().__init__(preprocessed_dir)
+        self.judgments_path = judgments_path
+        self.include_only_citing = include_only_citing
+        self.semantic_threshold = semantic_threshold
+        self.semantic_max_neighbors = semantic_max_neighbors
+        self.use_temporal_constraint = use_temporal_constraint
+        self.include_article_nodes = include_article_nodes
+        self.article_threshold = article_threshold
+
+        # TF-IDF state (lazy initialization)
+        self.tfidf_vectorizer: TfidfVectorizer | None = None
+        self.par_texts: dict[str, str] | None = None
+
+    def mask_edges_for_training(
+        self,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor | None,
+        anchor_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Mask edges to prevent leakage during training.
+
+        Masking strategy (CaseLink-style):
+        - Only mask outgoing edges from anchor nodes
+        - Semantic similarity edges are kept for message passing
+        - Citations are NOT in the graph (stored in citation_pairs), so no need to mask them
+
+        This allows the GNN to use semantic neighbors for embeddings while preventing
+        the query from influencing its own neighborhood.
+        """
+        src, _ = edge_index
+        outgoing_from_anchor = src < anchor_count
+
+        keep_mask = ~outgoing_from_anchor
+        masked_edge_index = edge_index[:, keep_mask]
+        masked_edge_attr = edge_attr[keep_mask] if edge_attr is not None else None
+
+        return masked_edge_index, masked_edge_attr
+
+    # =========================================================================
+    # Semantic Edge Computation (TF-IDF and FAISS-based)
+    # =========================================================================
+
+    def _load_paragraph_texts(self) -> dict[str, str]:
+        """Load paragraph texts from judgments file for TF-IDF computation."""
+        print("Loading paragraph texts for TF-IDF...")
+        with open(self.judgments_path) as f:
+            judgments = json.load(f)
+
+        par_texts = {}
+        for celex, judgment in judgments.items():
+            for par_num, text in judgment.get("paragraphs", {}).items():
+                par_id = f"par:{celex}:{par_num}"
+                par_texts[par_id] = text
+
+        print(f"Loaded texts for {len(par_texts)} paragraphs")
+        return par_texts
+
+    def _compute_tfidf_semantic_edges(
+        self,
+        par_ids: list[str],
+        times: np.ndarray | None = None,
+        batch_size: int = 512,
+    ) -> list[tuple[int, int]]:
+        """Compute semantic similarity edges using TF-IDF with temporal constraints."""
+        if self.par_texts is None:
+            self.par_texts = self._load_paragraph_texts()
+
+        n = len(par_ids)
+        print(f"  Computing TF-IDF semantic edges for {n} paragraphs...")
+
+        # Get texts for the selected paragraphs
+        texts = [self.par_texts.get(par_id, "") for par_id in par_ids]
+
+        # Fit TF-IDF vectorizer if not already fitted
+        if self.tfidf_vectorizer is None:
+            print("  Fitting TF-IDF vectorizer...")
+            self.tfidf_vectorizer = TfidfVectorizer(
+                stop_words="english",
+                strip_accents="ascii",
+                norm="l2",
+                max_features=50000,
+            )
+            self.tfidf_vectorizer.fit(texts)
+
+        # Transform texts to TF-IDF vectors
+        print("  Transforming texts to TF-IDF vectors...")
+        tfidf_matrix = self.tfidf_vectorizer.transform(texts)
+
+        if times is None or not self.use_temporal_constraint:
+            edges = self._compute_tfidf_edges_no_temporal(tfidf_matrix, batch_size)
+        else:
+            edges = self._compute_tfidf_edges_temporal(tfidf_matrix, times, batch_size)
+
+        print(f"  Found {len(edges)} TF-IDF semantic similarity edges")
+        return edges
+
+    def _compute_tfidf_edges_no_temporal(
+        self,
+        tfidf_matrix: csr_matrix,
+        batch_size: int,
+    ) -> list[tuple[int, int]]:
+        """Compute TF-IDF edges without temporal constraints."""
+        n = tfidf_matrix.shape[0]
+        edges = []
+
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch = tfidf_matrix[start:end]
+
+            # Compute similarities (already L2 normalized, so dot product = cosine sim)
+            similarities = batch.dot(tfidf_matrix.T).toarray()
+
+            for i, orig_idx in enumerate(range(start, end)):
+                row_sims = similarities[i]
+                row_sims[orig_idx] = 0  # Zero out self-similarity
+
+                # Get top-k neighbors above threshold
+                top_indices = np.argsort(row_sims)[::-1][: self.semantic_max_neighbors]
+                for neighbor_idx in top_indices:
+                    if row_sims[neighbor_idx] >= self.semantic_threshold:
+                        edges.append((orig_idx, int(neighbor_idx)))
+
+        return edges
+
+    def _compute_tfidf_edges_temporal(
+        self,
+        tfidf_matrix: csr_matrix,
+        times: np.ndarray,
+        batch_size: int,
+    ) -> list[tuple[int, int]]:
+        """Compute TF-IDF edges with temporal constraints."""
+        n = tfidf_matrix.shape[0]
+
+        # Group indices by time
+        time_to_indices: dict[int, list[int]] = defaultdict(list)
+        for idx in range(n):
+            time_to_indices[times[idx]].append(idx)
+
+        unique_times = sorted(time_to_indices.keys())
+        print(f"  Processing {len(unique_times)} time groups chronologically...")
+
+        edges = []
+        accumulated_indices: list[int] = []
+        nodes_processed = 0
+
+        for time_idx, t in enumerate(unique_times):
+            group_indices = time_to_indices[t]
+            group_size = len(group_indices)
+
+            if accumulated_indices and group_size > 0:
+                # Get TF-IDF vectors for current group
+                group_tfidf = tfidf_matrix[group_indices]
+                # Get TF-IDF vectors for accumulated (earlier) nodes
+                accumulated_tfidf = tfidf_matrix[accumulated_indices]
+
+                # Process in batches
+                for batch_start in range(0, group_size, batch_size):
+                    batch_end = min(batch_start + batch_size, group_size)
+                    batch_indices = group_indices[batch_start:batch_end]
+                    batch_tfidf = group_tfidf[batch_start:batch_end]
+
+                    # Compute similarities with accumulated nodes
+                    similarities = batch_tfidf.dot(accumulated_tfidf.T).toarray()
+
+                    for i, orig_idx in enumerate(batch_indices):
+                        row_sims = similarities[i]
+                        top_local_indices = np.argsort(row_sims)[::-1][
+                            : self.semantic_max_neighbors
+                        ]
+                        for local_idx in top_local_indices:
+                            if row_sims[local_idx] >= self.semantic_threshold:
+                                neighbor_orig_idx = accumulated_indices[local_idx]
+                                edges.append((orig_idx, neighbor_orig_idx))
+
+            # Add current group to accumulated indices
+            accumulated_indices.extend(group_indices)
+            nodes_processed += group_size
+
+            if (time_idx + 1) % max(1, len(unique_times) // 10) == 0:
+                pct = 100 * (time_idx + 1) / len(unique_times)
         print(
-            f"  Languages: {known_count} known, {multi_count} multi, {unknown_count} unknown"
+            f"    {pct:.0f}% complete ({nodes_processed}/{n} nodes, {len(edges)} edges)"
         )
+
+        return edges
+
+    def _compute_faiss_semantic_edges(
+        self,
+        embeddings: np.ndarray,
+        times: np.ndarray | None = None,
+        batch_size: int = 1024,
+    ) -> list[tuple[int, int]]:
+        """Compute semantic similarity edges using FAISS with temporal constraints."""
+        n, d = embeddings.shape
+        print(f"  Computing semantic edges for {n} nodes using FAISS...")
+
+        # Normalize embeddings for cosine similarity
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms = np.where(norms > 1e-10, norms, 1.0)
+        embeddings_normalized = (embeddings / norms).astype(np.float32)
+
+        # Ensure contiguous array for FAISS
+        if not embeddings_normalized.flags["C_CONTIGUOUS"]:
+            embeddings_normalized = np.ascontiguousarray(embeddings_normalized)
+
+        if times is None:
+            edges = self._compute_faiss_edges_no_temporal(
+                embeddings_normalized, batch_size
+            )
+        else:
+            edges = self._compute_faiss_edges_temporal(
+                embeddings_normalized, times, batch_size
+            )
+
+        print(f"  Found {len(edges)} semantic similarity edges")
+        return edges
+
+    def _compute_faiss_edges_no_temporal(
+        self,
+        embeddings: np.ndarray,
+        batch_size: int,
+    ) -> list[tuple[int, int]]:
+        """Compute edges without temporal constraints using FAISS."""
+        n, d = embeddings.shape
+
+        index = faiss.IndexFlatIP(d)
+        if not embeddings.flags["C_CONTIGUOUS"]:
+            embeddings = np.ascontiguousarray(embeddings)
+        index.add(embeddings)
+
+        edges = []
+
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch_embs = embeddings[start:end]
+
+            k = min(self.semantic_max_neighbors + 1, n)
+            similarities, neighbors = index.search(batch_embs, k)
+
+            for i, orig_idx in enumerate(range(start, end)):
+                for j in range(k):
+                    neighbor_idx = neighbors[i, j]
+                    sim = similarities[i, j]
+
+                    if neighbor_idx == orig_idx:
+                        continue
+
+                    if sim >= self.article_threshold:
+                        edges.append((orig_idx, neighbor_idx))
+
+        return edges
+
+    def _compute_faiss_edges_temporal(
+        self,
+        embeddings: np.ndarray,
+        times: np.ndarray,
+        batch_size: int,
+    ) -> list[tuple[int, int]]:
+        """Compute edges with temporal constraints using FAISS."""
+        n, d = embeddings.shape
+
+        # Group indices by time
+        time_to_indices: dict[int, list[int]] = defaultdict(list)
+        for idx in range(n):
+            time_to_indices[times[idx]].append(idx)
+
+        unique_times = sorted(time_to_indices.keys())
+        print(f"  Processing {len(unique_times)} time groups chronologically...")
+
+        index = faiss.IndexFlatIP(d)
+        faiss_to_orig: list[int] = []
+
+        edges = []
+        nodes_processed = 0
+
+        for time_idx, t in enumerate(unique_times):
+            group_indices = time_to_indices[t]
+            group_size = len(group_indices)
+
+            if index.ntotal > 0 and group_size > 0:
+                group_embs = embeddings[group_indices]
+
+                if not group_embs.flags["C_CONTIGUOUS"]:
+                    group_embs = np.ascontiguousarray(group_embs)
+
+                for batch_start in range(0, group_size, batch_size):
+                    batch_end = min(batch_start + batch_size, group_size)
+                    batch_indices = group_indices[batch_start:batch_end]
+                    batch_embs = group_embs[batch_start:batch_end]
+
+                    if not batch_embs.flags["C_CONTIGUOUS"]:
+                        batch_embs = np.ascontiguousarray(batch_embs)
+
+                    k = min(self.semantic_max_neighbors, index.ntotal)
+                    similarities, faiss_neighbors = index.search(batch_embs, k)
+
+                    for i, orig_idx in enumerate(batch_indices):
+                        for j in range(k):
+                            sim = similarities[i, j]
+                            if sim >= self.article_threshold:
+                                faiss_idx = faiss_neighbors[i, j]
+                                neighbor_orig_idx = faiss_to_orig[faiss_idx]
+                                edges.append((orig_idx, neighbor_orig_idx))
+
+            # Add current group to the index for future searches
+            if group_size > 0:
+                group_embs = embeddings[group_indices]
+
+                if not group_embs.flags["C_CONTIGUOUS"]:
+                    group_embs = np.ascontiguousarray(group_embs)
+
+                index.add(group_embs)
+                faiss_to_orig.extend(group_indices)
+
+            nodes_processed += group_size
+
+            if (time_idx + 1) % max(1, len(unique_times) // 10) == 0:
+                pct = 100 * (time_idx + 1) / len(unique_times)
+        print(
+            f"    {pct:.0f}% complete ({nodes_processed}/{n} nodes, {len(edges)} edges)"
+        )
+
+        return edges
+
+    def build_graph(self, train_cutoff_year: int | None = None) -> Data:
+        """
+        Build semantic similarity graph.
+
+        Args:
+            train_cutoff_year: Only include paragraphs before this year
+
+        Returns:
+            graph_data: PyTorch Geometric Data object with:
+                - citation_pairs: [2, N] tensor of citation pairs (for training loss)
+                - num_par_nodes: Number of paragraph nodes
+                - num_art_nodes: Number of article nodes
+        """
+        selected_pars = self._filter_paragraphs(
+            self.include_only_citing, train_cutoff_year
+        )
+        print(f"Selected {len(selected_pars)} paragraphs")
+
+        # Build paragraph node mappings
+        par_node_id_to_idx: dict[str, int] = {}
+        doc_embeddings_list = []
+        query_embeddings_list = []
+        date_features_list = []
+        par_times = []
+        node_ids = []
+
+        for par_idx in selected_pars:
+            meta = self.par_metadata[par_idx]
+            node_id = meta["id"]
+            current_idx = len(par_node_id_to_idx)
+
+            par_node_id_to_idx[node_id] = current_idx
+            doc_embeddings_list.append(self.par_embeddings_doc[par_idx])
+            query_embeddings_list.append(self.par_embeddings_query[par_idx])
+
+            case_meta = meta.get("meta", {})
+            date_features_list.append(
+                self._extract_date_features(
+                    meta.get("date"), case_meta.get("application_date")
+                )
+            )
+            node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
+            par_times.append(self._date_to_timestamp(meta.get("date")))
+
+        num_par_nodes = len(par_node_id_to_idx)
+
+        # Build article nodes if enabled
+        art_node_id_to_idx: dict[str, int] = {}
+        art_embeddings_list = []
+
+        if self.include_article_nodes:
+            referenced_articles = set()
+            for src_id, tgt_id in self.citations:
+                if src_id in par_node_id_to_idx and tgt_id in self.art_id_to_idx:
+                    referenced_articles.add(tgt_id)
+
+            for art_id in referenced_articles:
+                art_orig_idx = self.art_id_to_idx[art_id]
+                current_idx = len(art_node_id_to_idx)
+                art_node_id_to_idx[art_id] = current_idx
+                art_embeddings_list.append(self.art_embeddings[art_orig_idx])
+
+            print(f"Selected {len(art_node_id_to_idx)} articles")
+
+        num_art_nodes = len(art_node_id_to_idx)
+        total_nodes = num_par_nodes + num_art_nodes
+
+        # Build edges
+        edge_list = []
+        edge_attr_list = []
+
+        # Collect citation pairs for loss computation (not as graph edges)
+        citation_src_list = []
+        citation_tgt_list = []
+        for src_id, tgt_id in self.citations:
+            if src_id in par_node_id_to_idx and tgt_id in par_node_id_to_idx:
+                citation_src_list.append(par_node_id_to_idx[src_id])
+                citation_tgt_list.append(par_node_id_to_idx[tgt_id])
+
+        print(f"  Citation pairs for training: {len(citation_src_list)}")
+
+        # TF-IDF semantic similarity edges
+        print("Computing TF-IDF semantic similarity edges...")
+        par_ids_in_order = [
+            self.par_metadata[selected_pars[idx]]["id"] for idx in range(num_par_nodes)
+        ]
+        par_times_array = np.array(par_times)
+
+        semantic_edges = self._compute_tfidf_semantic_edges(
+            par_ids_in_order,
+            times=par_times_array if self.use_temporal_constraint else None,
+        )
+        for src_idx, tgt_idx in semantic_edges:
+            edge_list.append([src_idx, tgt_idx])
+            edge_attr_list.append(0)  # similar_to
+            edge_list.append([tgt_idx, src_idx])
+            edge_attr_list.append(0)
+
+        print(f"  Semantic edges: {len(semantic_edges)} (bidirectional)")
+
+        # Article edges if enabled
+        if self.include_article_nodes and len(art_node_id_to_idx) > 0:
+            # Paragraph -> Article edges
+            par_art_edges = 0
+            for src_id, tgt_id in self.citations:
+                if src_id in par_node_id_to_idx and tgt_id in art_node_id_to_idx:
+                    par_idx = par_node_id_to_idx[src_id]
+                    art_idx = num_par_nodes + art_node_id_to_idx[tgt_id]
+                    edge_list.append([par_idx, art_idx])
+                    edge_attr_list.append(1)  # references_article
+                    edge_list.append([art_idx, par_idx])
+                    edge_attr_list.append(2)  # referenced_by_article
+                    par_art_edges += 1
+
+            print(f"  Paragraph-article edges: {par_art_edges} (bidirectional)")
+
+            # Article-article similarity edges
+            if len(art_node_id_to_idx) > 1:
+                print("Computing article similarity edges...")
+                art_emb_array = np.array(art_embeddings_list)
+
+                article_edges = self._compute_faiss_semantic_edges(
+                    art_emb_array,
+                    times=None,
+                )
+                for src_idx, tgt_idx in article_edges:
+                    global_src = num_par_nodes + src_idx
+                    global_tgt = num_par_nodes + tgt_idx
+                    edge_list.append([global_src, global_tgt])
+                    edge_attr_list.append(3)  # article_similar
+
+                print(f"  Article-article edges: {len(article_edges)}")
+
+        # Create embeddings tensors
+        all_doc_embeddings = doc_embeddings_list.copy()
+        all_query_embeddings = query_embeddings_list.copy()
+
+        if self.include_article_nodes and len(art_embeddings_list) > 0:
+            par_emb_dim = self.par_embeddings_doc.shape[1]
+            art_emb_dim = self.art_embeddings.shape[1]
+            art_emb_array = np.array(art_embeddings_list)
+
+            if art_emb_dim != par_emb_dim:
+                if art_emb_dim < par_emb_dim:
+                    padding = np.zeros(
+                        (len(art_embeddings_list), par_emb_dim - art_emb_dim)
+                    )
+                    art_emb_array = np.concatenate([art_emb_array, padding], axis=1)
+                else:
+                    art_emb_array = art_emb_array[:, :par_emb_dim]
+
+            for emb in art_emb_array:
+                all_doc_embeddings.append(emb)
+                all_query_embeddings.append(emb)
+
+        # Create tensors
+        x_doc = torch.tensor(np.array(all_doc_embeddings), dtype=torch.float32)
+        x_query = torch.tensor(np.array(all_query_embeddings), dtype=torch.float32)
+        date_features = torch.tensor(np.array(date_features_list), dtype=torch.float32)
+
+        # Extend date features for articles (zeros)
+        if self.include_article_nodes and num_art_nodes > 0:
+            art_date_features = np.zeros(
+                (num_art_nodes, date_features.shape[1]), dtype=np.float32
+            )
+            date_features = torch.cat(
+                [date_features, torch.tensor(art_date_features)], dim=0
+            )
+
+        if edge_list:
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+            edge_attr = torch.tensor(edge_attr_list, dtype=torch.long)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_attr = torch.empty((0,), dtype=torch.long)
+
+        # Time tensor (articles get time 0)
+        all_times = par_times.copy()
+        if self.include_article_nodes and num_art_nodes > 0:
+            all_times.extend([0] * num_art_nodes)
+        node_times_tensor = torch.tensor(all_times, dtype=torch.long)
+
+        node_ids_tensor = torch.stack(node_ids)
+
+        # Node type: 0 = paragraph, 1 = article
+        node_type = torch.zeros(total_nodes, dtype=torch.long)
+        if self.include_article_nodes and num_art_nodes > 0:
+            node_type[num_par_nodes:] = 1
+
+        # Citation pairs for training
+        if citation_src_list:
+            citation_pairs = torch.tensor(
+                [citation_src_list, citation_tgt_list], dtype=torch.long
+            )
+        else:
+            citation_pairs = torch.empty((2, 0), dtype=torch.long)
+
+        graph_data = Data(
+            x=x_doc,
+            x_query=x_query,
+            date_feature=date_features,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            num_nodes=total_nodes,
+            time=node_times_tensor,
+            node_id_hash=node_ids_tensor,
+            node_type=node_type,
+            num_par_nodes=num_par_nodes,
+            num_art_nodes=num_art_nodes,
+            citation_pairs=citation_pairs,
+        )
+
+        print(f"\nBuilt semantic graph:")
+        print(
+            f"  Nodes: {total_nodes} ({num_par_nodes} paragraphs, {num_art_nodes} articles)"
+        )
+        print(f"  Edges: {edge_index.shape[1]}")
+        print(f"  Citation pairs: {citation_pairs.shape[1]}")
 
         return graph_data
 
@@ -570,25 +1195,33 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
     Returns PyTorch Geometric HeteroData object.
     """
 
-    def build_graph(
+    def __init__(
         self,
-        train_cutoff_year: int | None = None,
+        preprocessed_dir: str,
         include_only_citing: bool = False,
-    ) -> HeteroData:
+    ):
         """
-        Build heterogeneous graph with case and act nodes.
+        Initialize heterogeneous graph builder.
+
+        Args:
+            preprocessed_dir: Directory containing preprocessed embeddings and metadata
+            include_only_citing: Only include paragraphs involved in citations
+        """
+        super().__init__(preprocessed_dir)
+        self.include_only_citing = include_only_citing
+
+    def build_graph(self, train_cutoff_year: int | None = None) -> HeteroData:
+        """Build heterogeneous graph with case and act nodes.
 
         Args:
             train_cutoff_year: Only include paragraphs before this year
-            include_only_citing: Only include paragraphs involved in citations
-
-        Returns:
-            graph_data: PyTorch Geometric HeteroData object
         """
         data = HeteroData()
 
         # Filter paragraphs
-        selected_pars = self._filter_paragraphs(include_only_citing, train_cutoff_year)
+        selected_pars = self._filter_paragraphs(
+            self.include_only_citing, train_cutoff_year
+        )
 
         # Build paragraph nodes
         par_node_id_to_idx: dict[str, int] = {}

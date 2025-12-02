@@ -13,6 +13,7 @@ from evaluator import EvaluatorMode
 from preprocessing.graph_builder import (
     HomogeneousGraphBuilder,
     HeterogeneousGraphBuilder,
+    SemanticGraphBuilder,
     decode_celex,
 )
 
@@ -52,28 +53,39 @@ def compute_recall_at_k(
 
 
 class SimpleIncrementalEvaluator:
-    """Incremental GNN evaluator with support for heterogeneous and homogeneous graphs."""
+    """Incremental GNN evaluator with support for different graph types."""
 
     def __init__(
         self,
         gnn_model: nn.Module,
-        preprocessed_dir: str,
+        graph_builder: "HomogeneousGraphBuilder | HeterogeneousGraphBuilder | SemanticGraphBuilder",
         par_to_par_path: str,
         train_cutoff_year: int = 2018,
         k_hops: int = 2,
         device: str | None = None,
         mode: EvaluatorMode = "citation_pairs",
         top_k: int = 10000,
-        graph_type: str = "homogeneous",
     ):
-        self.preprocessed_dir = preprocessed_dir
+        """
+        Initialize the incremental evaluator.
+
+        Args:
+            gnn_model: The GNN model to evaluate
+            graph_builder: Pre-configured graph builder instance
+            par_to_par_path: Path to paragraph-to-paragraph citation CSV
+            train_cutoff_year: Evaluate on data after this year
+            k_hops: Number of hops for neighbor sampling
+            device: Device to use (cuda/cpu)
+            mode: Evaluation mode ("citation_pairs" or other)
+            top_k: Number of top candidates to consider
+        """
+        self.graph_builder = graph_builder
         self.par_to_par_path = par_to_par_path
         self.train_cutoff_year = train_cutoff_year
         self.k_hops = k_hops
         self.mode = mode
         self.top_k = top_k
-        self.graph_type = graph_type
-        self.is_hetero = graph_type == "heterogeneous"
+        self.is_hetero = isinstance(graph_builder, HeterogeneousGraphBuilder)
 
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -82,24 +94,20 @@ class SimpleIncrementalEvaluator:
         self.gnn_model.eval()
 
         print(f"Using device: {self.device}")
-        print(f"Using graph type: {self.graph_type}")
+        print(f"Graph builder: {type(graph_builder).__name__}")
+        print(f"Train cutoff year: {self.train_cutoff_year}")
 
         self.graph_data = self._build_graph()
         self.embeddings = self._compute_initial_embeddings()
         self.citation_mask = self._build_citation_mask()
 
     def _build_graph(self) -> Data | HeteroData:
-        """Build the evaluation graph."""
+        """Build the evaluation graph using the provided graph builder."""
+        # For evaluation, we include all data (no cutoff) since we evaluate incrementally
+        graph = self.graph_builder.build_graph(train_cutoff_year=None)
         if self.is_hetero:
-            graph = HeterogeneousGraphBuilder(self.preprocessed_dir).build_graph(
-                include_only_citing=False
-            )
             return ToUndirected()(graph)
-        else:
-            return HomogeneousGraphBuilder(self.preprocessed_dir).build_graph(
-                include_only_citing=(self.mode == "citation_pairs"),
-                add_reverse_edges=True,
-            )
+        return graph
 
     def _build_citation_mask(self) -> torch.Tensor | None:
         """Build mask of paragraphs involved in citations (for hetero graphs in citation_pairs mode)."""
@@ -156,19 +164,20 @@ class SimpleIncrementalEvaluator:
             return self.gnn_model(modified)["paragraph"]
 
     def _compute_homo_embeddings(self, cutoff_ts: float) -> torch.Tensor:
-        """Compute embeddings for homogeneous graph (document embeddings for corpus)."""
+        """Compute embeddings for homogeneous graph (document embeddings for corpus).
+
+        Filters edges by time to ensure only past edges are used for initial embeddings.
+        """
         edge_index = self.graph_data.edge_index
         times = self.graph_data.time
+        edge_attr = getattr(self.graph_data, "edge_attr", None)
 
+        # Filter edges by time (only use edges where both nodes are before cutoff)
         mask = (times[edge_index[0]] < cutoff_ts) & (times[edge_index[1]] < cutoff_ts)
         filtered_edges = edge_index[:, mask]
-        filtered_attr = (
-            self.graph_data.edge_attr[mask]
-            if hasattr(self.graph_data, "edge_attr")
-            and self.graph_data.edge_attr is not None
-            else None
-        )
+        filtered_attr = edge_attr[mask] if edge_attr is not None else None
         language = getattr(self.graph_data, "language", None)
+        node_type = getattr(self.graph_data, "node_type", None)
 
         with torch.no_grad():
             # Use document encoder for corpus embeddings if dual encoder
@@ -186,9 +195,10 @@ class SimpleIncrementalEvaluator:
             return self.gnn_model(
                 self.graph_data.x,
                 filtered_edges,
-                date_feature=self.graph_data.date_feature,
+                date_feature=getattr(self.graph_data, "date_feature", None),
                 edge_attr=filtered_attr,
                 language=language,
+                node_type=node_type,
             )
 
     def _get_graph_attrs(self) -> tuple:
@@ -200,11 +210,18 @@ class SimpleIncrementalEvaluator:
                 self.graph_data["paragraph", "cites", "paragraph"].edge_index[0],
             )
         else:
-            edge_attr = getattr(self.graph_data, "edge_attr", None)
-            if edge_attr is not None:
-                source_nodes = self.graph_data.edge_index[0, edge_attr == 0]
+            # Use citation_pairs if available (CaseLink-style), otherwise edge_index
+            if (
+                hasattr(self.graph_data, "citation_pairs")
+                and self.graph_data.citation_pairs.size(1) > 0
+            ):
+                source_nodes = self.graph_data.citation_pairs[0]
             else:
-                source_nodes = self.graph_data.edge_index[0]
+                edge_attr = getattr(self.graph_data, "edge_attr", None)
+                if edge_attr is not None:
+                    source_nodes = self.graph_data.edge_index[0, edge_attr == 0]
+                else:
+                    source_nodes = self.graph_data.edge_index[0]
             return self.graph_data.time, self.graph_data.node_id_hash, source_nodes
 
     def _create_loader(self, input_nodes) -> NeighborLoader:
@@ -244,7 +261,7 @@ class SimpleIncrementalEvaluator:
             return self.gnn_model(modified)["paragraph"][:num_nodes]
 
     def _process_homo_subgraph(self, sub: Data, num_nodes: int) -> torch.Tensor:
-        """Process homogeneous subgraph."""
+        """Process homogeneous subgraph using the graph builder's masking strategy."""
         # Use query features for anchor nodes
         x = sub.x.clone()
         if hasattr(sub, "x_query"):
@@ -277,29 +294,23 @@ class SimpleIncrementalEvaluator:
                     ),
                 )
 
-            # Fall back to full model with edge masking
-            src, tgt = sub.edge_index
+            # Fall back to full model with edge masking via graph builder
             edge_attr = getattr(sub, "edge_attr", None)
             language = getattr(sub, "language", None)
+            node_type = getattr(sub, "node_type", None)
 
-            outgoing = src < num_nodes
-            incoming = tgt < num_nodes
-
-            if edge_attr is not None:
-                is_citation = (edge_attr == 0) | (edge_attr == 1)
-                leakage_mask = outgoing | (incoming & is_citation)
-            else:
-                leakage_mask = outgoing | incoming
-
-            masked_edges = sub.edge_index[:, ~leakage_mask]
-            masked_attr = edge_attr[~leakage_mask] if edge_attr is not None else None
+            # Use the graph builder's masking logic
+            masked_edges, masked_attr = self.graph_builder.mask_edges_for_training(
+                sub.edge_index, edge_attr, num_nodes
+            )
 
             embeddings = self.gnn_model(
                 x,
                 masked_edges,
-                date_feature=sub.date_feature,
+                date_feature=getattr(sub, "date_feature", None),
                 edge_attr=masked_attr,
                 language=language,
+                node_type=node_type,
             )
             return embeddings[:num_nodes]
 
@@ -317,6 +328,7 @@ class SimpleIncrementalEvaluator:
                 edge_attr = getattr(expanded_sub, "edge_attr", None)
                 date_feature = getattr(expanded_sub, "date_feature", None)
                 language = getattr(expanded_sub, "language", None)
+                node_type = getattr(expanded_sub, "node_type", None)
                 subject_matter = getattr(expanded_sub, "subject_matter", None)
                 keywords = getattr(expanded_sub, "keywords", None)
                 case_law_about = getattr(expanded_sub, "case_law_about", None)
@@ -339,6 +351,7 @@ class SimpleIncrementalEvaluator:
                         date_feature=date_feature,
                         edge_attr=edge_attr,
                         language=language,
+                        node_type=node_type,
                     )
 
         self.embeddings[sub_n_id] = embeddings[: len(sub_n_id)]
@@ -445,22 +458,35 @@ if __name__ == "__main__":
     layers = 1
 
     model = DualEncoderGNN(
-        input_dim=1024,
-        output_dim=1024 * 2,
+        input_dim=384,
+        output_dim=384,
         num_layers=layers,
-        fusion_mode="cross_attention",
+        fusion_mode="scalar",
     )
     model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
 
+    # Option 1: Citation-based graph (HomogeneousGraphBuilder)
+    graph_builder = HomogeneousGraphBuilder(
+        preprocessed_dir="data/preprocessed",
+        include_only_citing=True,
+    )
+
+    # Option 2: Semantic similarity graph (SemanticGraphBuilder / CaseLink-style)
+    # graph_builder = SemanticGraphBuilder(
+    #     preprocessed_dir="data/preprocessed",
+    #     judgments_path="data/judgments_cleaned.json",
+    #     semantic_threshold=0.3,
+    #     include_article_nodes=True,
+    # )
+
     evaluator = SimpleIncrementalEvaluator(
         gnn_model=model,
-        preprocessed_dir="data/preprocessed_new",
+        graph_builder=graph_builder,
         par_to_par_path="data/par-to-par-cleaned.csv",
-        train_cutoff_year=2018,
+        train_cutoff_year=2018,  # Evaluate on data after this year
         k_hops=layers,
         device="cuda" if torch.cuda.is_available() else "cpu",
         top_k=1000,
-        graph_type="homogeneous",
     )
 
     evaluator.run()
