@@ -52,7 +52,7 @@ def compute_recall_at_k(
     return len(set(top_k) & relevant_pids) / len(relevant_pids)
 
 
-class SimpleIncrementalEvaluator:
+class GNNEvaluator:
     """Incremental GNN evaluator with support for different graph types."""
 
     def __init__(
@@ -479,7 +479,7 @@ if __name__ == "__main__":
     #     include_article_nodes=True,
     # )
 
-    evaluator = SimpleIncrementalEvaluator(
+    evaluator = GNNEvaluator(
         gnn_model=model,
         graph_builder=graph_builder,
         par_to_par_path="data/par-to-par-cleaned.csv",
