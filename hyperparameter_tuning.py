@@ -44,6 +44,8 @@ WARMUP_EPOCHS = 5
 # Fixed model settings
 USE_LANGUAGE = False
 LANGUAGE_EMBED_DIM = 16
+FUSION_MODE = "cross_attention"
+CONV_TYPE = "sage"
 
 
 # ============================================================================
@@ -58,13 +60,11 @@ def create_gnn_model(trial: optuna.Trial) -> torch.nn.Module:
         num_layers=trial.suggest_int("num_layers", 1, 3),
         dropout=trial.suggest_float("dropout", 0.1, 0.5, step=0.1),
         num_heads=trial.suggest_categorical("num_heads", [1, 2, 4]),
-        fusion_mode=trial.suggest_categorical(
-            "fusion_mode", ["cross_attention", "scalar", "attention"]
-        ),
+        fusion_mode=FUSION_MODE,
         language_embed_dim=LANGUAGE_EMBED_DIM,
         use_language=USE_LANGUAGE,
         use_case_metadata=True,
-        conv_type=trial.suggest_categorical("conv_type", ["sage", "gat"]),
+        conv_type=CONV_TYPE,
     )
 
 
@@ -75,9 +75,7 @@ def create_mlp_model(trial: optuna.Trial) -> torch.nn.Module:
         num_layers=trial.suggest_int("num_layers", 1, 3),
         dropout=trial.suggest_float("dropout", 0.1, 0.5, step=0.1),
         num_heads=trial.suggest_categorical("num_heads", [1, 2, 4]),
-        fusion_mode=trial.suggest_categorical(
-            "fusion_mode", ["cross_attention", "scalar", "attention"]
-        ),
+        fusion_mode=FUSION_MODE,
         language_embed_dim=LANGUAGE_EMBED_DIM,
         use_language=USE_LANGUAGE,
         use_case_metadata=True,
@@ -102,19 +100,17 @@ def create_caselink_symmetric_model(trial: optuna.Trial) -> torch.nn.Module:
         num_layers=trial.suggest_int("num_layers", 1, 3),
         dropout=trial.suggest_float("dropout", 0.1, 0.5, step=0.1),
         num_heads=trial.suggest_categorical("num_heads", [1, 2, 4]),
-        fusion_mode=trial.suggest_categorical(
-            "fusion_mode", ["cross_attention", "scalar", "attention"]
-        ),
+        fusion_mode=FUSION_MODE,
         language_embed_dim=LANGUAGE_EMBED_DIM,
         use_language=USE_LANGUAGE,
         use_case_metadata=True,
-        conv_type=trial.suggest_categorical("conv_type", ["sage", "gat"]),
+        conv_type=CONV_TYPE,
     )
 
 
 def get_training_params(trial: optuna.Trial, model_name: str) -> dict:
     params = {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True),
         "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
         "temperature": trial.suggest_float("temperature", 0.03, 0.15, step=0.01),
         "batch_size": trial.suggest_categorical("batch_size", [256, 512, 1024]),
