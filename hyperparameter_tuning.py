@@ -234,10 +234,13 @@ def run_hyperparameter_search(
     model_name: str,
     n_trials: int = MAX_TRIALS,
     storage: str | None = None,
+    output_dir: str = "results/tuning",
 ) -> optuna.Study:
     """Run hyperparameter search for a specific model."""
+    os.makedirs(output_dir, exist_ok=True)
 
     study_name = f"{model_name}_tuning_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    output_path = os.path.join(output_dir, f"{study_name}.json")
 
     study = optuna.create_study(
         study_name=study_name,
@@ -270,9 +273,15 @@ def run_hyperparameter_search(
     print(
         f"Trials: {n_trials} | Epochs: {EPOCHS} | Patience: {EARLY_STOPPING_PATIENCE}"
     )
+    print(f"Results will be saved to: {output_path}")
+
+    # Create callback for continuous saving
+    save_callback = create_continuous_save_callback(output_path)
 
     start_time = time.time()
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(
+        objective, n_trials=n_trials, show_progress_bar=False, callbacks=[save_callback]
+    )
     elapsed = time.time() - start_time
 
     print(f"\n{'='*80}")
@@ -283,30 +292,50 @@ def run_hyperparameter_search(
     for k, v in study.best_params.items():
         print(f"  {k}: {v}")
     print(f"Time: {elapsed/3600:.2f} hours")
+    print(f"All results saved to: {output_path}")
 
     return study
 
 
-def save_results(
-    studies: dict[str, optuna.Study], output_dir: str = "results/tuning"
-) -> None:
-    os.makedirs(output_dir, exist_ok=True)
+def save_all_trials(study: optuna.Study, output_path: str) -> None:
+    """Save all trial results to a JSON file."""
+    trials_data = []
+    for trial in study.trials:
+        trial_data = {
+            "number": trial.number,
+            "value": trial.value,
+            "params": trial.params,
+            "state": trial.state.name,
+            "datetime_start": (
+                trial.datetime_start.isoformat() if trial.datetime_start else None
+            ),
+            "datetime_complete": (
+                trial.datetime_complete.isoformat() if trial.datetime_complete else None
+            ),
+        }
+        trials_data.append(trial_data)
 
     results = {
-        name: {
-            "best_value": study.best_value,
-            "best_params": study.best_params,
-            "n_trials": len(study.trials),
-        }
-        for name, study in studies.items()
+        "study_name": study.study_name,
+        "best_trial": study.best_trial.number if study.best_trial else None,
+        "best_value": study.best_value if study.best_trial else None,
+        "best_params": study.best_params if study.best_trial else None,
+        "n_trials": len(study.trials),
+        "trials": trials_data,
     }
 
-    path = os.path.join(
-        output_dir, f"tuning_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    )
-    with open(path, "w") as f:
+    with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nResults saved to {path}")
+
+
+def create_continuous_save_callback(output_path: str):
+    """Create a callback that saves results after each trial."""
+
+    def callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        save_all_trials(study, output_path)
+        print(f"Results saved to {output_path} (trial {trial.number})")
+
+    return callback
 
 
 def main():
@@ -318,9 +347,9 @@ def main():
     )
     parser.add_argument("--n_trials", type=int, default=MAX_TRIALS)
     parser.add_argument("--storage", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default="results/tuning")
     args = parser.parse_args()
 
-    studies = {}
     models = (
         ["gnn", "mlp", "caselink", "caselink_symmetric"]
         if args.model == "all"
@@ -328,9 +357,7 @@ def main():
     )
 
     for model in models:
-        studies[model] = run_hyperparameter_search(model, args.n_trials, args.storage)
-
-    save_results(studies)
+        run_hyperparameter_search(model, args.n_trials, args.storage, args.output_dir)
 
 
 if __name__ == "__main__":
