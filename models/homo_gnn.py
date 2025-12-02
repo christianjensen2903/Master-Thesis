@@ -280,6 +280,7 @@ class DualEncoderGNN(nn.Module):
         language_embed_dim: int = 16,
         use_case_metadata: bool = True,
         fusion_mode: str = "scalar",
+        conv_type: str = "sage",
     ):
         super().__init__()
         if output_dim is None:
@@ -293,6 +294,7 @@ class DualEncoderGNN(nn.Module):
         self.language_embed_dim = language_embed_dim if use_language else 0
         self.use_case_metadata = use_case_metadata
         self.fusion_mode = fusion_mode
+        self.conv_type = conv_type
 
         # Separate date encoder for each date type (judgment_date, application_date)
         # Each encodes to input_dim to preserve relative-time property in dot products
@@ -327,7 +329,18 @@ class DualEncoderGNN(nn.Module):
         self.norms = nn.ModuleList()
 
         for _ in range(num_layers):
-            self.convs.append(SAGEConv(output_dim, output_dim, aggr="mean"))
+            if conv_type == "gat":
+                self.convs.append(
+                    GATConv(
+                        output_dim,
+                        output_dim,
+                        heads=num_heads,
+                        concat=False,
+                        dropout=dropout,
+                    )
+                )
+            else:  # default to sage
+                self.convs.append(SAGEConv(output_dim, output_dim, aggr="mean"))
             self.norms.append(nn.LayerNorm(output_dim))
 
         self.dropout = nn.Dropout(dropout)
@@ -484,6 +497,7 @@ class SymmetricGNN(nn.Module):
         language_embed_dim: int = 16,
         use_case_metadata: bool = True,
         fusion_mode: str = "scalar",
+        conv_type: str = "sage",
     ):
         super().__init__()
         if output_dim is None:
@@ -497,6 +511,7 @@ class SymmetricGNN(nn.Module):
         self.language_embed_dim = language_embed_dim if use_language else 0
         self.use_case_metadata = use_case_metadata
         self.fusion_mode = fusion_mode
+        self.conv_type = conv_type
 
         # Date encoder (shared)
         self.date_encoder = SinusoidalDateEncoder(output_dim, num_dates=1)
@@ -528,7 +543,18 @@ class SymmetricGNN(nn.Module):
         self.norms = nn.ModuleList()
 
         for _ in range(num_layers):
-            self.convs.append(SAGEConv(output_dim, output_dim, aggr="mean"))
+            if conv_type == "gat":
+                self.convs.append(
+                    GATConv(
+                        output_dim,
+                        output_dim,
+                        heads=num_heads,
+                        concat=False,
+                        dropout=dropout,
+                    )
+                )
+            else:  # default to sage
+                self.convs.append(SAGEConv(output_dim, output_dim, aggr="mean"))
             self.norms.append(nn.LayerNorm(output_dim))
 
         self.dropout = nn.Dropout(dropout)
