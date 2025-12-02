@@ -1253,6 +1253,8 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         self,
         preprocessed_dir: str,
         include_only_citing: bool = False,
+        include_articles: bool = True,
+        include_citations: bool = True,
     ):
         """
         Initialize heterogeneous graph builder.
@@ -1260,9 +1262,13 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         Args:
             preprocessed_dir: Directory containing preprocessed embeddings and metadata
             include_only_citing: Only include paragraphs involved in citations
+            include_articles: Include article and legal_act nodes in the graph
+            include_citations: Include citation edges between paragraphs
         """
         super().__init__(preprocessed_dir)
         self.include_only_citing = include_only_citing
+        self.include_articles = include_articles
+        self.include_citations = include_citations
 
     def build_graph(self, train_cutoff_year: int | None = None) -> HeteroData:
         """Build heterogeneous graph with case and act nodes.
@@ -1316,27 +1322,28 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
                     "authentic_language": case_meta.get("authentic_language"),
                 }
 
-        # Build article nodes (all articles)
+        # Build article nodes (all articles) - only if include_articles is True
         art_node_id_to_idx: dict[str, int] = {}
         art_idx_to_metadata: dict[int, dict] = {}
-        art_embeddings_list = []
-        art_times = []
+        art_embeddings_list: list[np.ndarray] = []
+        art_times: list[int] = []
         act_to_art_indices: dict[str, list[int]] = defaultdict(list)
 
-        for art_idx, meta in enumerate(self.art_metadata):
-            node_id = meta["id"]
-            current_idx = len(art_node_id_to_idx)
+        if self.include_articles:
+            for art_idx, meta in enumerate(self.art_metadata):
+                node_id = meta["id"]
+                current_idx = len(art_node_id_to_idx)
 
-            art_node_id_to_idx[node_id] = current_idx
-            art_idx_to_metadata[current_idx] = meta
-            art_embeddings_list.append(self.art_embeddings[art_idx])
+                art_node_id_to_idx[node_id] = current_idx
+                art_idx_to_metadata[current_idx] = meta
+                art_embeddings_list.append(self.art_embeddings[art_idx])
 
-            # Articles don't have dates, use 0
-            art_times.append(0)
+                # Articles don't have dates, use 0
+                art_times.append(0)
 
-            # Track which articles belong to each legal act
-            celex = meta["celex"]
-            act_to_art_indices[celex].append(current_idx)
+                # Track which articles belong to each legal act
+                celex = meta["celex"]
+                act_to_art_indices[celex].append(current_idx)
 
         # Build case nodes with case-level metadata
         case_node_id_to_idx: dict[str, int] = {}
@@ -1406,28 +1413,29 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
                 "timestamp": case_timestamp,
             }
 
-        # Build legal act nodes (average of articles)
+        # Build legal act nodes (average of articles) - only if include_articles is True
         act_node_id_to_idx: dict[str, int] = {}
         act_idx_to_metadata: dict[int, dict] = {}
-        act_embeddings_list = []
-        act_times = []
+        act_embeddings_list: list[np.ndarray] = []
+        act_times: list[int] = []
 
-        for celex, art_indices in act_to_art_indices.items():
-            current_idx = len(act_node_id_to_idx)
-            act_node_id_to_idx[f"act:{celex}"] = current_idx
+        if self.include_articles:
+            for celex, art_indices in act_to_art_indices.items():
+                current_idx = len(act_node_id_to_idx)
+                act_node_id_to_idx[f"act:{celex}"] = current_idx
 
-            # Average embeddings of all articles in act
-            act_emb = np.mean([art_embeddings_list[i] for i in art_indices], axis=0)
-            act_embeddings_list.append(act_emb)
+                # Average embeddings of all articles in act
+                act_emb = np.mean([art_embeddings_list[i] for i in art_indices], axis=0)
+                act_embeddings_list.append(act_emb)
 
-            act_times.append(0)  # Acts don't have temporal info
+                act_times.append(0)  # Acts don't have temporal info
 
-            act_idx_to_metadata[current_idx] = {
-                "id": f"act:{celex}",
-                "type": "legal_act",
-                "celex": celex,
-                "num_articles": len(art_indices),
-            }
+                act_idx_to_metadata[current_idx] = {
+                    "id": f"act:{celex}",
+                    "type": "legal_act",
+                    "celex": celex,
+                    "num_articles": len(art_indices),
+                }
 
         # Add node features
         # Paragraph nodes: just embeddings (no case-level info)
@@ -1440,32 +1448,35 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         data["paragraph"].time = torch.tensor(par_times, dtype=torch.long)
         data["paragraph"].node_id_hash = par_node_ids_tensor  # Hashed node IDs
 
-        data["article"].x = torch.tensor(
-            np.array(art_embeddings_list), dtype=torch.float32
-        )
-        data["article"].time = torch.tensor(art_times, dtype=torch.long)
+        if self.include_articles:
+            data["article"].x = torch.tensor(
+                np.array(art_embeddings_list), dtype=torch.float32
+            )
+            data["article"].time = torch.tensor(art_times, dtype=torch.long)
 
         # Case nodes: case-level metadata (date, language, subject_matter, keywords, case_law_about)
         data["case"].x = torch.tensor(np.array(case_features_list), dtype=torch.float32)
         data["case"].time = torch.tensor(case_times, dtype=torch.long)
 
-        data["legal_act"].x = torch.tensor(
-            np.array(act_embeddings_list), dtype=torch.float32
-        )
-        data["legal_act"].time = torch.tensor(act_times, dtype=torch.long)
+        if self.include_articles:
+            data["legal_act"].x = torch.tensor(
+                np.array(act_embeddings_list), dtype=torch.float32
+            )
+            data["legal_act"].time = torch.tensor(act_times, dtype=torch.long)
 
-        # Build edges: citation (bidirectional)
+        # Build edges: citation (bidirectional) - only if include_citations is True
         citation_edges = []
-        for src_id, tgt_id in self.citations:
-            if src_id in par_node_id_to_idx and tgt_id in par_node_id_to_idx:
-                src_idx = par_node_id_to_idx[src_id]
-                tgt_idx = par_node_id_to_idx[tgt_id]
-                citation_edges.append([src_idx, tgt_idx])
-                citation_edges.append([tgt_idx, src_idx])
+        if self.include_citations:
+            for src_id, tgt_id in self.citations:
+                if src_id in par_node_id_to_idx and tgt_id in par_node_id_to_idx:
+                    src_idx = par_node_id_to_idx[src_id]
+                    tgt_idx = par_node_id_to_idx[tgt_id]
+                    citation_edges.append([src_idx, tgt_idx])
+                    citation_edges.append([tgt_idx, src_idx])
 
-        if citation_edges:
-            edge_index = torch.tensor(citation_edges, dtype=torch.long).t()
-            data["paragraph", "cites", "paragraph"].edge_index = edge_index
+            if citation_edges:
+                edge_index = torch.tensor(citation_edges, dtype=torch.long).t()
+                data["paragraph", "cites", "paragraph"].edge_index = edge_index
 
         # Build edges: sequential (prev/next paragraph in same case)
         sequential_edges = []
@@ -1497,28 +1508,35 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             # Add reverse edge
             data["case", "contains", "paragraph"].edge_index = edge_index.flip([0])
 
-        # Build edges: article -> legal_act
-        art_to_act_edges = []
-        for celex, art_indices in act_to_art_indices.items():
-            act_idx = act_node_id_to_idx[f"act:{celex}"]
-            for art_idx in art_indices:
-                art_to_act_edges.append([art_idx, act_idx])
+        # Build edges: article -> legal_act - only if include_articles is True
+        if self.include_articles:
+            art_to_act_edges = []
+            for celex, art_indices in act_to_art_indices.items():
+                act_idx = act_node_id_to_idx[f"act:{celex}"]
+                for art_idx in art_indices:
+                    art_to_act_edges.append([art_idx, act_idx])
 
-        if art_to_act_edges:
-            edge_index = torch.tensor(art_to_act_edges, dtype=torch.long).t()
-            data["article", "belongs_to", "legal_act"].edge_index = edge_index
-            # Add reverse edge
-            data["legal_act", "contains", "article"].edge_index = edge_index.flip([0])
+            if art_to_act_edges:
+                edge_index = torch.tensor(art_to_act_edges, dtype=torch.long).t()
+                data["article", "belongs_to", "legal_act"].edge_index = edge_index
+                # Add reverse edge
+                data["legal_act", "contains", "article"].edge_index = edge_index.flip(
+                    [0]
+                )
 
         print(f"Built heterogeneous graph:")
         print(
             f"  Paragraphs: {len(par_doc_embeddings_list)} (embedding dim: {x_doc.shape[1]})"
         )
-        print(f"  Articles: {len(art_embeddings_list)}")
+        if self.include_articles:
+            print(f"  Articles: {len(art_embeddings_list)}")
         print(
             f"  Cases: {len(case_features_list)} (feature dim: {data['case'].x.shape[1]})"
         )
-        print(f"  Legal acts: {len(act_embeddings_list)}")
+        if self.include_articles:
+            print(f"  Legal acts: {len(act_embeddings_list)}")
         print(f"  Edge types: {len(data.edge_types)}")
+        print(f"  Include citations: {self.include_citations}")
+        print(f"  Include articles: {self.include_articles}")
 
         return data
