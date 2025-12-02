@@ -1,6 +1,8 @@
 from gnn_trainers import GNNTrainer
 from models import HeteroGNN, DualEncoderGNN
 from preprocessing.graph_builder import HeterogeneousGraphBuilder
+from gnn_evaluator import GNNEvaluator
+import torch
 
 
 def train_hetero_example() -> None:
@@ -14,7 +16,7 @@ def train_hetero_example() -> None:
     # Build graph to get metadata
     print("Building graph to extract metadata...")
     builder = HeterogeneousGraphBuilder("data/preprocessed")
-    sample_graph = builder.build_graph(train_cutoff_year=2018, include_only_citing=True)
+    sample_graph = builder.build_graph(train_cutoff_year=2018)
 
     # Extract metadata (node types and edge types)
     metadata = (
@@ -24,33 +26,64 @@ def train_hetero_example() -> None:
     print(f"Node types: {metadata[0]}")
     print(f"Edge types: {metadata[1]}")
 
+    # Get input dimensions per node type
+    # Paragraph/article nodes: paragraph embeddings (384)
+    # Case nodes: date(3) + language(23) + subject_matter(384) + keywords(384) + case_law_about(384)
+    # Legal act nodes: averaged article embeddings (384)
+    node_input_dims = {
+        node_type: sample_graph[node_type].x.shape[1]
+        for node_type in sample_graph.node_types
+    }
+    print(f"Node input dimensions: {node_input_dims}")
+
     # Initialize heterogeneous GNN
+    layers = 2
     model = HeteroGNN(
         input_dim=in_channels,
         hidden_dim=in_channels,
         output_dim=in_channels,
-        num_layers=2,
+        num_layers=layers,
         metadata=metadata,
+        node_input_dims=node_input_dims,
     )
+
+    graph_builder = HeterogeneousGraphBuilder("data/preprocessed")
 
     # Initialize trainer with heterogeneous graph type
     trainer = GNNTrainer(
-        preprocessed_dir="data/preprocessed",
+        graph_builder=graph_builder,
         output_path="checkpoints/hetero_gnn",
-        batch_size=2**10,
-        epochs=400,
-        learning_rate=5e-5,
-        weight_decay=1e-4,
-        temperature=0.07,
-        num_hops=2,
-        graph_type="heterogeneous",  # Use heterogeneous graph
+        batch_size=512,
+        epochs=50,
+        learning_rate=1e-3,
+        weight_decay=1e-3,
+        temperature=0.05,
+        num_hops=layers,
+        warmup_epochs=3,
+        early_stopping_patience=5,
+        early_stopping_min_delta=1e-3,
+        eval_every_n_epochs=1,
     )
 
     # Train on paragraph pairs
     cutoff_year = 2018
-    trainer.train(model, cutoff_year)
+    val_cutoff_year = 2022
+    trainer.train(model, cutoff_year, val_cutoff_year)
 
     print("\nTraining complete!")
+
+    # Load best model
+    model.load_state_dict(torch.load("checkpoints/hetero_gnn/best_model.pt"))
+
+    evaluator = GNNEvaluator(
+        gnn_model=model,
+        graph_builder=graph_builder,
+        par_to_par_path="data/par-to-par-cleaned.csv",
+        train_cutoff_year=cutoff_year,
+        k_hops=layers,
+        top_k=1000,
+    )
+    evaluator.run(k_values=[5, 10, 100])
 
 
 def train_homo_example() -> None:
@@ -183,8 +216,8 @@ def train_mlp_baseline_example() -> None:
 
 if __name__ == "__main__":
     # Train heterogeneous GNN (uses all edge types)
-    # train_hetero_example()
+    train_hetero_example()
 
     # Or train homogeneous GNN (citation edges only)
-    train_homo_example()
+    # train_homo_example()
     # train_caselink_example()

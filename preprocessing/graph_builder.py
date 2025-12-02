@@ -698,8 +698,11 @@ class SemanticGraphBuilder(BaseGraphBuilder):
     def _get_cache_key(self, par_ids: list[str], use_temporal: bool) -> str:
         """Generate a cache key based on parameters."""
         import hashlib
+
         # Include all parameters that affect the edges
-        params = f"{self.semantic_threshold}_{self.semantic_max_neighbors}_{use_temporal}"
+        params = (
+            f"{self.semantic_threshold}_{self.semantic_max_neighbors}_{use_temporal}"
+        )
         par_ids_hash = hashlib.md5("_".join(sorted(par_ids)).encode()).hexdigest()[:16]
         return f"semantic_edges_{params}_{par_ids_hash}"
 
@@ -1281,8 +1284,9 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         par_query_embeddings_list = []
         par_times = []
         par_node_ids = []
-        par_language_multihot_list = []
         case_to_par_indices: dict[str, list[int]] = defaultdict(list)
+        # Track case-level info for case nodes
+        case_info: dict[str, dict] = {}
 
         for par_idx in selected_pars:
             meta = self.par_metadata[par_idx]
@@ -1299,14 +1303,18 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             date_str = meta.get("date")
             par_times.append(self._date_to_timestamp(date_str))
 
-            # Add language multihot encoding
-            case_meta = meta.get("meta", {})
-            authentic_language = case_meta.get("authentic_language")
-            par_language_multihot_list.append(encode_language(authentic_language))
-
             # Track which paragraphs belong to each case
             celex = meta["celex"]
             case_to_par_indices[celex].append(current_idx)
+
+            # Store case-level info (only once per case)
+            if celex not in case_info:
+                case_meta = meta.get("meta", {})
+                case_info[celex] = {
+                    "date": meta.get("date"),
+                    "application_date": case_meta.get("application_date"),
+                    "authentic_language": case_meta.get("authentic_language"),
+                }
 
         # Build article nodes (all articles)
         art_node_id_to_idx: dict[str, int] = {}
@@ -1330,21 +1338,61 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             celex = meta["celex"]
             act_to_art_indices[celex].append(current_idx)
 
-        # Build case nodes (average of paragraphs)
+        # Build case nodes with case-level metadata
         case_node_id_to_idx: dict[str, int] = {}
         case_idx_to_metadata: dict[int, dict] = {}
-        case_embeddings_list = []
+        case_features_list = []
         case_times = []
+
+        # Determine case feature dimension
+        if self.has_case_metadata:
+            # Features: date(3) + language(NUM_LANGUAGES) + subject_matter + keywords + case_law_about
+            case_emb_dim = (
+                3
+                + NUM_LANGUAGES
+                + self.case_embeddings_subject_matter.shape[1]
+                + self.case_embeddings_keywords.shape[1]
+                + self.case_embeddings_case_law_about.shape[1]
+            )
+        else:
+            # Fallback: date(3) + language(NUM_LANGUAGES)
+            case_emb_dim = 3 + NUM_LANGUAGES
 
         for celex, par_indices in case_to_par_indices.items():
             current_idx = len(case_node_id_to_idx)
             case_node_id_to_idx[f"case:{celex}"] = current_idx
 
-            # Average embeddings of all paragraphs in case (use doc embeddings)
-            case_emb = np.mean(
-                [par_doc_embeddings_list[i] for i in par_indices], axis=0
+            # Get case info
+            info = case_info.get(celex, {})
+
+            # Date features (3 dims)
+            date_features = self._extract_date_features(
+                info.get("date"), info.get("application_date")
             )
-            case_embeddings_list.append(case_emb)
+
+            # Language multihot (NUM_LANGUAGES dims)
+            language_features = encode_language(info.get("authentic_language"))
+
+            # Build case feature vector
+            if self.has_case_metadata and celex in self.celex_to_case_idx:
+                case_idx = self.celex_to_case_idx[celex]
+                case_features = np.concatenate(
+                    [
+                        date_features,
+                        language_features,
+                        self.case_embeddings_subject_matter[case_idx],
+                        self.case_embeddings_keywords[case_idx],
+                        self.case_embeddings_case_law_about[case_idx],
+                    ]
+                )
+            else:
+                # Fallback: just date and language features, padded with zeros
+                case_features = np.zeros(case_emb_dim, dtype=np.float32)
+                case_features[: 3 + NUM_LANGUAGES] = np.concatenate(
+                    [date_features, language_features]
+                )
+
+            case_features_list.append(case_features)
 
             # Use earliest paragraph's date timestamp
             case_timestamp = min(par_times[i] for i in par_indices)
@@ -1382,27 +1430,23 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             }
 
         # Add node features
+        # Paragraph nodes: just embeddings (no case-level info)
         x_doc = torch.tensor(np.array(par_doc_embeddings_list), dtype=torch.float32)
         x_query = torch.tensor(np.array(par_query_embeddings_list), dtype=torch.float32)
         par_node_ids_tensor = torch.stack(par_node_ids)
-        par_language_tensor = torch.tensor(
-            np.array(par_language_multihot_list), dtype=torch.float32
-        )
 
-        data["paragraph"].x = x_doc  # Default to document embeddings
+        data["paragraph"].x = x_doc  # Document embeddings
         data["paragraph"].x_query = x_query  # Query embeddings
         data["paragraph"].time = torch.tensor(par_times, dtype=torch.long)
         data["paragraph"].node_id_hash = par_node_ids_tensor  # Hashed node IDs
-        data["paragraph"].language = par_language_tensor  # Language indices
 
         data["article"].x = torch.tensor(
             np.array(art_embeddings_list), dtype=torch.float32
         )
         data["article"].time = torch.tensor(art_times, dtype=torch.long)
 
-        data["case"].x = torch.tensor(
-            np.array(case_embeddings_list), dtype=torch.float32
-        )
+        # Case nodes: case-level metadata (date, language, subject_matter, keywords, case_law_about)
+        data["case"].x = torch.tensor(np.array(case_features_list), dtype=torch.float32)
         data["case"].time = torch.tensor(case_times, dtype=torch.long)
 
         data["legal_act"].x = torch.tensor(
@@ -1467,9 +1511,13 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             data["legal_act", "contains", "article"].edge_index = edge_index.flip([0])
 
         print(f"Built heterogeneous graph:")
-        print(f"  Paragraphs: {len(par_doc_embeddings_list)}")
+        print(
+            f"  Paragraphs: {len(par_doc_embeddings_list)} (embedding dim: {x_doc.shape[1]})"
+        )
         print(f"  Articles: {len(art_embeddings_list)}")
-        print(f"  Cases: {len(case_embeddings_list)}")
+        print(
+            f"  Cases: {len(case_features_list)} (feature dim: {data['case'].x.shape[1]})"
+        )
         print(f"  Legal acts: {len(act_embeddings_list)}")
         print(f"  Edge types: {len(data.edge_types)}")
 
