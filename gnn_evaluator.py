@@ -197,7 +197,6 @@ class GNNEvaluator:
             edge_attr[mask].to(self.device) if edge_attr is not None else None
         )
         language = getattr(self.graph_data, "language", None)
-        node_type = getattr(self.graph_data, "node_type", None)
 
         # Move features to device
         x = self.graph_data.x.to(self.device)
@@ -206,8 +205,6 @@ class GNNEvaluator:
             date_feature = date_feature.to(self.device)
         if language is not None:
             language = language.to(self.device)
-        if node_type is not None:
-            node_type = node_type.to(self.device)
         subject_matter = getattr(self.graph_data, "subject_matter", None)
         if subject_matter is not None:
             subject_matter = subject_matter.to(self.device)
@@ -238,7 +235,9 @@ class GNNEvaluator:
                     date_feature=date_feature,
                     edge_attr=filtered_attr,
                     language=language,
-                    node_type=node_type,
+                    subject_matter=subject_matter,
+                    keywords=keywords,
+                    case_law_about=case_law_about,
                 )
             return emb.cpu()
 
@@ -344,8 +343,11 @@ class GNNEvaluator:
 
             # Fall back to full model with edge masking via graph builder
             edge_attr = getattr(sub, "edge_attr", None)
+            date_feature = getattr(sub, "date_feature", None)
             language = getattr(sub, "language", None)
-            node_type = getattr(sub, "node_type", None)
+            subject_matter = getattr(sub, "subject_matter", None)
+            keywords = getattr(sub, "keywords", None)
+            case_law_about = getattr(sub, "case_law_about", None)
 
             # Use the graph builder's masking logic
             masked_edges, masked_attr = self.graph_builder.mask_edges_for_training(
@@ -358,7 +360,9 @@ class GNNEvaluator:
                 date_feature=getattr(sub, "date_feature", None),
                 edge_attr=masked_attr,
                 language=language,
-                node_type=node_type,
+                subject_matter=subject_matter,
+                keywords=keywords,
+                case_law_about=case_law_about,
             )
             return embeddings[:num_nodes].cpu()
 
@@ -378,7 +382,6 @@ class GNNEvaluator:
                 edge_attr = getattr(expanded_sub, "edge_attr", None)
                 date_feature = getattr(expanded_sub, "date_feature", None)
                 language = getattr(expanded_sub, "language", None)
-                node_type = getattr(expanded_sub, "node_type", None)
                 subject_matter = getattr(expanded_sub, "subject_matter", None)
                 keywords = getattr(expanded_sub, "keywords", None)
                 case_law_about = getattr(expanded_sub, "case_law_about", None)
@@ -401,7 +404,9 @@ class GNNEvaluator:
                         date_feature=date_feature,
                         edge_attr=edge_attr,
                         language=language,
-                        node_type=node_type,
+                        subject_matter=subject_matter,
+                        keywords=keywords,
+                        case_law_about=case_law_about,
                     )
 
         self.embeddings[sub_n_id] = embeddings[: len(sub_n_id)].cpu()
@@ -551,11 +556,11 @@ class GNNEvaluator:
 
 
 if __name__ == "__main__":
-    from models import DualEncoderGNN
+    from models import DualEncoderGNN, SymmetricGNN
 
     layers = 1
 
-    model = DualEncoderGNN(
+    model = SymmetricGNN(
         input_dim=384,
         output_dim=384,
         num_layers=layers,
