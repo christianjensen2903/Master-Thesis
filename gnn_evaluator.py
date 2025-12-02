@@ -102,7 +102,11 @@ class GNNEvaluator:
         self.citation_mask = self._build_citation_mask()
 
     def _build_graph(self) -> Data | HeteroData:
-        """Build the evaluation graph using the provided graph builder."""
+        """Build the evaluation graph using the provided graph builder.
+
+        Note: Graph stays on CPU for NeighborLoader compatibility.
+        Batches are moved to GPU during processing.
+        """
         # For evaluation, we include all data (no cutoff) since we evaluate incrementally
         graph = self.graph_builder.build_graph(train_cutoff_year=None)
         if self.is_hetero:
@@ -161,7 +165,9 @@ class GNNEvaluator:
             modified[edge_type].edge_index = edge_index[:, mask]
 
         with torch.no_grad():
-            return self.gnn_model(modified)["paragraph"]
+            # Move to device for model inference
+            modified = modified.to(self.device)
+            return self.gnn_model(modified)["paragraph"].cpu()
 
     def _compute_homo_embeddings(self, cutoff_ts: float) -> torch.Tensor:
         """Compute embeddings for homogeneous graph (document embeddings for corpus).
@@ -174,32 +180,55 @@ class GNNEvaluator:
 
         # Filter edges by time (only use edges where both nodes are before cutoff)
         mask = (times[edge_index[0]] < cutoff_ts) & (times[edge_index[1]] < cutoff_ts)
-        filtered_edges = edge_index[:, mask]
-        filtered_attr = edge_attr[mask] if edge_attr is not None else None
+        filtered_edges = edge_index[:, mask].to(self.device)
+        filtered_attr = (
+            edge_attr[mask].to(self.device) if edge_attr is not None else None
+        )
         language = getattr(self.graph_data, "language", None)
         node_type = getattr(self.graph_data, "node_type", None)
+
+        # Move features to device
+        x = self.graph_data.x.to(self.device)
+        date_feature = getattr(self.graph_data, "date_feature", None)
+        if date_feature is not None:
+            date_feature = date_feature.to(self.device)
+        if language is not None:
+            language = language.to(self.device)
+        if node_type is not None:
+            node_type = node_type.to(self.device)
+        subject_matter = getattr(self.graph_data, "subject_matter", None)
+        if subject_matter is not None:
+            subject_matter = subject_matter.to(self.device)
+        keywords = getattr(self.graph_data, "keywords", None)
+        if keywords is not None:
+            keywords = keywords.to(self.device)
+        case_law_about = getattr(self.graph_data, "case_law_about", None)
+        if case_law_about is not None:
+            case_law_about = case_law_about.to(self.device)
 
         with torch.no_grad():
             # Use document encoder for corpus embeddings if dual encoder
             if hasattr(self.gnn_model, "encode_document"):
-                return self.gnn_model.encode_document(
-                    self.graph_data.x,
+                emb = self.gnn_model.encode_document(
+                    x,
                     filtered_edges,
-                    date_feature=getattr(self.graph_data, "date_feature", None),
+                    date_feature=date_feature,
                     edge_attr=filtered_attr,
                     language=language,
-                    subject_matter=getattr(self.graph_data, "subject_matter", None),
-                    keywords=getattr(self.graph_data, "keywords", None),
-                    case_law_about=getattr(self.graph_data, "case_law_about", None),
+                    subject_matter=subject_matter,
+                    keywords=keywords,
+                    case_law_about=case_law_about,
                 )
-            return self.gnn_model(
-                self.graph_data.x,
-                filtered_edges,
-                date_feature=getattr(self.graph_data, "date_feature", None),
-                edge_attr=filtered_attr,
-                language=language,
-                node_type=node_type,
-            )
+            else:
+                emb = self.gnn_model(
+                    x,
+                    filtered_edges,
+                    date_feature=date_feature,
+                    edge_attr=filtered_attr,
+                    language=language,
+                    node_type=node_type,
+                )
+            return emb.cpu()
 
     def _get_graph_attrs(self) -> tuple:
         """Get graph attributes based on graph type."""
@@ -244,6 +273,9 @@ class GNNEvaluator:
 
     def _process_hetero_subgraph(self, sub: HeteroData, num_nodes: int) -> torch.Tensor:
         """Process heterogeneous subgraph."""
+        # Move subgraph to device
+        sub = sub.to(self.device)
+
         cite_edges = sub["paragraph", "cites", "paragraph"].edge_index
         src, tgt = cite_edges
 
@@ -258,10 +290,13 @@ class GNNEvaluator:
         modified["paragraph"].x = x
 
         with torch.no_grad():
-            return self.gnn_model(modified)["paragraph"][:num_nodes]
+            return self.gnn_model(modified)["paragraph"][:num_nodes].cpu()
 
     def _process_homo_subgraph(self, sub: Data, num_nodes: int) -> torch.Tensor:
         """Process homogeneous subgraph using the graph builder's masking strategy."""
+        # Move subgraph to device
+        sub = sub.to(self.device)
+
         # Use query features for anchor nodes
         x = sub.x.clone()
         if hasattr(sub, "x_query"):
@@ -275,7 +310,7 @@ class GNNEvaluator:
                 subject_matter = getattr(sub, "subject_matter", None)
                 keywords = getattr(sub, "keywords", None)
                 case_law_about = getattr(sub, "case_law_about", None)
-                return self.gnn_model.encode_query(
+                emb = self.gnn_model.encode_query(
                     x[:num_nodes],
                     date_feature=(
                         date_feature[:num_nodes] if date_feature is not None else None
@@ -293,6 +328,7 @@ class GNNEvaluator:
                         else None
                     ),
                 )
+                return emb.cpu()
 
             # Fall back to full model with edge masking via graph builder
             edge_attr = getattr(sub, "edge_attr", None)
@@ -312,7 +348,7 @@ class GNNEvaluator:
                 language=language,
                 node_type=node_type,
             )
-            return embeddings[:num_nodes]
+            return embeddings[:num_nodes].cpu()
 
     def _update_embeddings(self, sub: Data | HeteroData, sub_n_id: torch.Tensor):
         """Update embeddings for nodes in the subgraph (document embeddings)."""
@@ -320,6 +356,8 @@ class GNNEvaluator:
             ("paragraph", sub_n_id) if self.is_hetero else sub_n_id
         )
         expanded_sub = next(iter(loader))
+        # Move subgraph to device
+        expanded_sub = expanded_sub.to(self.device)
 
         with torch.no_grad():
             if self.is_hetero:
@@ -354,7 +392,7 @@ class GNNEvaluator:
                         node_type=node_type,
                     )
 
-        self.embeddings[sub_n_id] = embeddings[: len(sub_n_id)]
+        self.embeddings[sub_n_id] = embeddings[: len(sub_n_id)].cpu()
 
     def run(self, k_values: list[int] = [5, 10, 100]) -> float:
         """Run full incremental evaluation."""

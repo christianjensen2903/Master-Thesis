@@ -552,6 +552,9 @@ class GNNTrainer:
             for batch_idx, batch in enumerate(
                 tqdm(loader, desc=f"{desc} batches", leave=False)
             ):
+                # Move batch to device (NeighborLoader keeps data on CPU)
+                batch = batch.to(self.device)
+
                 batch_data = (
                     self._process_hetero_batch(batch)
                     if self.is_hetero
@@ -601,11 +604,15 @@ class GNNTrainer:
         return avg_loss, batch_counter, avg_stats
 
     def _build_graph(self, train_cutoff_year: int | None = None):
-        """Build graph using the configured graph builder."""
+        """Build graph using the configured graph builder.
+
+        Note: Graph stays on CPU for NeighborLoader compatibility.
+        Batches are moved to GPU in _run_epoch.
+        """
         graph = self.graph_builder.build_graph(train_cutoff_year=train_cutoff_year)
         if self.is_hetero:
-            return ToUndirected()(graph.to(self.device))
-        return graph.to(self.device)
+            return ToUndirected()(graph)
+        return graph
 
     def _get_input_nodes(self, graph_data):
         """Get input nodes (nodes with citation edges or citation pairs)."""
