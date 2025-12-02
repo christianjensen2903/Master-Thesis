@@ -208,52 +208,94 @@ class GNNEvaluator:
         self,
         filtered_edges: torch.Tensor,
         filtered_attr: torch.Tensor | None,
+        batch_size: int = 50000,
     ) -> torch.Tensor:
-        """Compute embeddings for all nodes at once (fallback)."""
-        language = getattr(self.graph_data, "language", None)
+        """Compute embeddings using batched inference to avoid OOM.
 
-        # Move features to device
-        x = self.graph_data.x.to(self.device)
-        date_feature = getattr(self.graph_data, "date_feature", None)
-        if date_feature is not None:
-            date_feature = date_feature.to(self.device)
-        if language is not None:
-            language = language.to(self.device)
-        subject_matter = getattr(self.graph_data, "subject_matter", None)
-        if subject_matter is not None:
-            subject_matter = subject_matter.to(self.device)
-        keywords = getattr(self.graph_data, "keywords", None)
-        if keywords is not None:
-            keywords = keywords.to(self.device)
-        case_law_about = getattr(self.graph_data, "case_law_about", None)
-        if case_law_about is not None:
-            case_law_about = case_law_about.to(self.device)
+        Uses NeighborLoader to sample subgraphs for each batch of nodes,
+        then extracts embeddings for the seed nodes only.
+        """
+        num_nodes = self.graph_data.x.size(0)
+
+        # Create a temporary graph with filtered edges for the loader
+        temp_graph = Data(
+            x=self.graph_data.x,
+            edge_index=filtered_edges.cpu(),
+            edge_attr=filtered_attr.cpu() if filtered_attr is not None else None,
+            time=self.graph_data.time,
+        )
+        # Copy optional attributes
+        for attr in [
+            "date_feature",
+            "language",
+            "subject_matter",
+            "keywords",
+            "case_law_about",
+        ]:
+            if hasattr(self.graph_data, attr):
+                setattr(temp_graph, attr, getattr(self.graph_data, attr))
+
+        # Use NeighborLoader to batch through all nodes
+        loader = NeighborLoader(
+            data=temp_graph,
+            num_neighbors=[-1] * self.k_hops,
+            input_nodes=torch.arange(num_nodes),
+            batch_size=batch_size,
+            shuffle=False,
+        )
+
+        output_dim: int = getattr(
+            self.gnn_model, "output_dim", self.graph_data.x.size(1)
+        )
+        all_embeddings = torch.zeros(num_nodes, output_dim)
 
         with torch.no_grad():
-            # Use document encoder for corpus embeddings if dual encoder
-            if hasattr(self.gnn_model, "encode_document"):
-                emb = self.gnn_model.encode_document(
-                    x,
-                    filtered_edges,
-                    date_feature=date_feature,
-                    edge_attr=filtered_attr,
-                    language=language,
-                    subject_matter=subject_matter,
-                    keywords=keywords,
-                    case_law_about=case_law_about,
-                )
-            else:
-                emb = self.gnn_model(
-                    x,
-                    filtered_edges,
-                    date_feature=date_feature,
-                    edge_attr=filtered_attr,
-                    language=language,
-                    subject_matter=subject_matter,
-                    keywords=keywords,
-                    case_law_about=case_law_about,
-                )
-            return emb.cpu()
+            for batch in tqdm(loader, desc="Computing initial embeddings"):
+                batch = batch.to(self.device)
+                batch_size_actual = batch.batch_size
+
+                # Get optional attributes
+                date_feature = getattr(batch, "date_feature", None)
+                language = getattr(batch, "language", None)
+                subject_matter = getattr(batch, "subject_matter", None)
+                keywords = getattr(batch, "keywords", None)
+                case_law_about = getattr(batch, "case_law_about", None)
+                edge_attr = getattr(batch, "edge_attr", None)
+
+                # Compute embeddings
+                if hasattr(self.gnn_model, "encode_document"):
+                    emb = self.gnn_model.encode_document(
+                        batch.x,
+                        batch.edge_index,
+                        date_feature=date_feature,
+                        edge_attr=edge_attr,
+                        language=language,
+                        subject_matter=subject_matter,
+                        keywords=keywords,
+                        case_law_about=case_law_about,
+                    )
+                else:
+                    emb = self.gnn_model(
+                        batch.x,
+                        batch.edge_index,
+                        date_feature=date_feature,
+                        edge_attr=edge_attr,
+                        language=language,
+                        subject_matter=subject_matter,
+                        keywords=keywords,
+                        case_law_about=case_law_about,
+                    )
+
+                # Store only seed node embeddings
+                all_embeddings[batch.n_id[:batch_size_actual]] = emb[
+                    :batch_size_actual
+                ].cpu()
+
+                # Clear cache periodically
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        return all_embeddings
 
     def _get_graph_attrs(self) -> tuple:
         """Get graph attributes based on graph type."""
