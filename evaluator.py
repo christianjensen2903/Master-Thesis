@@ -1,9 +1,8 @@
 import json
-import os
 import csv
 from datetime import datetime as dt
 from collections import defaultdict
-from typing import Literal, Any
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -12,7 +11,6 @@ from numba import njit, prange  # type: ignore
 
 from retrievers.base_retriever import BaseRetriever
 
-# Type alias for evaluator modes
 EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
 
 
@@ -20,7 +18,6 @@ EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
 def compute_ap_fast(
     ranked_pids: NDArray, relevant_pids: NDArray, max_rank: int
 ) -> float:
-    """Numba-optimized Average Precision calculation."""
     num_rel = len(relevant_pids)
     if num_rel == 0:
         return 0.0
@@ -28,9 +25,7 @@ def compute_ap_fast(
     precision_sum = 0.0
     num_found = 0
 
-    # Use simple loop - numba will optimize this
     for i in range(min(max_rank, len(ranked_pids))):
-        # Check if ranked_pids[i] is in relevant_pids
         is_relevant = False
         for j in range(len(relevant_pids)):
             if ranked_pids[i] == relevant_pids[j]:
@@ -48,15 +43,12 @@ def compute_ap_fast(
 def compute_recall_at_k_fast(
     ranked_pids: NDArray, relevant_pids: NDArray, k: int
 ) -> float:
-    """Numba-optimized Recall@k calculation."""
     num_rel = len(relevant_pids)
     if num_rel == 0:
         return 0.0
 
     num_found = 0
-
     for i in range(min(k, len(ranked_pids))):
-        # Check if ranked_pids[i] is in relevant_pids
         for j in range(len(relevant_pids)):
             if ranked_pids[i] == relevant_pids[j]:
                 num_found += 1
@@ -72,13 +64,6 @@ def compute_metrics_batch(
     max_ranks: NDArray,
     k_values: NDArray,
 ) -> tuple[NDArray, NDArray]:
-    """
-    Compute MAP and Recall@k for a batch of queries in parallel.
-
-    Returns:
-        avg_precs: Array of average precision scores
-        recall_matrix: Shape (n_queries, n_k_values) of recall scores
-    """
     n_queries = len(ranked_pids_list)
     n_k = len(k_values)
 
@@ -90,10 +75,8 @@ def compute_metrics_batch(
         relevant = relevant_pids_list[idx]
         max_rank = max_ranks[idx]
 
-        # Compute AP
         avg_precs[idx] = compute_ap_fast(ranked, relevant, max_rank)
 
-        # Compute Recall@k for all k values
         for k_idx in range(n_k):
             recall_matrix[idx, k_idx] = compute_recall_at_k_fast(
                 ranked, relevant, k_values[k_idx]
@@ -121,7 +104,7 @@ class Evaluator:
         self.train_cutoff_year = train_cutoff_year
         self.top_k = top_k
 
-        # Data structures (populated by load_and_prepare)
+        # Data structures
         self.pid_to_text: NDArray[np.object_] | None = None
         self.celex_number_to_pid: dict[tuple[str, int], int] | None = None
         self.paragraph_dates: NDArray | None = None
@@ -134,38 +117,25 @@ class Evaluator:
         self.query_embeddings: NDArray | None = None
         self.qrel: dict[int, list[int]] | None = None
 
-        self.sort_idx: NDArray | None = None
-        self.sorted_dates: NDArray | None = None
-
         self.map_score: float | None = None
         self.recall_scores: dict[int, float] | None = None
         self.map_ci: tuple[float, float] | None = None
         self.recall_cis: dict[int, tuple[float, float]] | None = None
 
     def load_and_prepare(self) -> None:
-        """Load all data and prepare for evaluation."""
-        # Load all paragraphs from judgments.json
         self._load_paragraphs()
-
-        # Load citation pairs from par-to-par CSV
         self._load_citation_pairs()
 
-        # Filter paragraphs for citation_pairs mode
         if self.mode == "citation_pairs":
             self._filter_to_citation_paragraphs()
 
-        # Prepare temporal index
-        self._prepare_temporal_index()
-
     def _load_paragraphs(self) -> None:
-        """Load all paragraphs from judgments.json."""
         print("Loading judgments...")
         with open(self.judgments_path) as f:
             judgments = json.load(f)
 
         paragraphs = []
         for celex, judgment in tqdm(judgments.items(), desc="Processing judgments"):
-            # Get date from meta
             meta = judgment.get("meta", {})
             date_str = meta.get("date")
 
@@ -188,10 +158,8 @@ class Evaluator:
                     }
                 )
 
-        # Sort paragraphs by (celex, number) to maintain document order
         paragraphs.sort(key=lambda p: (p["celex"], p["number"]))
 
-        # Build arrays
         self.pid_to_text = np.array([p["text"] for p in paragraphs], dtype=object)
         self.celex_number_to_pid = {
             (p["celex"], p["number"]): pid for pid, p in enumerate(paragraphs)
@@ -206,14 +174,12 @@ class Evaluator:
         self.paragraph_set = np.array([p["set_type"] for p in paragraphs], dtype=object)
 
     def _load_citation_pairs(self) -> None:
-        """Load citation pairs from par-to-par CSV file."""
         assert self.celex_number_to_pid is not None
         assert self.pid_to_text is not None
 
         print(f"Loading citation pairs from {self.par_to_par_path}...")
 
-        # Read CSV file
-        query_texts_dict: dict[tuple[str, int], str] = {}  # query_key -> query_text
+        query_texts_dict: dict[tuple[str, int], str] = {}
         qrel_dict: dict[tuple[str, int], list[tuple[str, int]]] = defaultdict(list)
 
         skipped = 0
@@ -229,7 +195,6 @@ class Evaluator:
                 query_key = (celex_from, number_from)
                 doc_key = (celex_to, number_to)
 
-                # Skip if either paragraph not in our index
                 if (
                     query_key not in self.celex_number_to_pid
                     or doc_key not in self.celex_number_to_pid
@@ -237,7 +202,6 @@ class Evaluator:
                     skipped += 1
                     continue
 
-                # Store query text from TEXT_FROM
                 if query_key not in query_texts_dict:
                     query_texts_dict[query_key] = text_from
 
@@ -246,14 +210,12 @@ class Evaluator:
         if skipped > 0:
             print(f"Skipped {skipped} citation pairs (paragraphs not in index)")
 
-        # Build query lists
         query_keys = sorted(query_texts_dict.keys())
         self.query_pids = [self.celex_number_to_pid[key] for key in query_keys]
         self.query_texts = np.array(
             [query_texts_dict[key] for key in query_keys], dtype=object
         )
 
-        # Build qrel mapping (query_pid -> list of doc_pids)
         self.qrel = {}
         for query_key in query_keys:
             query_pid = self.celex_number_to_pid[query_key]
@@ -268,7 +230,6 @@ class Evaluator:
         )
 
     def _filter_to_citation_paragraphs(self) -> None:
-        """Filter paragraphs to only those involved in citations for citation_pairs mode."""
         assert self.qrel is not None
         assert self.pid_to_text is not None
         assert self.celex_number_to_pid is not None
@@ -281,33 +242,26 @@ class Evaluator:
 
         print("Filtering to citation-involved paragraphs...")
 
-        # Collect all paragraphs involved in any citation
         citation_involved_pids: set[int] = set()
         for query_pid, cited_pids in self.qrel.items():
             citation_involved_pids.add(query_pid)
             citation_involved_pids.update(cited_pids)
 
-        # Create sorted list of citation-involved pids
         old_pids = sorted(citation_involved_pids)
-
-        # Create mapping from old pid to new pid
         old_to_new_pid = {old_pid: new_pid for new_pid, old_pid in enumerate(old_pids)}
 
-        # Filter all arrays to only citation-involved paragraphs
         self.pid_to_text = self.pid_to_text[old_pids]
         self.paragraph_dates = self.paragraph_dates[old_pids]
         self.paragraph_celex = self.paragraph_celex[old_pids]
         self.paragraph_number = self.paragraph_number[old_pids]
         self.paragraph_set = self.paragraph_set[old_pids]
 
-        # Update celex_number_to_pid mapping
         new_celex_number_to_pid = {}
         for (celex, number), old_pid in self.celex_number_to_pid.items():
             if old_pid in old_to_new_pid:
                 new_celex_number_to_pid[(celex, number)] = old_to_new_pid[old_pid]
         self.celex_number_to_pid = new_celex_number_to_pid
 
-        # Update query_pids and query_texts
         new_query_pids = []
         new_query_texts = []
         old_query_texts = self.query_texts
@@ -318,7 +272,6 @@ class Evaluator:
         self.query_pids = new_query_pids
         self.query_texts = np.array(new_query_texts, dtype=object)
 
-        # Update qrel
         new_qrel: dict[int, list[int]] = {}
         for old_query_pid, old_cited_pids in self.qrel.items():
             if old_query_pid in old_to_new_pid:
@@ -336,50 +289,38 @@ class Evaluator:
             f"Filtered from {len(citation_involved_pids)} to {len(old_pids)} citation-involved paragraphs"
         )
 
-    def _prepare_temporal_index(self) -> None:
-        """Pre-sort paragraph IDs by date for temporal filtering."""
-        assert self.paragraph_dates is not None
-        self.sort_idx = np.argsort(self.paragraph_dates)
-        self.sorted_dates = self.paragraph_dates[self.sort_idx]
-
     def _embed_queries(self) -> None:
-        """Embed query texts using the retriever."""
         assert self.query_texts is not None
         assert self.query_pids is not None
         assert self.paragraph_celex is not None
         assert self.paragraph_number is not None
 
-        query_texts = self.query_texts
-
         print("Embedding queries...")
 
-        # Build paragraph IDs for queries
         query_paragraph_ids = [
             (self.paragraph_celex[pid], int(self.paragraph_number[pid]))
             for pid in self.query_pids
         ]
 
-        # Check if retriever has a special method for queries (e.g., GNN)
         if hasattr(self.retriever, "transform_queries"):
             query_embeddings = self.retriever.transform_queries(
-                query_texts, paragraph_ids=query_paragraph_ids
+                self.query_texts, paragraph_ids=query_paragraph_ids
             )
         else:
-            # Standard transform for all other retrievers
             query_embeddings = self.retriever.transform(
-                query_texts, paragraph_ids=query_paragraph_ids
+                self.query_texts, paragraph_ids=query_paragraph_ids
             )
 
         self.query_embeddings = query_embeddings
         print(f"Query embeddings shape: {query_embeddings.shape}")
 
-    def evaluate_map_and_recall(
+    def evaluate_iterative(
         self,
         k_values: list[int] = [5, 10, 50, 100],
         confidence: float = 0.95,
         n_bootstrap: int = 1000,
     ) -> tuple[float, dict[int, float]]:
-        """Combined MAP and Recall evaluation using numba for speed."""
+        """Iterative evaluation: process queries chronologically, building index incrementally."""
         assert self.embeddings is not None
         assert self.pid_to_text is not None
         assert self.paragraph_set is not None
@@ -387,87 +328,119 @@ class Evaluator:
         assert self.query_pids is not None
         assert self.query_embeddings is not None
         assert self.paragraph_dates is not None
-        assert self.sorted_dates is not None
-        assert self.sort_idx is not None
 
-        # Create pid to query index mapping
-        pid_to_query_idx = {pid: idx for idx, pid in enumerate(self.query_pids)}
-
-        # Filter queries to test set only
+        # Get test queries with relevance judgments
         test_query_pids = [
             pid
             for pid in self.query_pids
             if self.paragraph_set[pid] == "test" and pid in self.qrel
         ]
 
-        # Prepare batch data for numba processing
+        if not test_query_pids:
+            self.map_score = 0.0
+            self.recall_scores = {k: 0.0 for k in k_values}
+            return self.map_score, self.recall_scores
+
+        pid_to_query_idx = {pid: idx for idx, pid in enumerate(self.query_pids)}
+
+        # Convert dates to timestamps for grouping
+        all_times = self.paragraph_dates.astype("datetime64[s]").astype(np.int64)
+
+        # Group all paragraphs by time
+        time_to_doc_pids: dict[int, list[int]] = defaultdict(list)
+        for pid in range(len(self.pid_to_text)):
+            time_to_doc_pids[all_times[pid]].append(pid)
+
+        # Group test queries by time
+        time_to_query_pids: dict[int, list[int]] = defaultdict(list)
+        for pid in test_query_pids:
+            time_to_query_pids[all_times[pid]].append(pid)
+
+        # Get all unique times and sort
+        all_unique_times = sorted(
+            set(time_to_doc_pids.keys()) | set(time_to_query_pids.keys())
+        )
+
+        # Create index
+        emb_dim = self.embeddings.shape[1]
+        self.retriever.create_index(emb_dim)
+
+        # Results storage
         ranked_pids_list: list[NDArray] = []
         relevant_pids_list: list[NDArray] = []
         max_ranks: list[int] = []
 
-        desc = (
-            f"Retrieving for MAP@{self.top_k} + Recall"
-            if self.top_k
-            else "Retrieving for MAP + Recall"
+        top_k = self.top_k if self.top_k else 10000
+        metric_name = f"MAP@{self.top_k}" if self.top_k else "MAP"
+
+        print(f"Processing {len(all_unique_times)} time groups chronologically...")
+        pbar = tqdm(
+            total=len(test_query_pids), desc=f"Iterative {metric_name} + Recall"
         )
 
-        # First pass: retrieve and collect data
-        for query_pid in tqdm(test_query_pids, desc=desc):
-            query_date = self.paragraph_dates[query_pid]
+        for t in all_unique_times:
+            # First, process queries at this timestamp
+            # They search against documents already in index (time < t)
+            query_pids_at_t = time_to_query_pids.get(t, [])
+            if query_pids_at_t:
+                query_indices = [pid_to_query_idx[pid] for pid in query_pids_at_t]
+                query_embs = self.query_embeddings[query_indices]
 
-            # Get all paragraphs strictly older than query
-            cutoff = int(np.searchsorted(self.sorted_dates, query_date, side="left"))
-            if cutoff == 0:
-                continue
+                # Search against accumulated index
+                retrieved_pids, _ = self.retriever.search_index(query_embs, top_k)
 
-            # Candidate set: all paragraphs before the query
-            cand_pids = self.sort_idx[:cutoff]
+                # Process results for each query
+                for i, query_pid in enumerate(query_pids_at_t):
+                    relevant_list = self.qrel.get(query_pid, [])
+                    if not relevant_list:
+                        pbar.update(1)
+                        continue
 
-            if len(cand_pids) == 0:
-                continue
+                    relevant_array = np.array(relevant_list, dtype=np.int64)
+                    ranked = retrieved_pids[i]
 
-            # Ground truth: relevant paragraphs that are also in candidate set
-            relevant_list = self.qrel[query_pid]
-            relevant_array = np.array(relevant_list, dtype=np.int64)
+                    # Filter to valid (non-negative) results
+                    valid_mask = ranked >= 0
+                    ranked = ranked[valid_mask]
 
-            # Fast intersection using numpy
-            relevant_mask = np.isin(relevant_array, cand_pids)
-            relevant_pids = relevant_array[relevant_mask]
-            num_rel = len(relevant_pids)
+                    if len(ranked) == 0:
+                        pbar.update(1)
+                        continue
 
-            if num_rel == 0:
-                continue
+                    # Filter relevant to those with time < query time
+                    relevant_in_candidates = relevant_array[
+                        all_times[relevant_array] < t
+                    ]
 
-            # Get query embedding
-            query_idx = pid_to_query_idx[query_pid]
-            query_embedding = self.query_embeddings[query_idx]
+                    if len(relevant_in_candidates) == 0:
+                        pbar.update(1)
+                        continue
 
-            # Retrieve and rank candidates once
-            ranked_pids = self.retriever.retrieve(
-                query_embedding, self.embeddings, cand_pids, top_k=self.top_k
-            )
+                    max_rank = min(len(ranked), top_k)
 
-            if len(ranked_pids) == 0:
-                continue
+                    ranked_pids_list.append(ranked.astype(np.int64))
+                    relevant_pids_list.append(relevant_in_candidates)
+                    max_ranks.append(max_rank)
 
-            # Compute max rank
-            max_rank = (
-                len(ranked_pids)
-                if self.top_k is None
-                else min(len(ranked_pids), self.top_k)
-            )
+                    pbar.update(1)
 
-            # Store for batch processing
-            ranked_pids_list.append(ranked_pids.astype(np.int64))
-            relevant_pids_list.append(relevant_pids)
-            max_ranks.append(max_rank)
+            # Then, add documents with this timestamp to the index
+            # (they become available as candidates for future queries)
+            doc_pids_at_t = time_to_doc_pids.get(t, [])
+            if doc_pids_at_t:
+                doc_pids_array = np.array(doc_pids_at_t, dtype=np.int64)
+                doc_embeddings = self.embeddings[doc_pids_array]
+                self.retriever.add_to_index(doc_embeddings, doc_pids_array)
+
+        pbar.close()
+        self.retriever.reset_index()
 
         if not ranked_pids_list:
             self.map_score = 0.0
             self.recall_scores = {k: 0.0 for k in k_values}
             return self.map_score, self.recall_scores
 
-        # Second pass: compute metrics in parallel using numba
+        # Compute metrics using numba
         print("Computing metrics with numba...")
         k_values_array = np.array(k_values, dtype=np.int64)
         max_ranks_array = np.array(max_ranks, dtype=np.int64)
@@ -489,6 +462,7 @@ class Evaluator:
             )
             for idx, k in enumerate(k_values)
         }
+
         return self.map_score, self.recall_scores
 
     def _bootstrap_confidence_interval(
@@ -536,26 +510,22 @@ class Evaluator:
             print("\nGenerating embeddings from retriever...")
             train_mask = self.paragraph_set == "train"
 
-            # Build paragraph IDs for all paragraphs
             paragraph_ids = [
                 (self.paragraph_celex[pid], int(self.paragraph_number[pid]))
                 for pid in range(len(self.pid_to_text))
             ]
 
-            # Fit on training data, transform on all data
             self.retriever.fit(self.pid_to_text, mask=train_mask)
             self.embeddings = self.retriever.transform(
                 self.pid_to_text, paragraph_ids=paragraph_ids
             )
             print(f"Embeddings shape: {self.embeddings.shape}")
 
-            # Save embeddings if retriever supports it
             if hasattr(self.retriever, "save_embeddings"):
                 save_path = getattr(self.retriever, "save_embeddings_path", None)
                 if save_path:
                     self.retriever.save_embeddings(self.embeddings, save_path)
         else:
-            # Validate embeddings match paragraph index
             if len(self.embeddings) != len(self.pid_to_text):
                 raise ValueError(
                     f"Embeddings size mismatch: got {len(self.embeddings)} embeddings "
@@ -563,12 +533,11 @@ class Evaluator:
                     f"You must regenerate embeddings in '{self.mode}' mode."
                 )
 
-        # Embed queries using cleaned query texts
         self._embed_queries()
 
         metric_name = f"MAP@{self.top_k}" if self.top_k else "MAP"
         print(f"\nComputing {metric_name} and Recall@k with confidence intervals...")
-        score, recall_scores = self.evaluate_map_and_recall([5, 10, 100])
+        score, recall_scores = self.evaluate_iterative([5, 10, 100])
 
         map_ci = self.map_ci if self.map_ci is not None else (score, score)
         print(
@@ -585,15 +554,12 @@ class Evaluator:
 
 if __name__ == "__main__":
     from retrievers import DenseRetriever, TfidfRetriever, BOWRetriever
-    import torch
-    from sentence_transformers import SentenceTransformer
 
-    retriever = TfidfRetriever(
-        stop_words="english",
-        strip_accents="ascii",
-        norm="l2",
-    )
-
+    # retriever = TfidfRetriever(
+    #     stop_words="english",
+    #     strip_accents="ascii",
+    #     norm="l2",
+    # )
     # retriever = BOWRetriever(
     #     lowercase=True,
     #     stop_words="english",
@@ -604,12 +570,11 @@ if __name__ == "__main__":
 
     evaluator = Evaluator(
         retriever=retriever,
-        mode="all_paragraphs",
+        # mode="all_paragraphs",
         judgments_path="data/judgments_cleaned.json",
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
         top_k=10000,
-        # save_embeddings_path="artifacts/simcse_embeddings.npy",
     )
 
     evaluator.run()

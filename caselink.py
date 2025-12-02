@@ -7,10 +7,11 @@ https://arxiv.org/abs/2403.17780
 Key adaptations:
 - Cases → Paragraphs (our main entities)
 - Charges → Legal Articles (articles/provisions cited by paragraphs)
-- Case-case semantic edges → Paragraph semantic similarity edges
+- Case-case semantic edges → Paragraph semantic similarity edges (via TF-IDF)
 - Case-charge edges → Paragraph-to-article citation edges
 """
 
+import json
 import pickle
 import os
 from pathlib import Path
@@ -22,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv, GATConv
+from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import csr_matrix
 
 # Fix OpenMP conflict on macOS (FAISS and PyTorch may use different OpenMP runtimes)
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -52,8 +55,11 @@ class CaseLinkGraphBuilder:
     Edge type 4 is used for neighbor sampling but should be masked during message passing.
     """
 
-    def __init__(self, preprocessed_dir: str):
+    def __init__(
+        self, preprocessed_dir: str, judgments_path: str = "data/judgments_cleaned.json"
+    ):
         self.preprocessed_dir = Path(preprocessed_dir)
+        self.judgments_path = judgments_path
 
         # Load paragraph embeddings
         doc_emb_path = self.preprocessed_dir / "paragraph_embeddings_doc.npy"
@@ -89,10 +95,32 @@ class CaseLinkGraphBuilder:
         self.par_id_to_idx = {m["id"]: i for i, m in enumerate(self.par_metadata)}
         self.art_id_to_idx = {m["id"]: i for i, m in enumerate(self.art_metadata)}
 
+        # Load paragraph texts for TF-IDF
+        self.par_texts = self._load_paragraph_texts()
+
+        # Initialize TF-IDF vectorizer (will be fitted when needed)
+        self.tfidf_vectorizer: TfidfVectorizer | None = None
+        self.tfidf_matrix: csr_matrix | None = None
+
         print(
             f"Loaded {len(self.par_metadata)} paragraphs, {len(self.art_metadata)} articles"
         )
         print(f"Loaded {len(self.citations)} citation edges")
+
+    def _load_paragraph_texts(self) -> dict[str, str]:
+        """Load paragraph texts from judgments file, keyed by paragraph ID."""
+        print("Loading paragraph texts for TF-IDF...")
+        with open(self.judgments_path) as f:
+            judgments = json.load(f)
+
+        par_texts = {}
+        for celex, judgment in judgments.items():
+            for par_num, text in judgment.get("paragraphs", {}).items():
+                par_id = f"par:{celex}:{par_num}"
+                par_texts[par_id] = text
+
+        print(f"Loaded texts for {len(par_texts)} paragraphs")
+        return par_texts
 
     def _date_to_timestamp(self, date_str: str | None) -> int:
         """Convert ISO date string to Unix timestamp."""
@@ -328,12 +356,166 @@ class CaseLinkGraphBuilder:
 
         return edges
 
+    def _compute_tfidf_semantic_edges(
+        self,
+        par_ids: list[str],
+        times: np.ndarray | None = None,
+        threshold: float = 0.3,
+        max_neighbors: int = 10,
+        batch_size: int = 512,
+        use_temporal_constraint: bool = True,
+    ) -> list[tuple[int, int]]:
+        """
+        Compute semantic similarity edges using TF-IDF with temporal constraints.
+
+        Args:
+            par_ids: List of paragraph IDs in node order
+            times: Timestamps for each node
+            threshold: TF-IDF cosine similarity threshold for creating an edge
+            max_neighbors: Maximum number of neighbors per node
+            batch_size: Batch size for similarity computation
+            use_temporal_constraint: If True, only link to earlier nodes
+
+        Returns:
+            List of (source_idx, target_idx) edges
+        """
+        n = len(par_ids)
+        print(f"  Computing TF-IDF semantic edges for {n} paragraphs...")
+
+        # Get texts for the selected paragraphs
+        texts = []
+        for par_id in par_ids:
+            text = self.par_texts.get(par_id, "")
+            texts.append(text)
+
+        # Fit TF-IDF vectorizer if not already fitted
+        if self.tfidf_vectorizer is None:
+            print("  Fitting TF-IDF vectorizer...")
+            self.tfidf_vectorizer = TfidfVectorizer(
+                stop_words="english",
+                strip_accents="ascii",
+                norm="l2",
+                max_features=50000,
+            )
+            self.tfidf_vectorizer.fit(texts)
+
+        # Transform texts to TF-IDF vectors
+        print("  Transforming texts to TF-IDF vectors...")
+        tfidf_matrix = self.tfidf_vectorizer.transform(texts)
+
+        if times is None or not use_temporal_constraint:
+            edges = self._compute_tfidf_edges_no_temporal(
+                tfidf_matrix, threshold, max_neighbors, batch_size
+            )
+        else:
+            edges = self._compute_tfidf_edges_temporal(
+                tfidf_matrix, times, threshold, max_neighbors, batch_size
+            )
+
+        print(f"  Found {len(edges)} TF-IDF semantic similarity edges")
+        return edges
+
+    def _compute_tfidf_edges_no_temporal(
+        self,
+        tfidf_matrix: csr_matrix,
+        threshold: float,
+        max_neighbors: int,
+        batch_size: int,
+    ) -> list[tuple[int, int]]:
+        """Compute TF-IDF edges without temporal constraints."""
+        n = tfidf_matrix.shape[0]
+        edges = []
+
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch = tfidf_matrix[start:end]
+
+            # Compute similarities (already L2 normalized, so dot product = cosine sim)
+            similarities = batch.dot(tfidf_matrix.T).toarray()
+
+            for i, orig_idx in enumerate(range(start, end)):
+                row_sims = similarities[i]
+                # Zero out self-similarity
+                row_sims[orig_idx] = 0
+
+                # Get top-k neighbors above threshold
+                top_indices = np.argsort(row_sims)[::-1][:max_neighbors]
+                for neighbor_idx in top_indices:
+                    if row_sims[neighbor_idx] >= threshold:
+                        edges.append((orig_idx, int(neighbor_idx)))
+
+        return edges
+
+    def _compute_tfidf_edges_temporal(
+        self,
+        tfidf_matrix: csr_matrix,
+        times: np.ndarray,
+        threshold: float,
+        max_neighbors: int,
+        batch_size: int,
+    ) -> list[tuple[int, int]]:
+        """Compute TF-IDF edges with temporal constraints."""
+        n = tfidf_matrix.shape[0]
+
+        # Group indices by time
+        time_to_indices: dict[int, list[int]] = defaultdict(list)
+        for idx in range(n):
+            time_to_indices[times[idx]].append(idx)
+
+        unique_times = sorted(time_to_indices.keys())
+        print(f"  Processing {len(unique_times)} time groups chronologically...")
+
+        edges = []
+        accumulated_indices: list[int] = []
+        nodes_processed = 0
+
+        for time_idx, t in enumerate(unique_times):
+            group_indices = time_to_indices[t]
+            group_size = len(group_indices)
+
+            if accumulated_indices and group_size > 0:
+                # Get TF-IDF vectors for current group
+                group_tfidf = tfidf_matrix[group_indices]
+                # Get TF-IDF vectors for accumulated (earlier) nodes
+                accumulated_tfidf = tfidf_matrix[accumulated_indices]
+
+                # Process in batches
+                for batch_start in range(0, group_size, batch_size):
+                    batch_end = min(batch_start + batch_size, group_size)
+                    batch_indices = group_indices[batch_start:batch_end]
+                    batch_tfidf = group_tfidf[batch_start:batch_end]
+
+                    # Compute similarities with accumulated nodes
+                    similarities = batch_tfidf.dot(accumulated_tfidf.T).toarray()
+
+                    for i, orig_idx in enumerate(batch_indices):
+                        row_sims = similarities[i]
+                        # Get top-k neighbors above threshold
+                        top_local_indices = np.argsort(row_sims)[::-1][:max_neighbors]
+                        for local_idx in top_local_indices:
+                            if row_sims[local_idx] >= threshold:
+                                neighbor_orig_idx = accumulated_indices[local_idx]
+                                edges.append((orig_idx, neighbor_orig_idx))
+
+            # Add current group to accumulated indices
+            accumulated_indices.extend(group_indices)
+            nodes_processed += group_size
+
+            if (time_idx + 1) % max(1, len(unique_times) // 10) == 0:
+                pct = 100 * (time_idx + 1) / len(unique_times)
+                print(
+                    f"    {pct:.0f}% complete ({nodes_processed}/{n} nodes, {len(edges)} edges)"
+                )
+
+        return edges
+
     def build_graph(
         self,
         train_cutoff_year: int | None = None,
         include_only_citing: bool = True,
         include_semantic_edges: bool = True,
-        semantic_threshold: float = 0.7,
+        semantic_threshold: float = 0.3,  # TF-IDF threshold (typically lower than dense embeddings)
+        article_threshold: float = 0.9,
         semantic_max_neighbors: int = 10,
         include_article_nodes: bool = True,
         use_temporal_constraint: bool = True,
@@ -344,8 +526,9 @@ class CaseLinkGraphBuilder:
         Args:
             train_cutoff_year: Only include paragraphs before this year
             include_only_citing: Only include paragraphs involved in citations
-            include_semantic_edges: Add semantic similarity edges (like CaseLink)
-            semantic_threshold: Cosine similarity threshold for semantic edges
+            include_semantic_edges: Add TF-IDF semantic similarity edges
+            semantic_threshold: TF-IDF cosine similarity threshold for paragraph semantic edges
+            article_threshold: Cosine similarity threshold for article semantic edges
             semantic_max_neighbors: Max number of semantic neighbors per node
             include_article_nodes: Include article nodes in the graph
             use_temporal_constraint: For semantic edges, only link to earlier paragraphs
@@ -483,14 +666,18 @@ class CaseLinkGraphBuilder:
 
             print(f"  Paragraph-article edges: {par_art_edges} (bidirectional)")
 
-        # Edge type 2: paragraph similar_to paragraph (semantic)
+        # Edge type 2: paragraph similar_to paragraph (TF-IDF semantic similarity)
         if include_semantic_edges:
-            print("Computing semantic similarity edges with FAISS...")
-            par_embeddings = np.array(par_doc_embeddings_list)
+            print("Computing semantic similarity edges with TF-IDF...")
+            # Collect paragraph IDs in node order
+            par_ids_in_order = [
+                self.par_metadata[selected_pars[idx]]["id"]
+                for idx in range(num_par_nodes)
+            ]
             par_times_array = np.array(par_times)
 
-            semantic_edges = self._compute_semantic_similarity_edges(
-                par_embeddings,
+            semantic_edges = self._compute_tfidf_semantic_edges(
+                par_ids_in_order,
                 times=par_times_array if use_temporal_constraint else None,
                 threshold=semantic_threshold,
                 max_neighbors=semantic_max_neighbors,
@@ -498,8 +685,10 @@ class CaseLinkGraphBuilder:
             )
             for src_idx, tgt_idx in semantic_edges:
                 edge_list.append([src_idx, tgt_idx])
+                edge_list.append([tgt_idx, src_idx])
                 edge_attr_list.append(2)
-            print(f"  Semantic similarity edges: {len(semantic_edges)}")
+                edge_attr_list.append(2)
+            print(f"  TF-IDF semantic similarity edges: {len(semantic_edges)}")
 
         # Edge type 3: article similar_to article (cosine similarity)
         if include_article_nodes and len(art_node_id_to_idx) > 1:
@@ -510,7 +699,7 @@ class CaseLinkGraphBuilder:
             article_semantic_edges = self._compute_semantic_similarity_edges(
                 art_emb_array,
                 times=None,  # Articles don't have temporal constraints
-                threshold=semantic_threshold,
+                threshold=article_threshold,
                 max_neighbors=semantic_max_neighbors,
                 use_temporal_constraint=False,
             )
@@ -611,10 +800,7 @@ class CaseLinkGNN(nn.Module):
         output_dim: int | None = None,
         num_layers: int = 3,
         dropout: float = 0.3,
-        num_edge_types: int = 6,
-        use_attention: bool = False,
         num_heads: int = 4,
-        degree_embed_dim: int = 32,
     ):
         super().__init__()
 
@@ -624,71 +810,44 @@ class CaseLinkGNN(nn.Module):
             output_dim = input_dim
 
         self.num_layers = num_layers
-        self.num_edge_types = num_edge_types
-        self.use_attention = use_attention
         self.hidden_dim = hidden_dim
-
-        # Node type embedding (paragraph vs article)
-        self.node_type_embedding = nn.Embedding(2, hidden_dim)
-
-        # Degree encoder (like CaseLink's degree-aware features)
-        self.degree_encoder = nn.Sequential(
-            nn.Linear(2, degree_embed_dim),
-            nn.GELU(),
-            nn.Linear(degree_embed_dim, hidden_dim),
-        )
-
-        # Edge type embedding for relation-aware message passing
-        self.edge_type_embedding = nn.Embedding(num_edge_types, hidden_dim)
-
-        # Input projection
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
 
         # GNN layers - use separate convolutions per edge type or shared
         self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
 
-        for _ in range(num_layers):
-            if use_attention:
-                # GAT for attention-based aggregation
-                self.convs.append(
-                    GATConv(
-                        hidden_dim,
-                        hidden_dim // num_heads,
-                        heads=num_heads,
-                        concat=True,
-                        dropout=dropout,
-                    )
-                )
-            else:
-                # GraphSAGE for mean aggregation
-                self.convs.append(SAGEConv(hidden_dim, hidden_dim, aggr="mean"))
-            self.norms.append(nn.LayerNorm(hidden_dim))
-
-        # Output projection
-        self.projector = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, output_dim),
+        self.convs.append(
+            GATConv(
+                input_dim,
+                hidden_dim,
+                heads=num_heads,
+                concat=False,
+                dropout=dropout,
+                add_self_loops=False,
+            )
         )
 
-        self.dropout = nn.Dropout(dropout)
+        for _ in range(num_layers - 2):
+            self.convs.append(
+                GATConv(
+                    hidden_dim,
+                    hidden_dim,
+                    heads=num_heads,
+                    concat=False,
+                    dropout=dropout,
+                    add_self_loops=False,
+                )
+            )
 
-    def compute_degree_features(
-        self,
-        edge_index: torch.Tensor,
-        num_nodes: int,
-        edge_attr: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute in-degree and out-degree for each node."""
-        in_degree = torch.zeros(num_nodes, device=edge_index.device)
-        out_degree = torch.zeros(num_nodes, device=edge_index.device)
-
-        ones = torch.ones(edge_index.size(1), device=edge_index.device)
-        in_degree.scatter_add_(0, edge_index[1], ones)
-        out_degree.scatter_add_(0, edge_index[0], ones)
-
-        return in_degree, out_degree
+        self.convs.append(
+            GATConv(
+                hidden_dim,
+                output_dim,
+                heads=num_heads,
+                concat=False,
+                dropout=dropout,
+                add_self_loops=False,
+            )
+        )
 
     def forward(
         self,
@@ -698,37 +857,22 @@ class CaseLinkGNN(nn.Module):
         edge_attr: torch.Tensor | None = None,
         node_type: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        num_nodes = x.size(0)
 
-        # Input projection
-        # h = self.input_proj(x)
+        in_feat = x  # Store input for residual connection
         h = x
 
-        # Add node type embedding if available
-        if node_type is not None:
-            h = h + self.node_type_embedding(node_type)
+        # Apply all layers with activation and normalization
+        for i in range(self.num_layers):
+            h = self.convs[i](h, edge_index)
 
-        # Compute and add degree features
-        # in_deg, out_deg = self.compute_degree_features(edge_index, num_nodes, edge_attr)
-        # degree_feats = torch.stack([in_deg, out_deg], dim=1)
-        # degree_feats = torch.log1p(degree_feats)  # log(1 + x) for stability
-        # degree_embedding = self.degree_encoder(degree_feats)
-        # h = h + degree_embedding
+            # Apply activation and norm for all layers except the last
+            if i < self.num_layers - 1:
+                h = F.relu(h)
 
-        # GNN layers with residual connections (key CaseLink feature)
-        for i, conv in enumerate(self.convs):
-            h_norm = self.norms[i](h)
-            h_new = conv(h_norm, edge_index)
-            h_new = F.gelu(h_new)
-            h_new = self.dropout(h_new)
-            # Residual connection
-            h = h + h_new
+        h = h + in_feat
+        h = F.normalize(h, p=2, dim=1)
 
-        # Output projection
-        out = self.projector(h)
-        out = F.normalize(out, p=2, dim=1)
-
-        return out
+        return h
 
 
 class CaseLinkGNNRelational(nn.Module):

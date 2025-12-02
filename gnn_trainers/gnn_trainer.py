@@ -1,146 +1,114 @@
 import os
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch_geometric.loader import NeighborLoader  # type: ignore
 from torch_geometric.data import Data, HeteroData  # type: ignore
+from torch_geometric.transforms import ToUndirected  # type: ignore
 from tqdm import tqdm  # type: ignore
-import wandb  # type: ignore
+import wandb
+
 from preprocessing.graph_builder import (
     HomogeneousGraphBuilder,
     HeterogeneousGraphBuilder,
 )
-import math
-from torch.optim.lr_scheduler import LambdaLR
-from torch_geometric.transforms import ToUndirected
 
 
-def info_nce_loss(
-    anchor,
-    positive,
-    temperature=0.07,
-    anchor_times=None,
-    positive_times=None,
-    anchor_indices=None,
-    positive_indices=None,  # ADDED: To detect target collisions
-    return_stats=False,
-):
-    """
-    In-batch negative contrastive loss with temporal filtering and False Negative masking.
-
-    anchor: [batch_size, dim]
-    positive: [batch_size, dim]
-    anchor_indices: [batch_size] - IDs of source nodes
-    positive_indices: [batch_size] - IDs of target nodes
-    return_stats: if True, return (loss, stats_dict), else return loss only
-    """
-    # Compute similarity matrix using unnormalized dot product: [batch_size, batch_size]
-    sim_matrix = torch.mm(anchor, positive.t()) / temperature
-
-    batch_size = sim_matrix.size(0)
-    diagonal_mask = torch.eye(batch_size, dtype=torch.bool, device=sim_matrix.device)
-
-    # Initialize mask for False Negatives (True = mask out/ignore)
-    # We start with False everywhere except potentially the diagonal handling later
-    false_negative_mask = torch.zeros_like(sim_matrix, dtype=torch.bool)
-
-    if anchor_indices is not None and positive_indices is not None:
-        # same_anchor[i,k] = True if anchor_i == anchor_k
-        same_anchor = anchor_indices.unsqueeze(1) == anchor_indices.unsqueeze(0)
-        # same_target[k,j] = True if positive_k == positive_j
-        same_target = positive_indices.unsqueeze(1) == positive_indices.unsqueeze(0)
-
-        # Mask (i,j) if there exists ANY k where:
-        #   anchor_i == anchor_k  AND  positive_k == positive_j
-        # This means positive_j is a true positive for anchor_i
-        false_negative_mask = (same_anchor.float() @ same_target.float()) > 0
-
-    # Ensure diagonal is NOT masked (we need it for the loss)
-    final_mask = false_negative_mask & ~diagonal_mask
-
-    # Apply mask: set false negatives to -inf so Softmax ignores them
-    sim_matrix = sim_matrix.masked_fill(final_mask, float("-inf"))
-
-    # Apply temporal masking if time information is provided
-    if anchor_times is not None and positive_times is not None:
-        # positive_j is valid negative for anchor_i only if positive_time_j < anchor_time_i
-        time_mask = positive_times.unsqueeze(0) < anchor_times.unsqueeze(1)
-
-        # Ensure diagonal (positive pairs) are always valid
-        time_mask = time_mask | diagonal_mask
-
-        # Apply mask: set invalid negatives to very low value
-        sim_matrix = sim_matrix.masked_fill(~time_mask, float("-inf"))
-
-    # Labels: for each anchor_i, the positive is at position i (diagonal)
-    labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
-
-    loss = F.cross_entropy(sim_matrix, labels)
-
-    if not return_stats:
-        return loss
-
-    # Compute statistics for monitoring
+def compute_contrastive_stats(
+    sim_matrix: torch.Tensor,
+    diagonal_mask: torch.Tensor,
+) -> dict:
+    """Compute statistics for monitoring contrastive learning."""
     stats = {}
 
-    # Get positive similarities (diagonal)
     positive_sims = torch.diagonal(sim_matrix)
     stats["pos_sim_mean"] = positive_sims.mean().item()
     stats["pos_sim_std"] = positive_sims.std().item()
     stats["pos_sim_min"] = positive_sims.min().item()
     stats["pos_sim_max"] = positive_sims.max().item()
 
-    # Get negative similarities (off-diagonal valid entries)
-    # Create a mask for valid negatives (not masked to -inf)
     valid_mask = ~torch.isinf(sim_matrix) & ~diagonal_mask
+    if not valid_mask.any():
+        return {
+            **stats,
+            "neg_sim_mean": 0.0,
+            "neg_sim_std": 0.0,
+            "neg_sim_max": 0.0,
+            "num_negatives_mean": 0.0,
+            "margin_mean": 0.0,
+            "pos_rank_mean": 1.0,
+        }
 
-    if valid_mask.any():
-        negative_sims = sim_matrix[valid_mask]
-        stats["neg_sim_mean"] = negative_sims.mean().item()
-        stats["neg_sim_std"] = negative_sims.std().item()
-        stats["neg_sim_max"] = negative_sims.max().item()
+    negative_sims = sim_matrix[valid_mask]
+    stats["neg_sim_mean"] = negative_sims.mean().item()
+    stats["neg_sim_std"] = negative_sims.std().item()
+    stats["neg_sim_max"] = negative_sims.max().item()
 
-        # Number of valid negatives per sample
-        num_valid_negatives = valid_mask.sum(dim=1).float()
-        stats["num_negatives_mean"] = num_valid_negatives.mean().item()
-        stats["num_negatives_min"] = num_valid_negatives.min().item()
-        stats["num_negatives_max"] = num_valid_negatives.max().item()
+    num_valid = valid_mask.sum(dim=1).float()
+    stats["num_negatives_mean"] = num_valid.mean().item()
+    stats["num_negatives_min"] = num_valid.min().item()
+    stats["num_negatives_max"] = num_valid.max().item()
 
-        # Margin: difference between positive and max negative similarity
-        max_neg_per_sample = torch.where(
-            valid_mask,
-            sim_matrix,
-            torch.tensor(float("-inf"), device=sim_matrix.device),
-        ).max(dim=1)[0]
-        margin = positive_sims - max_neg_per_sample
-        stats["margin_mean"] = margin.mean().item()
-        stats["margin_min"] = margin.min().item()
+    max_neg = torch.where(
+        valid_mask, sim_matrix, torch.full_like(sim_matrix, float("-inf"))
+    ).max(dim=1)[0]
+    margin = positive_sims - max_neg
+    stats["margin_mean"] = margin.mean().item()
+    stats["margin_min"] = margin.min().item()
 
-        # Positive rank: where does the positive rank among all samples?
-        # Lower is better (rank 1 means positive is the highest similarity)
-        ranks = (sim_matrix > positive_sims.unsqueeze(1)).sum(dim=1) + 1
-        stats["pos_rank_mean"] = ranks.float().mean().item()
-        stats["pos_rank_median"] = ranks.float().median().item()
+    ranks = (sim_matrix > positive_sims.unsqueeze(1)).sum(dim=1) + 1
+    stats["pos_rank_mean"] = ranks.float().mean().item()
+    stats["pos_rank_median"] = ranks.float().median().item()
 
-        # Accuracy@k: percentage of positives in top-k
-        for k in [1, 5, 10]:
-            if k <= sim_matrix.size(1):
-                acc_at_k = (ranks <= k).float().mean().item()
-                stats[f"acc@{k}"] = acc_at_k
-    else:
-        # No valid negatives case
-        stats["neg_sim_mean"] = 0.0
-        stats["neg_sim_std"] = 0.0
-        stats["neg_sim_max"] = 0.0
-        stats["num_negatives_mean"] = 0.0
-        stats["num_negatives_min"] = 0.0
-        stats["num_negatives_max"] = 0.0
-        stats["margin_mean"] = 0.0
-        stats["margin_min"] = 0.0
-        stats["pos_rank_mean"] = 1.0
-        stats["pos_rank_median"] = 1.0
+    for k in [1, 5, 10]:
+        if k <= sim_matrix.size(1):
+            stats[f"acc@{k}"] = (ranks <= k).float().mean().item()
 
+    return stats
+
+
+def info_nce_loss(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    temperature: float = 0.07,
+    anchor_times: torch.Tensor | None = None,
+    positive_times: torch.Tensor | None = None,
+    anchor_indices: torch.Tensor | None = None,
+    positive_indices: torch.Tensor | None = None,
+    return_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict]:
+    """In-batch contrastive loss with temporal filtering and false negative masking."""
+    sim_matrix = torch.mm(anchor, positive.t()) / temperature
+    batch_size = sim_matrix.size(0)
+
+    diagonal_mask = torch.eye(
+        batch_size, batch_size, dtype=torch.bool, device=sim_matrix.device
+    )
+
+    # Mask false negatives (same source pointing to same target)
+    if anchor_indices is not None and positive_indices is not None:
+        same_anchor = anchor_indices.unsqueeze(1) == anchor_indices.unsqueeze(0)
+        same_target = positive_indices.unsqueeze(1) == positive_indices.unsqueeze(0)
+        fn_mask = (same_anchor.float() @ same_target.float()) > 0
+
+        sim_matrix = sim_matrix.masked_fill(fn_mask & ~diagonal_mask, float("-inf"))
+
+    # Apply temporal masking
+    if anchor_times is not None and positive_times is not None:
+        time_mask = positive_times.unsqueeze(0) < anchor_times.unsqueeze(1)
+
+        sim_matrix = sim_matrix.masked_fill(~(time_mask | diagonal_mask), float("-inf"))
+
+    labels = torch.arange(batch_size, device=sim_matrix.device)
+    loss = F.cross_entropy(sim_matrix, labels)
+
+    if not return_stats:
+        return loss
+
+    stats = compute_contrastive_stats(sim_matrix, diagonal_mask)
     return loss, stats
 
 
@@ -161,8 +129,10 @@ class GNNTrainer:
         wandb_name: str | None = None,
         warmup_epochs: int = 3,
         eval_every_n_epochs: int = 1,
-        gradient_clip_val: float | None = None,  # NEW: Optional gradient clipping
-        log_every_n_batches: int = 100,  # NEW: Control logging frequency
+        gradient_clip_val: float | None = None,
+        log_every_n_batches: int = 100,
+        early_stopping_patience: int | None = None,
+        early_stopping_min_delta: float = 0.0,
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -180,605 +150,540 @@ class GNNTrainer:
         self.eval_every_n_epochs = eval_every_n_epochs
         self.gradient_clip_val = gradient_clip_val
         self.log_every_n_batches = log_every_n_batches
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_delta = early_stopping_min_delta
 
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.is_hetero = graph_type == "heterogeneous"
+
         print(f"Using device: {self.device}")
         print(f"Using graph type: {self.graph_type}")
 
-    def _process_batch(
-        self,
-        batch,
-        is_hetero: bool,
-    ):
-        """Process a batch and extract necessary components."""
-        if is_hetero:
-            batch_size = batch["paragraph"].batch_size
-            x = batch["paragraph"].x.clone()
+    def _process_hetero_batch(self, batch: HeteroData) -> dict | None:
+        """Process a heterogeneous batch."""
+        batch_size = batch["paragraph"].batch_size
+        x = batch["paragraph"].x.clone()
 
-            if hasattr(batch["paragraph"], "x_query"):
-                x[:batch_size] = batch["paragraph"].x_query[:batch_size]
+        if hasattr(batch["paragraph"], "x_query"):
+            x[:batch_size] = batch["paragraph"].x_query[:batch_size]
 
-            if hasattr(batch["paragraph"], "time"):
-                anchor_times = batch["paragraph"].time[:batch_size]
-            else:
-                anchor_times = None
+        anchor_times = getattr(batch["paragraph"], "time", None)
+        if anchor_times is not None:
+            anchor_times = anchor_times[:batch_size]
 
-            if ("paragraph", "cites", "paragraph") in batch.edge_types:
-                cite_edge_index = batch["paragraph", "cites", "paragraph"].edge_index
-            else:
-                return None
+        if ("paragraph", "cites", "paragraph") not in batch.edge_types:
+            return None
 
-            # Mask citation edges to prevent leakage
-            if ("paragraph", "belongs_to", "case") in batch.edge_types:
-                par_to_case = batch["paragraph", "belongs_to", "case"].edge_index
-                case_to_par = batch["case", "contains", "paragraph"].edge_index
+        cite_edge_index = batch["paragraph", "cites", "paragraph"].edge_index
 
-                anchor_mask = par_to_case[0] < batch_size
-                anchor_cases = par_to_case[1, anchor_mask].unique()
-
-                case_mask = torch.isin(case_to_par[0], anchor_cases)
-                paragraphs_in_anchor_cases = case_to_par[1, case_mask].unique()
-            else:
-                paragraphs_in_anchor_cases = torch.arange(
-                    batch_size, device=self.device
-                )
-
-            cite_src, cite_tgt = cite_edge_index
-            leakage_mask = torch.isin(
-                cite_src, paragraphs_in_anchor_cases
-            ) | torch.isin(cite_tgt, paragraphs_in_anchor_cases)
-            masked_cite_edges = cite_edge_index[:, ~leakage_mask]
-
-            modified_batch = batch.clone()
-            modified_batch["paragraph", "cites", "paragraph"].edge_index = (
-                masked_cite_edges
-            )
-            modified_batch["paragraph"].x = x
-
-            return {
-                "batch_size": batch_size,
-                "modified_batch": modified_batch,
-                "edge_index": cite_edge_index,
-                "x": x,
-                "anchor_times": anchor_times,
-                "all_times": (
-                    batch["paragraph"].time
-                    if hasattr(batch["paragraph"], "time")
-                    else None
-                ),
-            }
-
+        # Mask citation edges to prevent leakage
+        if ("paragraph", "belongs_to", "case") in batch.edge_types:
+            par_to_case = batch["paragraph", "belongs_to", "case"].edge_index
+            case_to_par = batch["case", "contains", "paragraph"].edge_index
+            anchor_cases = par_to_case[1, par_to_case[0] < batch_size].unique()
+            paragraphs_in_anchor_cases = case_to_par[
+                1, torch.isin(case_to_par[0], anchor_cases)
+            ].unique()
         else:
-            # For homogeneous graphs
-            batch_size = batch.batch_size
-            x = batch.x.clone()
+            paragraphs_in_anchor_cases = torch.arange(batch_size, device=self.device)
 
-            if hasattr(batch, "x_query"):
-                x[:batch_size] = batch.x_query[:batch_size]
+        src, tgt = cite_edge_index
+        leakage_mask = torch.isin(src, paragraphs_in_anchor_cases) | torch.isin(
+            tgt, paragraphs_in_anchor_cases
+        )
 
-            if hasattr(batch, "time"):
-                anchor_times = batch.time[:batch_size]
-            else:
-                anchor_times = None
+        modified_batch = batch.clone()
+        modified_batch["paragraph", "cites", "paragraph"].edge_index = cite_edge_index[
+            :, ~leakage_mask
+        ]
+        modified_batch["paragraph"].x = x
 
-            edge_index = batch.edge_index
-            edge_attr = batch.edge_attr if hasattr(batch, "edge_attr") else None
+        return {
+            "batch_size": batch_size,
+            "modified_batch": modified_batch,
+            "edge_index": cite_edge_index,
+            "anchor_times": anchor_times,
+            "all_times": getattr(batch["paragraph"], "time", None),
+        }
 
-            src, tgt = edge_index
-            leakage_mask = ~((src < batch_size) | (tgt < batch_size))
-            masked_edge_index = edge_index[:, leakage_mask]
-            masked_edge_attr = (
-                edge_attr[leakage_mask] if edge_attr is not None else None
+    def _process_homo_batch(self, batch: Data) -> dict:
+        """Process a homogeneous batch."""
+        batch_size = batch.batch_size
+        x = batch.x.clone()
+
+        if hasattr(batch, "x_query"):
+            x[:batch_size] = batch.x_query[:batch_size]
+
+        anchor_times = batch.time[:batch_size] if hasattr(batch, "time") else None
+        edge_attr = getattr(batch, "edge_attr", None)
+        src, tgt = batch.edge_index
+
+        # Mask edges to prevent leakage
+        outgoing = src < batch_size
+        incoming = tgt < batch_size
+
+        if edge_attr is not None:
+            is_citation = (edge_attr == 0) | (edge_attr == 1)
+            leakage_mask = outgoing | (incoming & is_citation)
+        else:
+            leakage_mask = outgoing | incoming
+
+        keep_mask = ~leakage_mask
+
+        return {
+            "batch_size": batch_size,
+            "x": x,
+            "edge_index": batch.edge_index,
+            "masked_edge_index": batch.edge_index[:, keep_mask],
+            "masked_edge_attr": edge_attr[keep_mask] if edge_attr is not None else None,
+            "edge_attr": edge_attr,
+            "date_feature": batch.date_feature,
+            "language": getattr(batch, "language", None),
+            "anchor_times": anchor_times,
+            "all_times": getattr(batch, "time", None),
+            # Case metadata embeddings
+            "subject_matter": getattr(batch, "subject_matter", None),
+            "keywords": getattr(batch, "keywords", None),
+            "case_law_about": getattr(batch, "case_law_about", None),
+        }
+
+    def _get_embeddings(
+        self, model: nn.Module, batch_data: dict
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Get embeddings from the model.
+
+        For dual encoders, returns (query_embeddings, doc_embeddings).
+        For single encoders, returns all embeddings.
+        """
+        if self.is_hetero:
+            out = model(batch_data["modified_batch"])
+            return out["paragraph"] if isinstance(out, dict) else out
+
+        # Check if model is a dual encoder
+        is_dual = hasattr(model, "encode_query") and hasattr(model, "encode_document")
+
+        if is_dual:
+            batch_size = batch_data["batch_size"]
+            x = batch_data["x"]
+            date_feature = batch_data.get("date_feature")
+            language = batch_data.get("language")
+            subject_matter = batch_data.get("subject_matter")
+            keywords = batch_data.get("keywords")
+            case_law_about = batch_data.get("case_law_about")
+
+            # Query encoding for anchor nodes (no edges needed)
+            query_emb = model.encode_query(
+                x[:batch_size],
+                date_feature=(
+                    date_feature[:batch_size] if date_feature is not None else None
+                ),
+                language=language[:batch_size] if language is not None else None,
+                subject_matter=(
+                    subject_matter[:batch_size] if subject_matter is not None else None
+                ),
+                keywords=keywords[:batch_size] if keywords is not None else None,
+                case_law_about=(
+                    case_law_about[:batch_size] if case_law_about is not None else None
+                ),
             )
 
-            return {
-                "batch_size": batch_size,
-                "modified_batch": None,
-                "edge_index": edge_index,
-                "x": x,
-                "masked_edge_index": masked_edge_index,
-                "masked_edge_attr": masked_edge_attr,
-                "edge_attr": edge_attr,
-                "date_feature": batch.date_feature,
-                "anchor_times": anchor_times,
-                "all_times": batch.time if hasattr(batch, "time") else None,
-            }
+            # Document encoding for all nodes (with edges)
+            doc_emb = model.encode_document(
+                x,
+                batch_data["masked_edge_index"],
+                date_feature=date_feature,
+                edge_attr=batch_data.get("masked_edge_attr"),
+                language=language,
+                subject_matter=subject_matter,
+                keywords=keywords,
+                case_law_about=case_law_about,
+            )
+
+            return query_emb, doc_emb
+        else:
+            out = model(
+                batch_data["x"],
+                batch_data["masked_edge_index"],
+                date_feature=batch_data.get("date_feature"),
+                edge_attr=batch_data.get("masked_edge_attr"),
+                language=batch_data.get("language"),
+                subject_matter=batch_data.get("subject_matter"),
+                keywords=batch_data.get("keywords"),
+                case_law_about=batch_data.get("case_law_about"),
+            )
+            return out["paragraph"] if isinstance(out, dict) else out
 
     def _compute_loss(
         self,
         model: nn.Module,
         batch_data: dict,
-        is_hetero: bool,
         return_stats: bool = False,
     ):
-        """Compute loss for a processed batch."""
+        """Compute contrastive loss for a batch."""
         batch_size = batch_data["batch_size"]
         edge_index = batch_data["edge_index"]
+        edge_attr = batch_data.get("edge_attr")
         all_times = batch_data.get("all_times")
 
-        # Get embeddings
-        if is_hetero:
-            out = model(batch_data["modified_batch"])
-            embeddings = out["paragraph"] if isinstance(out, dict) else out
+        emb_result = self._get_embeddings(model, batch_data)
+
+        # Check if dual encoder (returns tuple) or single encoder
+        is_dual = isinstance(emb_result, tuple)
+        if is_dual:
+            query_emb, doc_emb = emb_result
         else:
-            date_feature = batch_data.get("date_feature")
-            masked_edge_attr = batch_data.get("masked_edge_attr")
-            out = model(
-                batch_data["x"],
-                batch_data["masked_edge_index"],
-                date_feature=date_feature,
-                edge_attr=masked_edge_attr,
-            )
-            embeddings = out["paragraph"] if isinstance(out, dict) else out
+            doc_emb = emb_result
 
-        # Find edges where source is in the input batch
-        # We only want "cites" edges (edge_attr == 0) for training
+        # Find training pairs (only "cites" edges from anchor nodes)
         src, tgt = edge_index
-        edge_attr = batch_data.get("edge_attr")
-
         if edge_attr is not None:
-            # Only use forward citation edges (type 0 = "cites")
-            cites_mask = edge_attr == 0
-            input_mask = (src < batch_size) & cites_mask
+            input_mask = (src < batch_size) & (edge_attr == 0)
         else:
             input_mask = src < batch_size
 
         if input_mask.sum() == 0:
             return (None, None) if return_stats else None
 
-        batch_src = src[input_mask]
-        batch_tgt = tgt[input_mask]
+        batch_src, batch_tgt = src[input_mask], tgt[input_mask]
 
-        anchor_emb = embeddings[batch_src]
-        positive_emb = embeddings[batch_tgt]
+        if is_dual:
+            # For dual encoder: query embeddings for anchors, doc embeddings for positives
+            # batch_src are indices into the first batch_size nodes (which are queries)
+            anchor_emb = query_emb[batch_src]
+            positive_emb = doc_emb[batch_tgt]
+        else:
+            anchor_emb = doc_emb[batch_src]
+            positive_emb = doc_emb[batch_tgt]
 
-        # Get times for all pairs
-        pair_anchor_times = None
-        pair_positive_times = None
-        if all_times is not None:
-            pair_anchor_times = all_times[batch_src]
-            pair_positive_times = all_times[batch_tgt]
+        pair_times = (
+            (all_times[batch_src], all_times[batch_tgt])
+            if all_times is not None
+            else (None, None)
+        )
 
-        # Compute loss with in-batch negatives
         result = info_nce_loss(
             anchor_emb,
             positive_emb,
             self.temperature,
-            anchor_times=pair_anchor_times,
-            positive_times=pair_positive_times,
-            anchor_indices=batch_src,  # Mask Same Source
-            positive_indices=batch_tgt,  # Mask Same Target
+            anchor_times=pair_times[0],
+            positive_times=pair_times[1],
+            anchor_indices=batch_src,
+            positive_indices=batch_tgt,
             return_stats=return_stats,
         )
 
         if return_stats:
             loss, stats = result
-            # Add embedding statistics
-            stats["emb_norm_mean"] = embeddings.norm(dim=1).mean().item()
-            stats["emb_norm_std"] = embeddings.norm(dim=1).std().item()
+            stats["emb_norm_mean"] = doc_emb.norm(dim=1).mean().item()
+            stats["emb_norm_std"] = doc_emb.norm(dim=1).std().item()
+            if is_dual:
+                stats["query_emb_norm_mean"] = query_emb.norm(dim=1).mean().item()
             stats["num_pairs"] = input_mask.sum().item()
+            # Log language embedding stats
+            if hasattr(model, "language_embedding") and model.use_language:
+                lang_emb_weight = model.language_embedding.embedding.weight
+                stats["lang_emb_norm_mean"] = lang_emb_weight.norm(dim=1).mean().item()
+                stats["lang_emb_norm_std"] = lang_emb_weight.norm(dim=1).std().item()
             return loss, stats
-        else:
-            return result
+        return result
 
-    def train_epoch(
+    def _run_epoch(
         self,
         model: nn.Module,
         loader: NeighborLoader,
-        optimizer: torch.optim.Optimizer,
-        scheduler: LambdaLR,
-        is_hetero: bool,
-        epoch: int = 0,
-        global_batch_counter: int = 0,
-    ) -> tuple[float, int]:
-        """Train for one epoch."""
-        model.train()
-        total_loss = 0
-        num_batches = 0
-        batch_counter = global_batch_counter
+        optimizer: torch.optim.Optimizer | None,
+        scheduler: LambdaLR | None,
+        epoch: int,
+        batch_counter: int,
+        training: bool = True,
+    ) -> tuple[float, int, dict]:
+        """Run one epoch of training or validation."""
+        model.train() if training else model.eval()
+        total_loss, num_batches = 0.0, 0
+        stats_accum: dict[str, list] = {}
 
-        # Accumulators for batch statistics
-        batch_stats_accum = {}
+        desc = "Training" if training else "Validation"
+        context = torch.enable_grad() if training else torch.no_grad()
 
-        for batch_idx, batch in enumerate(
-            tqdm(loader, desc="Training batches", leave=False)
-        ):
-            batch_data = self._process_batch(batch, is_hetero)
-            if batch_data is None:
-                continue
-
-            # Get loss and stats
-            result = self._compute_loss(model, batch_data, is_hetero, return_stats=True)
-            if result[0] is None:
-                continue
-
-            loss, batch_stats = result
-
-            optimizer.zero_grad()
-            loss.backward()
-
-            total_norm = 0.0
-            max_grad = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-                    max_grad = max(max_grad, p.grad.data.abs().max().item())
-            total_norm = total_norm**0.5
-
-            if self.gradient_clip_val is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=self.gradient_clip_val
-                )
-
-            optimizer.step()
-            scheduler.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-            batch_counter += 1
-
-            # Accumulate statistics
-            for key, value in batch_stats.items():
-                if key not in batch_stats_accum:
-                    batch_stats_accum[key] = []
-                batch_stats_accum[key].append(value)
-
-            if (
-                self.wandb_project is not None
-                and batch_idx % self.log_every_n_batches == 0
+        with context:
+            for batch_idx, batch in enumerate(
+                tqdm(loader, desc=f"{desc} batches", leave=False)
             ):
-                log_dict = {
-                    "train/batch_loss": loss.item(),
-                    "train/learning_rate": optimizer.param_groups[0]["lr"],
-                    "train/batch": batch_counter,
-                    "train/scheduler_lr": scheduler.get_last_lr()[0],
-                    "train/grad_norm": total_norm,
-                    "train/max_grad": max_grad,
-                }
+                batch_data = (
+                    self._process_hetero_batch(batch)
+                    if self.is_hetero
+                    else self._process_homo_batch(batch)
+                )
+                if batch_data is None:
+                    continue
 
-                # Add batch statistics to wandb
-                for key, value in batch_stats.items():
-                    log_dict[f"train/{key}"] = value
+                result = self._compute_loss(model, batch_data, return_stats=True)
+                if result is None or result[0] is None:
+                    continue
 
-                wandb.log(log_dict)
+                loss, batch_stats = result
+
+                if training and optimizer is not None and scheduler is not None:
+                    optimizer.zero_grad()
+                    loss.backward()
+
+                    if self.gradient_clip_val is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), self.gradient_clip_val
+                        )
+
+                    optimizer.step()
+                    scheduler.step()
+                    batch_counter += 1
+
+                    if self.wandb_project and batch_idx % self.log_every_n_batches == 0:
+                        wandb.log(
+                            {
+                                "train/batch_loss": loss.item(),
+                                "train/learning_rate": optimizer.param_groups[0]["lr"],
+                                "train/batch": batch_counter,
+                                **{f"train/{k}": v for k, v in batch_stats.items()},
+                            }
+                        )
+
+                total_loss += loss.item()
+                num_batches += 1
+
+                for k, v in batch_stats.items():
+                    stats_accum.setdefault(k, []).append(v)
 
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        avg_stats = {k: sum(v) / len(v) for k, v in stats_accum.items() if v}
 
-        # Compute epoch averages for statistics
-        epoch_stats = {}
-        for key, values in batch_stats_accum.items():
-            if values:
-                epoch_stats[key] = sum(values) / len(values)
+        return avg_loss, batch_counter, avg_stats
 
-        return avg_loss, batch_counter, epoch_stats
+    def _build_graph(self, builder, cutoff_year: int | None, is_train: bool = True):
+        """Build graph with appropriate settings."""
+        if self.is_hetero:
+            graph = builder.build_graph(
+                train_cutoff_year=cutoff_year, include_only_citing=True
+            )
+            return ToUndirected()(graph.to(self.device))
+        else:
+            graph = builder.build_graph(
+                train_cutoff_year=cutoff_year,
+                include_only_citing=True,
+                add_reverse_edges=True,
+            )
+            return graph.to(self.device)
 
-    @torch.no_grad()
-    def validate(
+    def _get_input_nodes(
+        self, graph_data, builder=None, train_cutoff_year: int | None = None
+    ):
+        """Get input nodes (nodes with citation edges)."""
+        if self.is_hetero:
+            cite_edges = graph_data["paragraph", "cites", "paragraph"].edge_index
+            nodes = cite_edges[0].unique()
+            print(
+                f"  Paragraph nodes with citations: {len(nodes)} / {graph_data['paragraph'].num_nodes}"
+            )
+            return ("paragraph", nodes), nodes
+        else:
+            cites_edges = graph_data.edge_index[:, graph_data.edge_attr == 0]
+            nodes = cites_edges[0].unique()
+            print(f"  Nodes with citations: {len(nodes)} / {graph_data.num_nodes}")
+            return nodes, nodes
+
+    def _create_loader(
+        self, graph_data, input_nodes, shuffle: bool = True
+    ) -> NeighborLoader:
+        """Create a NeighborLoader."""
+        num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
+        return NeighborLoader(
+            graph_data,
+            num_neighbors=num_neighbors,
+            batch_size=self.batch_size,
+            input_nodes=input_nodes,
+            shuffle=shuffle,
+            time_attr="time",
+            subgraph_type="bidirectional",
+        )
+
+    def _print_epoch_stats(
         self,
-        model: nn.Module,
-        loader: NeighborLoader,
-        is_hetero: bool,
-    ) -> tuple[float, dict]:
-        """Validate the model on validation set."""
-        model.eval()
-        total_loss = 0
-        num_batches = 0
+        epoch: int,
+        train_loss: float,
+        train_stats: dict,
+        val_loss: float | None = None,
+        val_stats: dict | None = None,
+    ):
+        """Print epoch statistics."""
+        print(f"\nEpoch {epoch + 1}/{self.epochs}")
+        print(f"  Train Loss: {train_loss:.4f}")
 
-        # Accumulators for validation statistics
-        val_stats_accum = {}
+        if train_stats:
+            print(
+                f"  Pos Sim: {train_stats.get('pos_sim_mean', 0):.3f} ± {train_stats.get('pos_sim_std', 0):.3f}"
+            )
+            print(f"  Neg Sim: {train_stats.get('neg_sim_mean', 0):.3f}")
+            print(f"  Margin:  {train_stats.get('margin_mean', 0):.3f}")
+            print(f"  Acc@1:   {train_stats.get('acc@1', 0):.2%}")
 
-        for batch in tqdm(loader, desc="Validation batches", leave=False):
-            batch_data = self._process_batch(batch, is_hetero)
-            if batch_data is None:
-                continue
-
-            result = self._compute_loss(model, batch_data, is_hetero, return_stats=True)
-            if result[0] is None:
-                continue
-
-            loss, batch_stats = result
-
-            total_loss += loss.item()
-            num_batches += 1
-
-            # Accumulate statistics
-            for key, value in batch_stats.items():
-                if key not in val_stats_accum:
-                    val_stats_accum[key] = []
-                val_stats_accum[key].append(value)
-
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-
-        # Compute validation averages for statistics
-        val_stats = {}
-        for key, values in val_stats_accum.items():
-            if values:
-                val_stats[key] = sum(values) / len(values)
-
-        return avg_loss, val_stats
+        if val_loss is not None:
+            print(f"  Val Loss: {val_loss:.4f}")
+            if val_stats:
+                print(f"  Val Acc@1: {val_stats.get('acc@1', 0):.2%}")
 
     def train(
         self,
         gnn_model: nn.Module,
         train_cutoff_year: int | None = None,
         val_cutoff_year: int | None = None,
-    ) -> torch.nn.Module:
+    ) -> nn.Module:
         """Train GNN model with optional validation."""
         os.makedirs(self.output_path, exist_ok=True)
         checkpoint_dir = os.path.join(self.output_path, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         print("\n" + "=" * 80)
-        print(f"Training GNN with {self.graph_type.capitalize()} Graph Builder")
+        print(f"Training GNN with {self.graph_type.capitalize()} Graph")
         print("=" * 80)
 
-        is_hetero = self.graph_type == "heterogeneous"
-
-        # Build training graph
-        if is_hetero:
-            hetero_builder = HeterogeneousGraphBuilder(self.preprocessed_dir)
-            train_graph_data = hetero_builder.build_graph(
-                train_cutoff_year=train_cutoff_year,
-                include_only_citing=True,
-            ).to(self.device)
-        else:
-            homo_builder = HomogeneousGraphBuilder(self.preprocessed_dir)
-            train_graph_data = homo_builder.build_graph(
-                train_cutoff_year=train_cutoff_year,
-                include_only_citing=True,
-                add_reverse_edges=True,  # Enable edge direction features
-            ).to(self.device)
+        # Build graphs
+        builder = (
+            HeterogeneousGraphBuilder(self.preprocessed_dir)
+            if self.is_hetero
+            else HomogeneousGraphBuilder(self.preprocessed_dir)
+        )
+        train_graph = self._build_graph(builder, train_cutoff_year)
 
         print("\nFiltering nodes with positive examples...")
-        if is_hetero:
-            cite_edge_index = train_graph_data[
-                "paragraph", "cites", "paragraph"
-            ].edge_index
-            nodes_with_positives = cite_edge_index[0].unique()
-            print(
-                f"  Paragraph nodes with citations: {len(nodes_with_positives)} / {train_graph_data['paragraph'].num_nodes}"
-            )
-            input_nodes = ("paragraph", nodes_with_positives)
-        else:
-            edge_index = train_graph_data.edge_index
-            edge_attr = train_graph_data.edge_attr
-            # Only consider "cites" edges (type 0) for finding nodes with positives
-            cites_mask = edge_attr == 0
-            cites_edges = edge_index[:, cites_mask]
-            nodes_with_positives = cites_edges[0].unique()
-            print(
-                f"  Nodes with citations: {len(nodes_with_positives)} / {train_graph_data.num_nodes}"
-            )
-            input_nodes = nodes_with_positives
+        input_nodes, nodes_with_positives = self._get_input_nodes(
+            train_graph, builder, train_cutoff_year
+        )
+        train_loader = self._create_loader(train_graph, input_nodes)
 
-        # Don't use ToUndirected for homogeneous graphs anymore since we handle it ourselves
-        if is_hetero:
-            train_graph_data = ToUndirected()(train_graph_data)
-
-        # Build validation graph if val_cutoff_year is provided
+        # Build validation loader if needed
         val_loader = None
+        val_nodes_with_positives = None
         if val_cutoff_year is not None:
             print("\nBuilding validation graph...")
-            if is_hetero:
-                val_graph_data = hetero_builder.build_graph(
-                    train_cutoff_year=val_cutoff_year,
-                    include_only_citing=True,
-                ).to(self.device)
-                val_cite_edge_index = val_graph_data[
-                    "paragraph", "cites", "paragraph"
-                ].edge_index
-                val_nodes_with_positives = val_cite_edge_index[0].unique()
-                print(
-                    f"  Val paragraph nodes with citations: {len(val_nodes_with_positives)} / {val_graph_data['paragraph'].num_nodes}"
-                )
-                val_input_nodes = ("paragraph", val_nodes_with_positives)
-            else:
-                val_graph_data = homo_builder.build_graph(
-                    train_cutoff_year=val_cutoff_year,
-                    include_only_citing=True,
-                    add_reverse_edges=True,
-                ).to(self.device)
-                val_edge_index = val_graph_data.edge_index
-                val_edge_attr = val_graph_data.edge_attr
-                val_cites_mask = val_edge_attr == 0
-                val_cites_edges = val_edge_index[:, val_cites_mask]
-                val_nodes_with_positives = val_cites_edges[0].unique()
-                train_cutoff_time_stamp = homo_builder._date_to_timestamp(
-                    f"{train_cutoff_year}-01-01"
-                )
-                node_times = val_graph_data.time[val_nodes_with_positives]
-                time_mask = node_times > train_cutoff_time_stamp
+            val_graph = self._build_graph(builder, val_cutoff_year, is_train=False)
+            val_input_nodes, val_nodes_with_positives = self._get_input_nodes(
+                val_graph, builder, train_cutoff_year
+            )
+
+            # Filter val nodes to only those after train cutoff
+            if not self.is_hetero and train_cutoff_year:
+                cutoff_ts = builder._date_to_timestamp(f"{train_cutoff_year}-01-01")
+                time_mask = val_graph.time[val_nodes_with_positives] > cutoff_ts
                 val_nodes_with_positives = val_nodes_with_positives[time_mask]
-                print(
-                    f"  Val nodes with citations: {len(val_nodes_with_positives)} / {val_graph_data.num_nodes}"
-                )
                 val_input_nodes = val_nodes_with_positives
+                print(f"  Val nodes after filtering: {len(val_nodes_with_positives)}")
 
-            if is_hetero:
-                val_graph_data = ToUndirected()(val_graph_data)
+            val_loader = self._create_loader(val_graph, val_input_nodes, shuffle=False)
 
-            num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
-            val_loader = NeighborLoader(
-                val_graph_data,
-                num_neighbors=num_neighbors,
-                batch_size=self.batch_size,
-                input_nodes=val_input_nodes,
-                shuffle=True,
-                time_attr="time",
-                subgraph_type="bidirectional",
-            )
-
-        if self.wandb_project is not None:
+        # Initialize wandb
+        if self.wandb_project:
             config = {
-                "batch_size": self.batch_size,
-                "epochs": self.epochs,
-                "learning_rate": self.learning_rate,
-                "weight_decay": self.weight_decay,
-                "temperature": self.temperature,
-                "num_hops": self.num_hops,
-                "graph_type": self.graph_type,
-                "checkpoint_interval": self.checkpoint_interval,
-                "train_cutoff_year": train_cutoff_year,
-                "val_cutoff_year": val_cutoff_year,
-                "device": str(self.device),
-                "num_nodes_with_positives": len(nodes_with_positives),
-                "gradient_clip_val": self.gradient_clip_val,
-                "log_every_n_batches": self.log_every_n_batches,
+                k: v
+                for k, v in self.__dict__.items()
+                if not k.startswith("_") and k != "device"
             }
-            if val_cutoff_year is not None:
+            config["num_nodes_with_positives"] = len(nodes_with_positives)
+            if val_nodes_with_positives is not None:
                 config["num_val_nodes_with_positives"] = len(val_nodes_with_positives)
+            wandb.init(project=self.wandb_project, name=self.wandb_name, config=config)
 
-            wandb.init(
-                project=self.wandb_project,
-                name=self.wandb_name,
-                config=config,
-            )
-
-        print("\nInitializing GNN model...")
+        # Setup model and optimizer
         model = gnn_model.to(self.device)
-
-        if self.wandb_project is not None:
-            wandb.watch(model, log="all", log_freq=100)
-
         optimizer = AdamW(
-            model.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
+            model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
 
-        num_neighbors = [-1] * (self.num_hops + 1) if self.num_hops > 0 else [-1]
-
-        train_loader = NeighborLoader(
-            train_graph_data,
-            num_neighbors=num_neighbors,
-            batch_size=self.batch_size,
-            input_nodes=input_nodes,
-            shuffle=True,
-            time_attr="time",
-            subgraph_type="bidirectional",
-        )
-
+        # Scheduler with warmup and cosine decay
         steps_per_epoch = len(train_loader)
         total_steps = self.epochs * steps_per_epoch
         warmup_steps = self.warmup_epochs * steps_per_epoch
 
-        def lr_lambda(current_step):
-            if current_step < warmup_steps:
-                return float(current_step) / float(max(1, warmup_steps))
-            progress = float(current_step - warmup_steps) / float(
-                max(1, total_steps - warmup_steps)
-            )
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
             return 0.5 * (1.0 + math.cos(math.pi * progress))
 
         scheduler = LambdaLR(optimizer, lr_lambda)
 
+        if self.wandb_project:
+            wandb.watch(model, log="all", log_freq=100)
+
         print(f"\nStarting training for {self.epochs} epochs...")
-        best_train_loss = float("inf")
+        if self.early_stopping_patience is not None:
+            print(
+                f"  Early stopping: patience={self.early_stopping_patience}, min_delta={self.early_stopping_min_delta}"
+            )
+
         best_val_loss = float("inf")
-        global_batch_counter = 0
+        epochs_without_improvement = 0
+        batch_counter = 0
 
         for epoch in range(self.epochs):
-            train_loss, global_batch_counter, train_stats = self.train_epoch(
+            train_loss, batch_counter, train_stats = self._run_epoch(
                 model,
                 train_loader,
                 optimizer,
                 scheduler,
-                is_hetero,
                 epoch,
-                global_batch_counter,
+                batch_counter,
+                training=True,
             )
 
-            # Enhanced console output with key metrics
-            print(f"\nEpoch {epoch + 1}/{self.epochs}")
-            print(f"  Train Loss: {train_loss:.4f}")
-
-            # Print key training statistics
-            if train_stats:
-                print(
-                    f"  Pos Sim:    {train_stats.get('pos_sim_mean', 0):.3f} ± {train_stats.get('pos_sim_std', 0):.3f}"
+            val_loss, val_stats = None, None
+            if val_loader and (epoch + 1) % self.eval_every_n_epochs == 0:
+                val_loss, _, val_stats = self._run_epoch(
+                    model, val_loader, None, None, epoch, 0, training=False
                 )
-                print(
-                    f"  Neg Sim:    {train_stats.get('neg_sim_mean', 0):.3f} ± {train_stats.get('neg_sim_std', 0):.3f}"
-                )
-                print(f"  Margin:     {train_stats.get('margin_mean', 0):.3f}")
-                print(f"  Acc@1:      {train_stats.get('acc@1', 0):.2%}")
-                print(f"  Num Negs:   {train_stats.get('num_negatives_mean', 0):.1f}")
 
-            # Run validation if enabled and it's time to evaluate
-            val_loss = None
-            val_stats = None
-            if val_loader is not None and (epoch + 1) % self.eval_every_n_epochs == 0:
-                val_loss, val_stats = self.validate(model, val_loader, is_hetero)
-                print(f"  Val Loss:   {val_loss:.4f}")
+            self._print_epoch_stats(epoch, train_loss, train_stats, val_loss, val_stats)
 
-                # Print key validation statistics
-                if val_stats:
-                    print(f"  Val Pos Sim: {val_stats.get('pos_sim_mean', 0):.3f}")
-                    print(f"  Val Margin:  {val_stats.get('margin_mean', 0):.3f}")
-                    print(f"  Val Acc@1:   {val_stats.get('acc@1', 0):.2%}")
-
-            # Log to wandb
-            if self.wandb_project is not None:
-                log_dict = {
-                    "train/epoch_loss": train_loss,
-                    "epoch": epoch + 1,
-                }
-
-                # Add epoch-level training statistics
-                for key, value in train_stats.items():
-                    log_dict[f"train_epoch/{key}"] = value
-
+            # Logging and checkpointing
+            if self.wandb_project:
+                log_dict = {"train/epoch_loss": train_loss, "epoch": epoch + 1}
+                log_dict.update({f"train_epoch/{k}": v for k, v in train_stats.items()})
                 if val_loss is not None:
                     log_dict["val/epoch_loss"] = val_loss
-                    # Add epoch-level validation statistics
-                    if val_stats:
-                        for key, value in val_stats.items():
-                            log_dict[f"val_epoch/{key}"] = value
-
+                    log_dict.update(
+                        {f"val_epoch/{k}": v for k, v in (val_stats or {}).items()}
+                    )
                 wandb.log(log_dict)
 
-            # Save best model based on validation loss if available, otherwise training loss
             if val_loss is not None:
-                if val_loss < best_val_loss:
+                if val_loss < best_val_loss - self.early_stopping_min_delta:
                     torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
                     print(
-                        f"  ✓ New best validation loss: {best_val_loss:.4f} -> {val_loss:.4f}"
+                        f"  ✓ New best val loss: {best_val_loss:.4f} -> {val_loss:.4f}"
                     )
                     best_val_loss = val_loss
-                    if self.wandb_project is not None:
-                        wandb.run.summary["best_val_loss"] = best_val_loss
-            else:
-                if train_loss < best_train_loss:
-                    torch.save(model.state_dict(), f"{self.output_path}/best_model.pt")
-                    print(
-                        f"  ✓ New best training loss: {best_train_loss:.4f} -> {train_loss:.4f}"
-                    )
-                    best_train_loss = train_loss
-                    if self.wandb_project is not None:
-                        wandb.run.summary["best_train_loss"] = best_train_loss
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    if self.early_stopping_patience is not None:
+                        print(
+                            f"  No improvement for {epochs_without_improvement}/{self.early_stopping_patience} epochs"
+                        )
+                        if epochs_without_improvement >= self.early_stopping_patience:
+                            print(
+                                f"\n⚡ Early stopping triggered after {epoch + 1} epochs"
+                            )
+                            break
 
             if (epoch + 1) % self.checkpoint_interval == 0:
-                checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}.pt")
-                torch.save(
-                    model.state_dict(),
-                    checkpoint_path,
-                )
-                print(f"  ✓ Checkpoint saved: {checkpoint_path}")
+                path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}.pt")
+                torch.save(model.state_dict(), path)
+                print(f"  ✓ Checkpoint saved: {path}")
 
         torch.save(model.state_dict(), f"{self.output_path}/final_model.pt")
 
-        if val_loader is not None:
+        if os.path.exists(f"{self.output_path}/best_model.pt"):
             print(f"\nLoading best model (val loss: {best_val_loss:.4f})...")
-        else:
-            print(f"\nLoading best model (train loss: {best_train_loss:.4f})...")
+            model.load_state_dict(torch.load(f"{self.output_path}/best_model.pt"))
 
-        model.load_state_dict(torch.load(f"{self.output_path}/best_model.pt"))
-
-        if self.wandb_project is not None:
+        if self.wandb_project:
             wandb.finish()
 
         return model

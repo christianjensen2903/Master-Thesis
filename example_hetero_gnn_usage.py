@@ -1,5 +1,5 @@
 from gnn_trainers import GNNTrainer
-from models import HeteroGNN, CitationGNN
+from models import HeteroGNN, DualEncoderGNN
 from preprocessing.graph_builder import HeterogeneousGraphBuilder
 
 
@@ -76,18 +76,18 @@ def train_homo_example() -> None:
         preprocessed_dir="data/preprocessed_new",
         output_path="checkpoints/homo_gnn",
         batch_size=512,
-        epochs=75,
+        epochs=50,
         learning_rate=1e-3,
-        weight_decay=5e-4,
+        weight_decay=1e-3,
         temperature=0.05,
-        num_hops=2,
+        num_hops=layers,
         checkpoint_interval=10,
         graph_type="homogeneous",  # Use homogeneous graph
         wandb_project="homo-gnn-training",
         # gradient_clip_val=3.0,
-        eval_every_n_epochs=2,
+        eval_every_n_epochs=1,
         warmup_epochs=3,
-        early_stopping_patience=10,
+        early_stopping_patience=5,
     )
     # Train on paragraph pairs
     cutoff_year = 2018

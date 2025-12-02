@@ -1,3 +1,4 @@
+import os
 import pickle
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -8,6 +9,72 @@ import numpy as np
 import torch
 from torch_geometric.data import Data, HeteroData  # type: ignore
 from torch_geometric.utils import add_self_loops  # type: ignore
+
+# Language vocabulary for authentic language feature
+# Based on frequency analysis of training data (year < 2018):
+# Only includes languages with >= 500 training samples (sufficient to learn embeddings)
+# UNKNOWN: missing, invalid, or rare languages (<500 samples: MLT, HRV)
+LANGUAGE_VOCAB = [
+    "UNKNOWN",  # Index 0: Unknown/None/rare languages
+    "MULTI",  # Index 1: Multi-language cases (~1.5%)
+    "DEU",  # Index 2: German (23.06%)
+    "FRA",  # Index 3: French (18.22%)
+    "ENG",  # Index 4: English (14.27%)
+    "NLD",  # Index 5: Dutch (10.87%)
+    "ITA",  # Index 6: Italian (10.43%)
+    "SPA",  # Index 7: Spanish (5.56%)
+    "ELL",  # Index 8: Greek (3.15%)
+    "POR",  # Index 9: Portuguese (2.12%)
+    "DAN",  # Index 10: Danish (1.68%)
+    "POL",  # Index 11: Polish (1.47%)
+    "SWE",  # Index 12: Swedish (1.37%)
+    "FIN",  # Index 13: Finnish (1.21%)
+    "HUN",  # Index 14: Hungarian (1.18%)
+    "BUL",  # Index 15: Bulgarian (0.93%)
+    "RON",  # Index 16: Romanian (0.60%)
+    "CES",  # Index 17: Czech (0.52%)
+    "LAV",  # Index 18: Latvian (0.51%)
+    "LIT",  # Index 19: Lithuanian (0.44%)
+    "SLK",  # Index 20: Slovak (0.35%)
+    "SLV",  # Index 21: Slovenian (0.25%)
+    "EST",  # Index 22: Estonian (0.24%)
+]
+LANGUAGE_TO_IDX = {lang: idx for idx, lang in enumerate(LANGUAGE_VOCAB)}
+NUM_LANGUAGES = len(LANGUAGE_VOCAB)
+
+
+def encode_language(authentic_language: list[str] | str | None) -> np.ndarray:
+    """Encode authentic language to multihot vector.
+
+    Args:
+        authentic_language: List of language codes, single code, or None
+
+    Returns:
+        Multihot vector of shape (NUM_LANGUAGES,) where UNKNOWN is all zeros
+    """
+    multihot = np.zeros(NUM_LANGUAGES, dtype=np.float32)
+
+    if authentic_language is None:
+        return multihot  # UNKNOWN: all zeros
+
+    # Handle string input (single language)
+    if isinstance(authentic_language, str):
+        idx = LANGUAGE_TO_IDX.get(authentic_language)
+        if idx is not None and idx != LANGUAGE_TO_IDX["UNKNOWN"]:
+            multihot[idx] = 1.0
+        return multihot
+
+    # Handle list input
+    if not authentic_language:  # Empty list
+        return multihot  # UNKNOWN: all zeros
+
+    # For multiple languages, set all of them to 1
+    for lang in authentic_language:
+        idx = LANGUAGE_TO_IDX.get(lang)
+        if idx is not None and idx != LANGUAGE_TO_IDX["UNKNOWN"]:
+            multihot[idx] = 1.0
+
+    return multihot
 
 
 class BaseGraphBuilder(ABC):
@@ -181,24 +248,42 @@ class BaseGraphBuilder(ABC):
 
         return selected_pars
 
-    def _extract_date_features(self, date_str: str | None) -> np.ndarray:
-        """Extract date feature: normalized days since 1954-01-01 (max 2025-12-31)."""
+    def _normalize_date(self, date_str: str | None) -> float:
+        """Normalize date to [0, 1] range based on days since 1954-01-01."""
         if not date_str:
-            # Return zero for missing dates
-            return np.array([0.0], dtype=np.float32)
+            return 0.0
         try:
             dt = datetime.fromisoformat(date_str)
-            # Calculate days since 1954-01-01
             base_date = datetime(1954, 1, 1)
             max_date = datetime(2025, 12, 31)
             days_since_base = (dt - base_date).days
             max_days = (max_date - base_date).days
-
-            # Normalize to [0, 1] range, clamping values outside range
-            time_norm = max(0.0, min(1.0, days_since_base / max_days))
-            return np.array([time_norm], dtype=np.float32)
+            return max(0.0, min(1.0, days_since_base / max_days))
         except (ValueError, AttributeError):
-            return np.array([0.0], dtype=np.float32)
+            return 0.0
+
+    def _extract_date_features(
+        self, date_str: str | None, application_date_str: str | None = None
+    ) -> np.ndarray:
+        """Extract date features: [judgment_date, application_date, duration] normalized."""
+        judgment_norm = self._normalize_date(date_str)
+        application_norm = self._normalize_date(application_date_str)
+
+        # Duration between application and judgment (case processing time)
+        duration_norm = 0.0
+        if date_str and application_date_str:
+            try:
+                judgment_dt = datetime.fromisoformat(date_str)
+                application_dt = datetime.fromisoformat(application_date_str)
+                duration_days = (judgment_dt - application_dt).days
+                # Normalize: 0 days = 0, ~5 years (1825 days) = 1, clamp to [0, 1]
+                duration_norm = max(0.0, min(1.0, duration_days / 1825))
+            except (ValueError, AttributeError):
+                pass
+
+        return np.array(
+            [judgment_norm, application_norm, duration_norm], dtype=np.float32
+        )
 
     def _compute_relative_positions(self, selected_pars: list[int]) -> dict[int, float]:
         """Compute relative paragraph positions within each case.
@@ -266,7 +351,11 @@ def decode_celex(tensor):
 
 class HomogeneousGraphBuilder(BaseGraphBuilder):
     """
-    Homogeneous graph builder with only bidirectional citing edges.
+    Homogeneous graph builder with citation edges.
+
+    Edge types:
+    - 0: "cites" (forward direction: src cites tgt)
+    - 1: "cited_by" (reverse direction: tgt is cited by src)
 
     Returns PyTorch Geometric Data object.
     """
@@ -301,8 +390,14 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
         doc_embeddings_list = []
         query_embeddings_list = []
         date_features_list = []
+        language_multihot_list = []
         node_times = []
         node_ids = []
+
+        # Prepare case metadata lists if available
+        subject_matter_list = []
+        keywords_list = []
+        case_law_about_list = []
 
         for par_idx in selected_pars:
             meta = self.par_metadata[par_idx]
@@ -316,17 +411,48 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
             doc_emb = self.par_embeddings_doc[par_idx]
             query_emb = self.par_embeddings_query[par_idx]
 
-            # Store date feature separately instead of concatenating
-            date_feature = self._extract_date_features(meta.get("date"))
+            # Store date features separately: [judgment_date, application_date]
+            case_meta = meta.get("meta", {})
+            date_feature = self._extract_date_features(
+                meta.get("date"), case_meta.get("application_date")
+            )
 
             doc_embeddings_list.append(doc_emb)
             query_embeddings_list.append(query_emb)
             date_features_list.append(date_feature)
             node_ids.append(encode_celex(meta["celex"], meta["paragraph_number"]))
 
+            # Add language multihot encoding
+            authentic_language = case_meta.get("authentic_language")
+            language_multihot_list.append(encode_language(authentic_language))
+
             # Add timestamp (convert date to Unix timestamp)
             date_str = meta.get("date")
             node_times.append(self._date_to_timestamp(date_str))
+
+            # Add case metadata embeddings (per-paragraph, from case level)
+            if self.has_case_metadata:
+                celex = meta["celex"]
+                if celex in self.celex_to_case_idx:
+                    case_idx = self.celex_to_case_idx[celex]
+                    subject_matter_list.append(
+                        self.case_embeddings_subject_matter[case_idx]
+                    )
+                    keywords_list.append(self.case_embeddings_keywords[case_idx])
+                    case_law_about_list.append(
+                        self.case_embeddings_case_law_about[case_idx]
+                    )
+                else:
+                    # Use zero vectors for missing cases
+                    subject_matter_list.append(
+                        np.zeros_like(self.case_embeddings_subject_matter[0])
+                    )
+                    keywords_list.append(
+                        np.zeros_like(self.case_embeddings_keywords[0])
+                    )
+                    case_law_about_list.append(
+                        np.zeros_like(self.case_embeddings_case_law_about[0])
+                    )
 
         # Build citation edges with edge attributes
         # Edge type 0 = "cites" (forward direction: src cites tgt)
@@ -372,35 +498,59 @@ class HomogeneousGraphBuilder(BaseGraphBuilder):
 
         node_times_tensor = torch.tensor(node_times, dtype=torch.long)
         node_ids_tensor = torch.stack(node_ids)
+        language_tensor = torch.tensor(
+            np.array(language_multihot_list), dtype=torch.float32
+        )
+
+        # Prepare case metadata tensors
+        case_metadata_kwargs = {}
+        if self.has_case_metadata and subject_matter_list:
+            case_metadata_kwargs["subject_matter"] = torch.tensor(
+                np.array(subject_matter_list), dtype=torch.float32
+            )
+            case_metadata_kwargs["keywords"] = torch.tensor(
+                np.array(keywords_list), dtype=torch.float32
+            )
+            case_metadata_kwargs["case_law_about"] = torch.tensor(
+                np.array(case_law_about_list), dtype=torch.float32
+            )
 
         graph_data = Data(
             x=x_doc,  # Default to document embeddings for backward compatibility
             x_query=x_query,  # Query embeddings (for citing paragraphs)
             date_feature=date_features,  # Date features stored separately
+            language=language_tensor,  # Language indices for embedding lookup
             edge_index=edge_index,
             edge_attr=edge_attr,  # Edge direction: 0=cites, 1=cited_by
             num_nodes=len(doc_embeddings_list),
             time=node_times_tensor,  # For temporal sampling
             node_id_hash=node_ids_tensor,  # Hashed node IDs
+            **case_metadata_kwargs,  # Case-level metadata embeddings
         )
 
         # Report embedding dimensions
-        if self.has_case_metadata:
+        if self.has_case_metadata and subject_matter_list:
             base_dim = self.par_embeddings_doc.shape[1]
-            metadata_dim = (
-                self.case_embeddings_subject_matter.shape[1]
-                + self.case_embeddings_keywords.shape[1]
-                + self.case_embeddings_case_law_about.shape[1]
-            )
+            print(f"Node embedding dim: {base_dim}")
             print(
-                f"Node embedding dim: {base_dim} (base) + {metadata_dim} (metadata) = {x_doc.shape[1]}"
+                f"  + Case metadata: subject_matter ({self.case_embeddings_subject_matter.shape[1]}), "
+                f"keywords ({self.case_embeddings_keywords.shape[1]}), "
+                f"case_law_about ({self.case_embeddings_case_law_about.shape[1]})"
             )
 
         print(
             f"Built homogeneous graph: {len(doc_embeddings_list)} nodes, {edge_index.shape[1]} edges"
         )
+        cites_count = (edge_attr == 0).sum().item()
+        cited_by_count = (edge_attr == 1).sum().item()
+        print(f"  Edge types: 0=cites ({cites_count}), 1=cited_by ({cited_by_count})")
+
+        # Report language distribution
+        unknown_count = (language_tensor.sum(dim=1) == 0).sum().item()
+        multi_count = (language_tensor.sum(dim=1) > 1).sum().item()
+        known_count = len(language_multihot_list) - unknown_count - multi_count
         print(
-            f"  Edge types: 0=cites ({(edge_attr == 0).sum().item()}), 1=cited_by ({(edge_attr == 1).sum().item()})"
+            f"  Languages: {known_count} known, {multi_count} multi, {unknown_count} unknown"
         )
 
         return graph_data
@@ -447,6 +597,7 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         par_query_embeddings_list = []
         par_times = []
         par_node_ids = []
+        par_language_multihot_list = []
         case_to_par_indices: dict[str, list[int]] = defaultdict(list)
 
         for par_idx in selected_pars:
@@ -463,6 +614,11 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
             # Convert date to Unix timestamp
             date_str = meta.get("date")
             par_times.append(self._date_to_timestamp(date_str))
+
+            # Add language multihot encoding
+            case_meta = meta.get("meta", {})
+            authentic_language = case_meta.get("authentic_language")
+            par_language_multihot_list.append(encode_language(authentic_language))
 
             # Track which paragraphs belong to each case
             celex = meta["celex"]
@@ -545,11 +701,15 @@ class HeterogeneousGraphBuilder(BaseGraphBuilder):
         x_doc = torch.tensor(np.array(par_doc_embeddings_list), dtype=torch.float32)
         x_query = torch.tensor(np.array(par_query_embeddings_list), dtype=torch.float32)
         par_node_ids_tensor = torch.stack(par_node_ids)
+        par_language_tensor = torch.tensor(
+            np.array(par_language_multihot_list), dtype=torch.float32
+        )
 
         data["paragraph"].x = x_doc  # Default to document embeddings
         data["paragraph"].x_query = x_query  # Query embeddings
         data["paragraph"].time = torch.tensor(par_times, dtype=torch.long)
         data["paragraph"].node_id_hash = par_node_ids_tensor  # Hashed node IDs
+        data["paragraph"].language = par_language_tensor  # Language indices
 
         data["article"].x = torch.tensor(
             np.array(art_embeddings_list), dtype=torch.float32

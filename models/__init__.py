@@ -1,4 +1,4 @@
 from .hetero_gnn import HeteroGNN  # type: ignore
-from .homo_gnn import CitationGNN  # type: ignore
+from .homo_gnn import DualEncoderGNN
 
-__all__ = ["HeteroGNN", "CitationGNN"]
+__all__ = ["HeteroGNN", "DualEncoderGNN"]

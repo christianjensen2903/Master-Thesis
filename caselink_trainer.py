@@ -60,9 +60,10 @@ class CaseLinkTrainer:
         # CaseLink-specific
         degree_reg_weight: float = 0.1,
         include_semantic_edges: bool = True,
-        semantic_threshold: float = 0.7,
+        semantic_threshold: float = 0.3,  # Lower threshold for TF-IDF
         semantic_max_neighbors: int = 10,
         include_article_nodes: bool = True,
+        judgments_path: str = "data/judgments_cleaned.json",
     ):
         self.preprocessed_dir = preprocessed_dir
         self.output_path = output_path
@@ -86,6 +87,7 @@ class CaseLinkTrainer:
         self.semantic_threshold = semantic_threshold
         self.semantic_max_neighbors = semantic_max_neighbors
         self.include_article_nodes = include_article_nodes
+        self.judgments_path = judgments_path
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -390,7 +392,9 @@ class CaseLinkTrainer:
         print("=" * 80)
 
         # Build training graph
-        builder = CaseLinkGraphBuilder(self.preprocessed_dir)
+        builder = CaseLinkGraphBuilder(
+            self.preprocessed_dir, judgments_path=self.judgments_path
+        )
         train_graph = builder.build_graph(
             train_cutoff_year=train_cutoff_year,
             include_only_citing=True,
@@ -624,9 +628,11 @@ if __name__ == "__main__":
     trainer = CaseLinkTrainer(
         preprocessed_dir="data/preprocessed",
         output_path="output/caselink",
-        batch_size=2048,
-        epochs=50,
+        batch_size=512,
+        epochs=100,
         learning_rate=1e-4,
+        temperature=0.1,
+        weight_decay=1e-6,
         degree_reg_weight=1e-3,
         include_semantic_edges=True,
         include_article_nodes=True,
@@ -643,7 +649,8 @@ if __name__ == "__main__":
         hidden_dim=384,
         output_dim=384,
         num_layers=1,
-        num_edge_types=5,
+        dropout=0.2,
+        num_heads=1,
     )
 
     # Train
