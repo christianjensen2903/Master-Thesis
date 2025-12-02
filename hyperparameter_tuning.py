@@ -41,7 +41,6 @@ EARLY_STOPPING_PATIENCE = 5
 WARMUP_EPOCHS = 5
 
 # Fixed model settings
-FUSION_MODE = "cross_attention"
 USE_LANGUAGE = False
 LANGUAGE_EMBED_DIM = 16
 
@@ -58,7 +57,9 @@ def create_gnn_model(trial: optuna.Trial) -> torch.nn.Module:
         num_layers=trial.suggest_int("num_layers", 1, 3),
         dropout=trial.suggest_float("dropout", 0.1, 0.5, step=0.1),
         num_heads=trial.suggest_categorical("num_heads", [1, 2, 4]),
-        fusion_mode=FUSION_MODE,
+        fusion_mode=trial.suggest_categorical(
+            "fusion_mode", ["cross_attention", "scalar", "attention"]
+        ),
         language_embed_dim=LANGUAGE_EMBED_DIM,
         use_language=USE_LANGUAGE,
         use_case_metadata=True,
@@ -73,7 +74,9 @@ def create_mlp_model(trial: optuna.Trial) -> torch.nn.Module:
         num_layers=trial.suggest_int("num_layers", 1, 3),
         dropout=trial.suggest_float("dropout", 0.1, 0.5, step=0.1),
         num_heads=trial.suggest_categorical("num_heads", [1, 2, 4]),
-        fusion_mode=FUSION_MODE,
+        fusion_mode=trial.suggest_categorical(
+            "fusion_mode", ["cross_attention", "scalar", "attention"]
+        ),
         language_embed_dim=LANGUAGE_EMBED_DIM,
         use_language=USE_LANGUAGE,
         use_case_metadata=True,
@@ -98,7 +101,9 @@ def create_caselink_symmetric_model(trial: optuna.Trial) -> torch.nn.Module:
         num_layers=trial.suggest_int("num_layers", 1, 3),
         dropout=trial.suggest_float("dropout", 0.1, 0.5, step=0.1),
         num_heads=trial.suggest_categorical("num_heads", [1, 2, 4]),
-        fusion_mode=FUSION_MODE,
+        fusion_mode=trial.suggest_categorical(
+            "fusion_mode", ["cross_attention", "scalar", "attention"]
+        ),
         language_embed_dim=LANGUAGE_EMBED_DIM,
         use_language=USE_LANGUAGE,
         use_case_metadata=True,
