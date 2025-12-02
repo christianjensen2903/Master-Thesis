@@ -40,7 +40,7 @@ PREPROCESSED_DIR = "data/preprocessed_new"
 
 # Time budget settings
 MAX_TRIALS_PER_MODEL = 30  # Adjust based on available time
-EPOCHS_FOR_TUNING = 30  # Reduced epochs during tuning
+EPOCHS_FOR_TUNING = 50  # Reduced epochs during tuning
 EARLY_STOPPING_PATIENCE = 5
 
 
@@ -363,7 +363,7 @@ def run_hyperparameter_search(
     print(f"Number of trials: {n_trials}")
 
     start_time = time.time()
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     elapsed = time.time() - start_time
 
     print(f"\n{'='*80}")

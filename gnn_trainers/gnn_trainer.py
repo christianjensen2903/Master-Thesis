@@ -8,7 +8,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch_geometric.loader import NeighborLoader  # type: ignore
 from torch_geometric.data import Data, HeteroData  # type: ignore
 from torch_geometric.transforms import ToUndirected  # type: ignore
-from tqdm import tqdm  # type: ignore
+from tqdm.auto import tqdm  # type: ignore
 import wandb
 
 from preprocessing.graph_builder import (
@@ -550,7 +550,7 @@ class GNNTrainer:
 
         with context:
             for batch_idx, batch in enumerate(
-                tqdm(loader, desc=f"{desc} batches", leave=False)
+                tqdm(loader, desc=f"{desc} batches", leave=False, dynamic_ncols=True)
             ):
                 # Move batch to device (NeighborLoader keeps data on CPU)
                 batch = batch.to(self.device)
