@@ -244,10 +244,7 @@ class GNNEvaluator:
             shuffle=False,
         )
 
-        output_dim: int = getattr(
-            self.gnn_model, "output_dim", self.graph_data.x.size(1)
-        )
-        all_embeddings = torch.zeros(num_nodes, output_dim)
+        all_embeddings: torch.Tensor | None = None
 
         with torch.no_grad():
             for batch in tqdm(loader, desc="Computing initial embeddings"):
@@ -286,6 +283,10 @@ class GNNEvaluator:
                         case_law_about=case_law_about,
                     )
 
+                # Allocate on first batch using actual output dimension
+                if all_embeddings is None:
+                    all_embeddings = torch.zeros(num_nodes, emb.size(1))
+
                 # Store only seed node embeddings
                 all_embeddings[batch.n_id[:batch_size_actual]] = emb[
                     :batch_size_actual
@@ -295,6 +296,7 @@ class GNNEvaluator:
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
 
+        assert all_embeddings is not None, "No batches processed"
         return all_embeddings
 
     def _get_graph_attrs(self) -> tuple:
