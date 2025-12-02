@@ -2,10 +2,10 @@
 Hyperparameter Tuning Script for GNN Models
 
 Uses Optuna for Bayesian optimization to tune:
-- DualEncoderGNN (homogeneous graph)
+- DualEncoderGNN (homogeneous graph) - tunes conv_type (GAT vs GraphSAGE)
 - MLPBaseline (no graph structure)
-- CaseLinkGNN (semantic graph)
-- SymmetricGNN with semantic graph (caselink_symmetric)
+- CaseLinkGNN (semantic graph) - uses GAT
+- SymmetricGNN with semantic graph (caselink_symmetric) - tunes conv_type (GAT vs GraphSAGE)
 """
 
 import argparse
@@ -62,6 +62,7 @@ def create_gnn_model(trial: optuna.Trial) -> torch.nn.Module:
         language_embed_dim=LANGUAGE_EMBED_DIM,
         use_language=USE_LANGUAGE,
         use_case_metadata=True,
+        conv_type=trial.suggest_categorical("conv_type", ["sage", "gat"]),
     )
 
 
@@ -101,6 +102,7 @@ def create_caselink_symmetric_model(trial: optuna.Trial) -> torch.nn.Module:
         language_embed_dim=LANGUAGE_EMBED_DIM,
         use_language=USE_LANGUAGE,
         use_case_metadata=True,
+        conv_type=trial.suggest_categorical("conv_type", ["sage", "gat"]),
     )
 
 
