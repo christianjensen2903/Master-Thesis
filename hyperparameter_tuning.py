@@ -5,6 +5,7 @@ Uses Optuna for Bayesian optimization to tune:
 - DualEncoderGNN (homogeneous graph)
 - MLPBaseline (no graph structure)
 - CaseLinkGNN (semantic graph)
+- SymmetricGNN with semantic graph (caselink_symmetric)
 """
 
 import argparse
@@ -20,7 +21,7 @@ import torch
 
 from gnn_evaluator import GNNEvaluator
 from gnn_trainers import GNNTrainer
-from models import DualEncoderGNN, MLPBaseline, CaseLinkGNN
+from models import DualEncoderGNN, MLPBaseline, CaseLinkGNN, SymmetricGNN
 from preprocessing.graph_builder import HomogeneousGraphBuilder, SemanticGraphBuilder
 
 
@@ -89,6 +90,20 @@ def create_caselink_model(trial: optuna.Trial) -> torch.nn.Module:
     )
 
 
+def create_caselink_symmetric_model(trial: optuna.Trial) -> torch.nn.Module:
+    return SymmetricGNN(
+        input_dim=INPUT_DIM,
+        output_dim=INPUT_DIM,
+        num_layers=trial.suggest_int("num_layers", 1, 3),
+        dropout=trial.suggest_float("dropout", 0.1, 0.5, step=0.1),
+        num_heads=trial.suggest_categorical("num_heads", [1, 2, 4]),
+        fusion_mode=FUSION_MODE,
+        language_embed_dim=LANGUAGE_EMBED_DIM,
+        use_language=USE_LANGUAGE,
+        use_case_metadata=True,
+    )
+
+
 def get_training_params(trial: optuna.Trial, model_name: str) -> dict:
     params = {
         "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
@@ -100,7 +115,7 @@ def get_training_params(trial: optuna.Trial, model_name: str) -> dict:
         "early_stopping_patience": EARLY_STOPPING_PATIENCE,
     }
 
-    if model_name == "caselink":
+    if model_name in ("caselink", "caselink_symmetric"):
         params["degree_reg_weight"] = trial.suggest_categorical(
             "degree_reg_weight", [0, 5e-4, 1e-3, 5e-3]
         )
@@ -190,6 +205,26 @@ def objective_caselink(trial: optuna.Trial) -> float:
     return run_trial(trial, model, graph_builder, "caselink", num_hops=num_layers)
 
 
+def objective_caselink_symmetric(trial: optuna.Trial) -> float:
+    """CaseLink using SymmetricGNN architecture with semantic graph."""
+    semantic_max_neighbors = trial.suggest_categorical("semantic_max_neighbors", [3, 5])
+
+    graph_builder = SemanticGraphBuilder(
+        PREPROCESSED_DIR,
+        "data/judgments_cleaned.json",
+        semantic_threshold=0.0,
+        semantic_max_neighbors=semantic_max_neighbors,
+        include_article_nodes=False,
+        semantic_cache_path="data/semantic_cache",
+    )
+
+    model = create_caselink_symmetric_model(trial)
+    num_layers = trial.params["num_layers"]
+    return run_trial(
+        trial, model, graph_builder, "caselink_symmetric", num_hops=num_layers
+    )
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -223,6 +258,9 @@ def run_hyperparameter_search(
     elif model_name == "caselink":
         # Graph builder created per trial (semantic_max_neighbors is tuned)
         objective = lambda t: objective_caselink(t)
+    elif model_name == "caselink_symmetric":
+        # SymmetricGNN with semantic graph (graph builder created per trial)
+        objective = lambda t: objective_caselink_symmetric(t)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
@@ -274,14 +312,20 @@ def save_results(
 def main():
     parser = argparse.ArgumentParser(description="Hyperparameter Tuning")
     parser.add_argument(
-        "--model", choices=["gnn", "mlp", "caselink", "all"], default="gnn"
+        "--model",
+        choices=["gnn", "mlp", "caselink", "caselink_symmetric", "all"],
+        default="gnn",
     )
     parser.add_argument("--n_trials", type=int, default=MAX_TRIALS)
     parser.add_argument("--storage", type=str, default=None)
     args = parser.parse_args()
 
     studies = {}
-    models = ["gnn", "mlp", "caselink"] if args.model == "all" else [args.model]
+    models = (
+        ["gnn", "mlp", "caselink", "caselink_symmetric"]
+        if args.model == "all"
+        else [args.model]
+    )
 
     for model in models:
         studies[model] = run_hyperparameter_search(model, args.n_trials, args.storage)
