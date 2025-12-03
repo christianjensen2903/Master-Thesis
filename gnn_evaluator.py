@@ -126,10 +126,7 @@ class GNNEvaluator:
         self.citation_mask = self._build_citation_mask()
 
         # FAISS index for efficient similarity search (built lazily during evaluation)
-        self.faiss_index = None  # faiss.IndexFlatIP
-        self.faiss_to_orig: list[int] = (
-            []
-        )  # Maps FAISS index position to original node index
+        self.faiss_index: faiss.IndexIDMap | None = None
 
     def _build_graph(self) -> Data | HeteroData:
         """Build the evaluation graph using the provided graph builder.
@@ -226,7 +223,7 @@ class GNNEvaluator:
         self,
         filtered_edges: torch.Tensor,
         filtered_attr: torch.Tensor | None,
-        batch_size: int = 512,
+        batch_size: int = 256,
     ) -> torch.Tensor:
         """Compute embeddings using batched inference to avoid OOM.
 
@@ -234,6 +231,8 @@ class GNNEvaluator:
         then extracts embeddings for the seed nodes only.
         """
         num_nodes = self.graph_data.x.size(0)
+
+        print(f"num nodes: {num_nodes}")
 
         # Create a temporary graph with filtered edges for the loader
         temp_graph = Data(
@@ -340,7 +339,7 @@ class GNNEvaluator:
                     source_nodes = self.graph_data.edge_index[0]
             return self.graph_data.time, self.graph_data.node_id_hash, source_nodes
 
-    def _create_loader(self, input_nodes) -> NeighborLoader:
+    def _create_loader(self, input_nodes, batch_size: int = 512) -> NeighborLoader:
         """Create a NeighborLoader for the given input nodes."""
         return NeighborLoader(
             data=self.graph_data,
@@ -348,7 +347,7 @@ class GNNEvaluator:
             input_nodes=input_nodes,
             num_neighbors=[-1] * self.k_hops,
             time_attr="time",
-            batch_size=512,
+            batch_size=batch_size,
             subgraph_type="bidirectional",
         )
 
@@ -442,77 +441,130 @@ class GNNEvaluator:
             )
             return embeddings[:num_nodes].cpu()
 
-    def _update_embeddings(self, sub: Data | HeteroData, sub_n_id: torch.Tensor):
-        """Update embeddings for nodes in the subgraph (document embeddings)."""
-        loader = self._create_loader(
-            ("paragraph", sub_n_id) if self.is_hetero else sub_n_id
+    def _get_k_hop_neighbors(
+        self, seed_nodes: torch.Tensor, batch_size: int = 256
+    ) -> torch.Tensor:
+        """Find all nodes within k hops of seed nodes using NeighborLoader."""
+        if len(seed_nodes) == 0:
+            return torch.tensor([], dtype=torch.long)
+
+        input_nodes = ("paragraph", seed_nodes) if self.is_hetero else seed_nodes
+        loader = NeighborLoader(
+            data=self.graph_data,
+            num_neighbors=[-1] * self.k_hops,
+            input_nodes=input_nodes,
+            batch_size=batch_size,
+            shuffle=False,
         )
-        expanded_sub = next(iter(loader))
-        # Move subgraph to device
-        expanded_sub = expanded_sub.to(self.device)
 
-        with torch.no_grad():
-            if self.is_hetero:
-                embeddings = self.gnn_model(expanded_sub)["paragraph"]
-            else:
-                edge_attr = getattr(expanded_sub, "edge_attr", None)
-                date_feature = getattr(expanded_sub, "date_feature", None)
-                language = getattr(expanded_sub, "language", None)
-                subject_matter = getattr(expanded_sub, "subject_matter", None)
-                keywords = getattr(expanded_sub, "keywords", None)
-                case_law_about = getattr(expanded_sub, "case_law_about", None)
-                # Use document encoder if dual encoder
-                if hasattr(self.gnn_model, "encode_document"):
-                    embeddings = self.gnn_model.encode_document(
-                        expanded_sub.x,
-                        expanded_sub.edge_index,
-                        date_feature=date_feature,
-                        edge_attr=edge_attr,
-                        language=language,
-                        subject_matter=subject_matter,
-                        keywords=keywords,
-                        case_law_about=case_law_about,
-                    )
+        all_neighbors: set[int] = set()
+        for sub in loader:
+            n_id = sub["paragraph"].n_id if self.is_hetero else sub.n_id
+            all_neighbors.update(n_id.tolist())
+
+        return torch.tensor(list(all_neighbors), dtype=torch.long)
+
+    def _update_embeddings(
+        self, node_indices: torch.Tensor, batch_size: int = 256
+    ) -> None:
+        """Update embeddings for given nodes using their k-hop neighborhoods."""
+        if len(node_indices) == 0:
+            return
+
+        input_nodes = ("paragraph", node_indices) if self.is_hetero else node_indices
+        loader = self._create_loader(input_nodes, batch_size=batch_size)
+
+        for batch in loader:
+            batch = batch.to(self.device)
+            actual_batch_size = batch.batch_size
+            n_id = batch["paragraph"].n_id if self.is_hetero else batch.n_id
+
+            with torch.no_grad():
+                if self.is_hetero:
+                    embeddings = self.gnn_model(batch)["paragraph"]
                 else:
-                    embeddings = self.gnn_model(
-                        expanded_sub.x,
-                        expanded_sub.edge_index,
-                        date_feature=date_feature,
-                        edge_attr=edge_attr,
-                        language=language,
-                        subject_matter=subject_matter,
-                        keywords=keywords,
-                        case_law_about=case_law_about,
-                    )
+                    edge_attr = getattr(batch, "edge_attr", None)
+                    date_feature = getattr(batch, "date_feature", None)
+                    language = getattr(batch, "language", None)
+                    subject_matter = getattr(batch, "subject_matter", None)
+                    keywords = getattr(batch, "keywords", None)
+                    case_law_about = getattr(batch, "case_law_about", None)
+                    # Use document encoder if dual encoder
+                    if hasattr(self.gnn_model, "encode_document"):
+                        embeddings = self.gnn_model.encode_document(
+                            batch.x,
+                            batch.edge_index,
+                            date_feature=date_feature,
+                            edge_attr=edge_attr,
+                            language=language,
+                            subject_matter=subject_matter,
+                            keywords=keywords,
+                            case_law_about=case_law_about,
+                        )
+                    else:
+                        embeddings = self.gnn_model(
+                            batch.x,
+                            batch.edge_index,
+                            date_feature=date_feature,
+                            edge_attr=edge_attr,
+                            language=language,
+                            subject_matter=subject_matter,
+                            keywords=keywords,
+                            case_law_about=case_law_about,
+                        )
 
-        self.embeddings[sub_n_id] = embeddings[: len(sub_n_id)].cpu()
+            # Update only the seed nodes in this batch
+            self.embeddings[n_id[:actual_batch_size]] = embeddings[
+                :actual_batch_size
+            ].cpu()
+
+            # Clear GPU memory
+            del batch, embeddings
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
     def _init_faiss_index(self, dim: int) -> None:
-        """Initialize FAISS index for inner product (cosine) similarity."""
-        self.faiss_index = faiss.IndexFlatIP(dim)
-        self.faiss_to_orig = []
+        """Initialize FAISS index with ID mapping for updates."""
+        base_index = faiss.IndexFlatIP(dim)
+        self.faiss_index = faiss.IndexIDMap(base_index)
 
-    def _add_to_faiss_index(self, indices: torch.Tensor) -> None:
-        """Add embeddings at given indices to the FAISS index.
-
-        Args:
-            indices: Original node indices to add to the index
-        """
+    def _add_to_faiss_index(
+        self, indices: torch.Tensor, batch_size: int = 10000
+    ) -> None:
+        """Add embeddings at given indices to the FAISS index in batches."""
         if self.faiss_index is None:
             raise RuntimeError("FAISS index not initialized")
 
-        # Get embeddings and normalize for cosine similarity
-        emb = self.embeddings[indices].numpy()
-        norms = np.linalg.norm(emb, axis=1, keepdims=True)
-        norms = np.where(norms > 1e-10, norms, 1.0)
-        emb_normalized = (emb / norms).astype(np.float32)
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start : start + batch_size]
 
-        # Ensure contiguous array for FAISS
-        if not emb_normalized.flags["C_CONTIGUOUS"]:
-            emb_normalized = np.ascontiguousarray(emb_normalized)
+            # Get embeddings and normalize for cosine similarity
+            # emb = self.embeddings[batch_indices].numpy()
+            # norms = np.linalg.norm(emb, axis=1, keepdims=True)
+            # norms = np.where(norms > 1e-10, norms, 1.0)
+            # emb_normalized = (emb / norms).astype(np.float32)
+            emb_normalized = self.embeddings[batch_indices].numpy()
 
-        self.faiss_index.add(emb_normalized)
-        self.faiss_to_orig.extend(indices.tolist())
+            # Ensure contiguous array for FAISS
+            if not emb_normalized.flags["C_CONTIGUOUS"]:
+                emb_normalized = np.ascontiguousarray(emb_normalized)
+
+            ids = batch_indices.numpy().astype(np.int64)
+            self.faiss_index.add_with_ids(emb_normalized, ids)
+
+    def _update_faiss_index(
+        self, indices: torch.Tensor, batch_size: int = 10000
+    ) -> None:
+        """Update embeddings for existing indices in FAISS (remove + re-add) in batches."""
+        if self.faiss_index is None or len(indices) == 0:
+            return
+
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start : start + batch_size]
+            ids = batch_indices.numpy().astype(np.int64)
+            self.faiss_index.remove_ids(ids)
+
+        self._add_to_faiss_index(indices, batch_size)
 
     def _search_faiss_index(
         self, query_emb: torch.Tensor, k: int
@@ -539,14 +591,9 @@ class GNNEvaluator:
         if not emb_normalized.flags["C_CONTIGUOUS"]:
             emb_normalized = np.ascontiguousarray(emb_normalized)
 
-        # Search FAISS index
+        # Search FAISS index (IndexIDMap returns IDs directly)
         k_actual = min(k, self.faiss_index.ntotal)
-        similarities, faiss_indices = self.faiss_index.search(emb_normalized, k_actual)
-
-        # Map FAISS indices back to original node indices
-        orig_indices = np.array(
-            [[self.faiss_to_orig[idx] for idx in row] for row in faiss_indices]
-        )
+        similarities, orig_indices = self.faiss_index.search(emb_normalized, k_actual)
 
         return similarities, orig_indices
 
@@ -591,6 +638,8 @@ class GNNEvaluator:
         initial_mask = times < cutoff_ts
         initial_indices = torch.where(initial_mask)[0]
 
+        print(f"citation mask: {self.citation_mask}")
+
         if self.citation_mask is not None:
             initial_indices = initial_indices[
                 torch.isin(initial_indices, self.citation_mask)
@@ -626,7 +675,7 @@ class GNNEvaluator:
             input_nodes = (
                 ("paragraph", nodes_with_edges) if self.is_hetero else nodes_with_edges
             )
-            sub = next(iter(self._create_loader(input_nodes)))
+            sub = next(iter(self._create_loader(input_nodes, batch_size=10000)))
             query_emb = self._process_subgraph(sub, num_nodes)
 
             # Search FAISS index for top-k candidates
@@ -671,20 +720,28 @@ class GNNEvaluator:
                         )
                     )
 
-            # Update embeddings for future queries
-            self._update_embeddings(sub, sub_n_id)
-
-            # Add new nodes to FAISS index incrementally
-            new_indices = [idx for idx in sub_n_id.tolist() if idx not in in_index]
+            # Add ALL nodes at this timestamp to FAISS and update affected neighbors
+            new_indices = [idx for idx in nodes_at_time.tolist() if idx not in in_index]
             if new_indices:
-                # Filter to only include citing nodes if citation_mask is set
-                if self.citation_mask is not None:
-                    new_indices = [
-                        idx for idx in new_indices if idx in self.citation_mask.tolist()
-                    ]
-                if new_indices:
-                    self._add_to_faiss_index(torch.tensor(new_indices))
-                    in_index.update(new_indices)
+                new_indices_tensor = torch.tensor(new_indices, dtype=torch.long)
+
+                # Find k-hop neighbors of new nodes that are already in index
+                # Their embeddings are affected by the new nodes
+                k_hop_neighbors = self._get_k_hop_neighbors(new_indices_tensor)
+                existing_neighbors = torch.tensor(
+                    [idx for idx in k_hop_neighbors.tolist() if idx in in_index],
+                    dtype=torch.long,
+                )
+
+                # Update embeddings for existing neighbors (affected by new edges)
+                if len(existing_neighbors) > 0:
+                    self._update_embeddings(existing_neighbors)
+                    self._update_faiss_index(existing_neighbors)
+
+                # Update embeddings for new nodes and add to FAISS
+                self._update_embeddings(new_indices_tensor)
+                self._add_to_faiss_index(new_indices_tensor)
+                in_index.update(new_indices)
 
         # Compute metrics and confidence intervals
         ap_array = np.array(ap_scores, dtype=np.float64)
@@ -716,7 +773,7 @@ class GNNEvaluator:
 
 
 if __name__ == "__main__":
-    from models import DualEncoderGNN, SymmetricGNN
+    from models import DualEncoderGNN, SymmetricGNN, MLPBaseline
 
     layers = 1
 
@@ -751,7 +808,7 @@ if __name__ == "__main__":
         k_hops=layers,
         device="cuda" if torch.cuda.is_available() else "cpu",
         mode="all_paragraphs",
-        top_k=1000,
+        top_k=10000,
     )
 
     evaluator.run()
