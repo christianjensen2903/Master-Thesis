@@ -1,6 +1,14 @@
-from .hetero_gnn import HeteroGNN  # type: ignore
+from .hetero_gnn import HeteroDualEncoderGNN, HeteroSymmetricGNN, create_hetero_model
 from .homo_gnn import DualEncoderGNN, SymmetricGNN
 from .caselink_gnn import CaseLinkGNN
 from .mlp_baseline import MLPBaseline
 
-__all__ = ["HeteroGNN", "DualEncoderGNN", "SymmetricGNN", "CaseLinkGNN", "MLPBaseline"]
+__all__ = [
+    "HeteroDualEncoderGNN",
+    "HeteroSymmetricGNN",
+    "create_hetero_model",
+    "DualEncoderGNN",
+    "SymmetricGNN",
+    "CaseLinkGNN",
+    "MLPBaseline",
+]
