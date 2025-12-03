@@ -256,14 +256,11 @@ class SinusoidalDateEncoder(nn.Module):
 class DualEncoderGNN(nn.Module):
     """Dual encoder with separate query encoder (MLP) and document encoder (GNN).
 
-    Language is handled via concatenation: [content_emb, language_emb].
-    Case metadata (subject_matter, keywords, case_law_about) is also concatenated.
+    Language is handled via FiLM (Feature-wise Linear Modulation):
+        x_out = gamma[lang] * x + beta[lang]
 
-    Final embedding structure: [content, language, metadata]
-
-    This concatenation approach preserves the original content signal while
-    adding auxiliary information as separate dimensions. The dot product
-    becomes: content_sim + lang_sim + metadata_sim
+    This preserves dimensionality while allowing per-language scaling and shifting
+    of embedding dimensions. More expressive than additive embeddings.
     """
 
     embedding_fusion: CrossAttentionFusion | WeightedEmbeddingFusion
@@ -277,7 +274,6 @@ class DualEncoderGNN(nn.Module):
         num_heads: int = 4,
         num_date_features: int = 3,
         use_language: bool = True,
-        language_embed_dim: int = 16,
         use_case_metadata: bool = True,
         fusion_mode: str = "scalar",
         conv_type: str = "sage",
@@ -291,7 +287,6 @@ class DualEncoderGNN(nn.Module):
         self.num_heads = num_heads
         self.num_date_features = num_date_features
         self.use_language = use_language
-        self.language_embed_dim = language_embed_dim if use_language else 0
         self.use_case_metadata = use_case_metadata
         self.fusion_mode = fusion_mode
         self.conv_type = conv_type
@@ -320,10 +315,13 @@ class DualEncoderGNN(nn.Module):
                 mode=fusion_mode,
             )
 
-        # Language embedding - concatenated to content (not added)
+        # Language FiLM: x = gamma * x + beta (feature-wise linear modulation)
         if use_language:
-            self.language_doc_proj = nn.Linear(NUM_LANGUAGES, language_embed_dim)
-            self.language_query_proj = nn.Linear(NUM_LANGUAGES, language_embed_dim)
+            self.language_gamma = nn.Embedding(NUM_LANGUAGES, output_dim)
+            self.language_beta = nn.Embedding(NUM_LANGUAGES, output_dim)
+            # Initialize gamma near 1 (identity) and beta near 0 (no shift)
+            nn.init.ones_(self.language_gamma.weight)
+            nn.init.zeros_(self.language_beta.weight)
 
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -402,6 +400,15 @@ class DualEncoderGNN(nn.Module):
             x, keywords, subject_matter, case_law_about
         )
 
+    def _apply_language_film(
+        self, x: torch.Tensor, language: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply FiLM modulation: x = gamma * x + beta."""
+        lang_indices = language.argmax(dim=1)  # one-hot -> indices
+        gamma = self.language_gamma(lang_indices)  # (N, output_dim)
+        beta = self.language_beta(lang_indices)  # (N, output_dim)
+        return gamma * x + beta
+
     def encode_query(
         self,
         x: torch.Tensor,
@@ -411,13 +418,12 @@ class DualEncoderGNN(nn.Module):
         keywords: torch.Tensor,
         case_law_about: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode query nodes. Returns [content, language, metadata] normalized."""
+        """Encode query nodes with FiLM language modulation."""
         x = self._encode_node(x, date_feature, subject_matter, keywords, case_law_about)
 
-        # Concatenate language embedding
+        # FiLM: x = gamma * x + beta (preserves dimensionality)
         if self.use_language:
-            lang_emb = self.language_query_proj(language)  # (N, lang_dim)
-            x = torch.cat([x, lang_emb], dim=1)
+            x = self._apply_language_film(x, language)
 
         return F.normalize(x, p=2, dim=1)
 
@@ -432,22 +438,22 @@ class DualEncoderGNN(nn.Module):
         keywords: torch.Tensor,
         case_law_about: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode document nodes using GNN. Returns [content, language, metadata] normalized."""
+        """Encode document nodes using GNN with FiLM language modulation."""
         x = self._encode_node(x, date_feature, subject_matter, keywords, case_law_about)
+
+        # FiLM before GNN: modulate based on language
+        if self.use_language and language is not None:
+            x = self._apply_language_film(x, language)
+
         x = self.dropout(x)
 
-        # GNN layers operate on content only (preserves semantic signal)
+        # GNN layers operate on modulated content
         for i, conv in enumerate(self.convs):
             x = self.norms[i](x)
             x_new = conv(x, edge_index)
             x_new = F.gelu(x_new)
             x_new = self.dropout(x_new)
             x = x + x_new
-
-        # Concatenate language embedding after GNN
-        if self.use_language and language is not None:
-            lang_emb = self.language_doc_proj(language)  # (N, lang_dim)
-            x = torch.cat([x, lang_emb], dim=1)
 
         return F.normalize(x, p=2, dim=1)
 
@@ -481,6 +487,9 @@ class SymmetricGNN(nn.Module):
     Unlike DualEncoderGNN which uses MLP for queries and GNN for documents,
     this model applies GNN message passing to both query and document nodes.
     The GNN weights are shared between query and document encoders.
+
+    Language is handled via FiLM (Feature-wise Linear Modulation):
+        x_out = gamma[lang] * x + beta[lang]
     """
 
     embedding_fusion: CrossAttentionFusion | WeightedEmbeddingFusion
@@ -494,7 +503,6 @@ class SymmetricGNN(nn.Module):
         num_heads: int = 4,
         num_date_features: int = 3,
         use_language: bool = True,
-        language_embed_dim: int = 16,
         use_case_metadata: bool = True,
         fusion_mode: str = "scalar",
         conv_type: str = "sage",
@@ -508,7 +516,6 @@ class SymmetricGNN(nn.Module):
         self.num_heads = num_heads
         self.num_date_features = num_date_features
         self.use_language = use_language
-        self.language_embed_dim = language_embed_dim if use_language else 0
         self.use_case_metadata = use_case_metadata
         self.fusion_mode = fusion_mode
         self.conv_type = conv_type
@@ -534,9 +541,13 @@ class SymmetricGNN(nn.Module):
                 mode=fusion_mode,
             )
 
-        # Language embedding (shared projection)
+        # Language FiLM: x = gamma * x + beta (feature-wise linear modulation)
         if use_language:
-            self.language_proj = nn.Linear(NUM_LANGUAGES, language_embed_dim)
+            self.language_gamma = nn.Embedding(NUM_LANGUAGES, output_dim)
+            self.language_beta = nn.Embedding(NUM_LANGUAGES, output_dim)
+            # Initialize gamma near 1 (identity) and beta near 0 (no shift)
+            nn.init.ones_(self.language_gamma.weight)
+            nn.init.zeros_(self.language_beta.weight)
 
         # Shared GNN layers for both query and document
         self.convs = nn.ModuleList()
@@ -591,6 +602,15 @@ class SymmetricGNN(nn.Module):
             x, keywords, subject_matter, case_law_about
         )
 
+    def _apply_language_film(
+        self, x: torch.Tensor, language: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply FiLM modulation: x = gamma * x + beta."""
+        lang_indices = language.argmax(dim=1)  # one-hot -> indices
+        gamma = self.language_gamma(lang_indices)  # (N, output_dim)
+        beta = self.language_beta(lang_indices)  # (N, output_dim)
+        return gamma * x + beta
+
     def forward(
         self,
         x: torch.Tensor,
@@ -602,13 +622,17 @@ class SymmetricGNN(nn.Module):
         keywords: torch.Tensor,
         case_law_about: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass encoding all nodes using GNN."""
+        """Forward pass encoding all nodes using GNN with FiLM language modulation."""
         x = self.embedding_fusion(x, keywords, subject_matter, case_law_about)
 
         if date_feature is not None:
             date_emb = self._encode_date(date_feature)
             assert date_emb is not None
             x = x + date_emb
+
+        # FiLM: x = gamma * x + beta (preserves dimensionality)
+        if self.use_language and language is not None:
+            x = self._apply_language_film(x, language)
 
         x = self.dropout(x)
 
@@ -618,9 +642,5 @@ class SymmetricGNN(nn.Module):
             x_new = F.gelu(x_new)
             x_new = self.dropout(x_new)
             x = x + x_new
-
-        if self.use_language and language is not None:
-            lang_emb = self.language_proj(language)
-            x = torch.cat([x, lang_emb], dim=1)
 
         return F.normalize(x, p=2, dim=1)
