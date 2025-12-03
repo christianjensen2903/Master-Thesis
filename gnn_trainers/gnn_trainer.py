@@ -522,11 +522,6 @@ class GNNTrainer:
             if is_dual:
                 stats["query_emb_norm_mean"] = query_emb.norm(dim=1).mean().item()
             stats["num_pairs"] = batch_src.size(0)
-            # Log language embedding stats
-            if hasattr(model, "language_embedding") and model.use_language:
-                lang_emb_weight = model.language_embedding.embedding.weight
-                stats["lang_emb_norm_mean"] = lang_emb_weight.norm(dim=1).mean().item()
-                stats["lang_emb_norm_std"] = lang_emb_weight.norm(dim=1).std().item()
             return loss, stats
         return result
 

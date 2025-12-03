@@ -1,4 +1,16 @@
+import os
+
+# Fix OpenMP conflict on macOS - MUST be set before importing torch/faiss
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 from datetime import datetime
+
+import faiss  # type: ignore
+
+# Set FAISS to single-threaded mode to avoid segmentation faults
+faiss.omp_set_num_threads(1)
+
 import numpy as np
 from numpy.typing import NDArray
 import pandas as pd  # type: ignore
@@ -113,6 +125,12 @@ class GNNEvaluator:
         self.embeddings = self._compute_initial_embeddings()
         self.citation_mask = self._build_citation_mask()
 
+        # FAISS index for efficient similarity search (built lazily during evaluation)
+        self.faiss_index = None  # faiss.IndexFlatIP
+        self.faiss_to_orig: list[int] = (
+            []
+        )  # Maps FAISS index position to original node index
+
     def _build_graph(self) -> Data | HeteroData:
         """Build the evaluation graph using the provided graph builder.
 
@@ -208,7 +226,7 @@ class GNNEvaluator:
         self,
         filtered_edges: torch.Tensor,
         filtered_attr: torch.Tensor | None,
-        batch_size: int = 50000,
+        batch_size: int = 512,
     ) -> torch.Tensor:
         """Compute embeddings using batched inference to avoid OOM.
 
@@ -330,7 +348,7 @@ class GNNEvaluator:
             input_nodes=input_nodes,
             num_neighbors=[-1] * self.k_hops,
             time_attr="time",
-            batch_size=100000,
+            batch_size=512,
             subgraph_type="bidirectional",
         )
 
@@ -469,6 +487,69 @@ class GNNEvaluator:
 
         self.embeddings[sub_n_id] = embeddings[: len(sub_n_id)].cpu()
 
+    def _init_faiss_index(self, dim: int) -> None:
+        """Initialize FAISS index for inner product (cosine) similarity."""
+        self.faiss_index = faiss.IndexFlatIP(dim)
+        self.faiss_to_orig = []
+
+    def _add_to_faiss_index(self, indices: torch.Tensor) -> None:
+        """Add embeddings at given indices to the FAISS index.
+
+        Args:
+            indices: Original node indices to add to the index
+        """
+        if self.faiss_index is None:
+            raise RuntimeError("FAISS index not initialized")
+
+        # Get embeddings and normalize for cosine similarity
+        emb = self.embeddings[indices].numpy()
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        norms = np.where(norms > 1e-10, norms, 1.0)
+        emb_normalized = (emb / norms).astype(np.float32)
+
+        # Ensure contiguous array for FAISS
+        if not emb_normalized.flags["C_CONTIGUOUS"]:
+            emb_normalized = np.ascontiguousarray(emb_normalized)
+
+        self.faiss_index.add(emb_normalized)
+        self.faiss_to_orig.extend(indices.tolist())
+
+    def _search_faiss_index(
+        self, query_emb: torch.Tensor, k: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Search the FAISS index for top-k similar candidates.
+
+        Args:
+            query_emb: Query embeddings [num_queries, dim]
+            k: Number of top candidates to return
+
+        Returns:
+            similarities: Similarity scores [num_queries, k]
+            orig_indices: Original node indices [num_queries, k]
+        """
+        if self.faiss_index is None:
+            raise RuntimeError("FAISS index not initialized")
+
+        # Normalize query embeddings
+        emb = query_emb.numpy()
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        norms = np.where(norms > 1e-10, norms, 1.0)
+        emb_normalized = (emb / norms).astype(np.float32)
+
+        if not emb_normalized.flags["C_CONTIGUOUS"]:
+            emb_normalized = np.ascontiguousarray(emb_normalized)
+
+        # Search FAISS index
+        k_actual = min(k, self.faiss_index.ntotal)
+        similarities, faiss_indices = self.faiss_index.search(emb_normalized, k_actual)
+
+        # Map FAISS indices back to original node indices
+        orig_indices = np.array(
+            [[self.faiss_to_orig[idx] for idx in row] for row in faiss_indices]
+        )
+
+        return similarities, orig_indices
+
     def _bootstrap_confidence_interval(
         self,
         values: NDArray,
@@ -497,7 +578,7 @@ class GNNEvaluator:
         return lower, upper
 
     def run(self, k_values: list[int] = [5, 10, 100]) -> float:
-        """Run full incremental evaluation."""
+        """Run full incremental evaluation using FAISS for efficient similarity search."""
         df = pd.read_csv(self.par_to_par_path)
         df["DATE_FROM"] = pd.to_datetime(df["DATE_FROM"])
         cutoff_date = datetime.strptime(str(self.train_cutoff_year), "%Y")
@@ -505,23 +586,30 @@ class GNNEvaluator:
 
         times, node_id_hash, source_nodes = self._get_graph_attrs()
 
+        # Initialize FAISS index with embeddings before cutoff
+        cutoff_ts = int(cutoff_date.timestamp())
+        initial_mask = times < cutoff_ts
+        initial_indices = torch.where(initial_mask)[0]
+
+        if self.citation_mask is not None:
+            initial_indices = initial_indices[
+                torch.isin(initial_indices, self.citation_mask)
+            ]
+
+        emb_dim = self.embeddings.size(1)
+        self._init_faiss_index(emb_dim)
+        self._add_to_faiss_index(initial_indices)
+        print(f"Initialized FAISS index with {self.faiss_index.ntotal} embeddings")
+
+        # Track which nodes have been added to the index
+        in_index = set(initial_indices.tolist())
+
         ap_scores = []
         recall_scores: dict[int, list[float]] = {k: [] for k in k_values}
 
         for date, group in tqdm(df.groupby("DATE_FROM"), desc="Evaluating"):
             date_str = date.normalize().strftime("%Y-%m-%d")
             timestamp = int(datetime.fromisoformat(date_str).timestamp())
-
-            # Get candidate and query nodes
-            cand_mask = times < timestamp
-            cand_indices = torch.where(cand_mask)[0]
-
-            if self.citation_mask is not None:
-                cand_indices = cand_indices[
-                    torch.isin(cand_indices, self.citation_mask)
-                ]
-
-            cand_emb = self.embeddings[cand_indices]
 
             # Get nodes at current time with outgoing edges
             nodes_at_time = (times == timestamp).nonzero(as_tuple=True)[0]
@@ -531,6 +619,9 @@ class GNNEvaluator:
             if num_nodes == 0:
                 continue
 
+            if self.faiss_index.ntotal == 0:
+                continue
+
             # Create subgraph and compute query embeddings
             input_nodes = (
                 ("paragraph", nodes_with_edges) if self.is_hetero else nodes_with_edges
@@ -538,11 +629,9 @@ class GNNEvaluator:
             sub = next(iter(self._create_loader(input_nodes)))
             query_emb = self._process_subgraph(sub, num_nodes)
 
-            # Compute similarities (language is already in embeddings via concatenation)
-            sim = torch.matmul(query_emb, cand_emb.T)
-
-            k = min(self.top_k, sim.size(1))
-            _, sim_ord = torch.topk(sim, k=k, dim=1, largest=True, sorted=True)
+            # Search FAISS index for top-k candidates
+            _, orig_indices = self._search_faiss_index(query_emb, self.top_k)
+            del query_emb
 
             # Get node IDs
             sub_node_id_hash = (
@@ -551,10 +640,11 @@ class GNNEvaluator:
             sub_n_id = sub["paragraph"].n_id if self.is_hetero else sub.n_id
 
             query_ids = [decode_celex(nid) for nid in sub_node_id_hash[:num_nodes]]
+            cand_ids_ordered = node_id_hash[orig_indices]
             ranked_ids = [
-                [decode_celex(nid) for nid in row]
-                for row in node_id_hash[cand_indices[sim_ord]]
+                [decode_celex(nid) for nid in row] for row in cand_ids_ordered
             ]
+            del orig_indices, cand_ids_ordered
 
             # Compute metrics
             grouped = group.groupby(["CELEX_FROM", "NUMBER_FROM"])
@@ -583,6 +673,18 @@ class GNNEvaluator:
 
             # Update embeddings for future queries
             self._update_embeddings(sub, sub_n_id)
+
+            # Add new nodes to FAISS index incrementally
+            new_indices = [idx for idx in sub_n_id.tolist() if idx not in in_index]
+            if new_indices:
+                # Filter to only include citing nodes if citation_mask is set
+                if self.citation_mask is not None:
+                    new_indices = [
+                        idx for idx in new_indices if idx in self.citation_mask.tolist()
+                    ]
+                if new_indices:
+                    self._add_to_faiss_index(torch.tensor(new_indices))
+                    in_index.update(new_indices)
 
         # Compute metrics and confidence intervals
         ap_array = np.array(ap_scores, dtype=np.float64)
@@ -619,17 +721,18 @@ if __name__ == "__main__":
     layers = 1
 
     model = DualEncoderGNN(
-        input_dim=384,
-        output_dim=384,
+        input_dim=1024,
+        output_dim=1024,
         num_layers=layers,
         fusion_mode="cross_attention",
+        use_language=False,
     )
     model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
 
     # Option 1: Citation-based graph (HomogeneousGraphBuilder)
     graph_builder = HomogeneousGraphBuilder(
-        preprocessed_dir="data/preprocessed",
-        include_only_citing=True,
+        preprocessed_dir="data/preprocessed_new",
+        include_only_citing=False,
     )
 
     # Option 2: Semantic similarity graph (SemanticGraphBuilder / CaseLink-style)
@@ -647,6 +750,7 @@ if __name__ == "__main__":
         train_cutoff_year=2018,  # Evaluate on data after this year
         k_hops=layers,
         device="cuda" if torch.cuda.is_available() else "cpu",
+        mode="all_paragraphs",
         top_k=1000,
     )
 
