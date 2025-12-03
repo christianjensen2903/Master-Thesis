@@ -90,7 +90,7 @@ def train_homo_example() -> None:
     print("=" * 80 + "\n")
     from preprocessing.graph_builder import HomogeneousGraphBuilder
 
-    in_channels = 1024
+    in_channels = 384
 
     layers = 1
 
@@ -100,10 +100,10 @@ def train_homo_example() -> None:
         num_layers=layers,
         dropout=0.4,
         fusion_mode="cross_attention",
-        use_language=False,
+        use_language=True,
     )
 
-    graph_builder = HomogeneousGraphBuilder("data/preprocessed_new")
+    graph_builder = HomogeneousGraphBuilder("data/preprocessed")
 
     # Initialize trainer with homogeneous graph type
     trainer = GNNTrainer(
@@ -138,6 +138,65 @@ def train_homo_example() -> None:
         par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
         k_hops=layers,
+        top_k=10000,
+    )
+    evaluator.run(k_values=[5, 10, 100])
+
+    print("\nEvaluation complete!")
+
+
+def train_mlp_baseline_example() -> None:
+    """Example: Train an MLP baseline (no graph structure) for comparison."""
+    print("\n" + "=" * 80)
+    print("Training MLP Baseline (No Graph Structure)")
+    print("=" * 80 + "\n")
+    from preprocessing.graph_builder import HomogeneousGraphBuilder
+    from models import MLPBaseline
+
+    in_channels = 1024
+    layers = 2  # MLP depth
+
+    model = MLPBaseline(
+        input_dim=in_channels,
+        output_dim=in_channels,
+        num_layers=layers,
+        dropout=0.4,
+        fusion_mode="cross_attention",
+        use_language=False,
+    )
+
+    graph_builder = HomogeneousGraphBuilder("data/preprocessed_new")
+
+    # Uses the same graph builder for data loading, but model ignores edges
+    trainer = GNNTrainer(
+        graph_builder=graph_builder,
+        output_path="checkpoints/mlp_baseline",
+        batch_size=512,
+        epochs=50,
+        learning_rate=1e-3,
+        weight_decay=4e-3,
+        temperature=0.07,
+        num_hops=1,  # No neighbor sampling needed for MLP
+        checkpoint_interval=10,
+        wandb_project="mlp-baseline-training",
+        eval_every_n_epochs=1,
+        warmup_epochs=3,
+        early_stopping_patience=5,
+    )
+
+    cutoff_year = 2016
+    trainer.train(model, cutoff_year, 2018)
+
+    print("\nTraining complete!")
+
+    model.load_state_dict(torch.load("checkpoints/mlp_baseline/best_model.pt"))
+
+    evaluator = GNNEvaluator(
+        gnn_model=model,
+        graph_builder=graph_builder,
+        par_to_par_path="data/par-to-par-cleaned.csv",
+        train_cutoff_year=cutoff_year,
+        k_hops=0,
         top_k=10000,
     )
     evaluator.run(k_values=[5, 10, 100])
@@ -187,48 +246,6 @@ def train_caselink_example() -> None:
     print("\nTraining complete!")
 
 
-def train_mlp_baseline_example() -> None:
-    """Example: Train an MLP baseline (no graph structure) for comparison."""
-    print("\n" + "=" * 80)
-    print("Training MLP Baseline (No Graph Structure)")
-    print("=" * 80 + "\n")
-    from preprocessing.graph_builder import HomogeneousGraphBuilder
-    from models import MLPBaseline
-
-    in_channels = 384
-    layers = 2  # MLP depth
-
-    model = MLPBaseline(
-        input_dim=in_channels,
-        output_dim=in_channels,
-        num_layers=layers,
-        dropout=0.3,
-        fusion_mode="scalar",
-    )
-
-    # Uses the same graph builder for data loading, but model ignores edges
-    trainer = GNNTrainer(
-        graph_builder=HomogeneousGraphBuilder("data/preprocessed"),
-        output_path="checkpoints/mlp_baseline",
-        batch_size=512,
-        epochs=50,
-        learning_rate=1e-3,
-        weight_decay=1e-3,
-        temperature=0.05,
-        num_hops=0,  # No neighbor sampling needed for MLP
-        checkpoint_interval=10,
-        wandb_project="mlp-baseline-training",
-        eval_every_n_epochs=1,
-        warmup_epochs=3,
-        early_stopping_patience=5,
-    )
-
-    cutoff_year = 2018
-    trainer.train(model, cutoff_year, 2022)
-
-    print("\nTraining complete!")
-
-
 if __name__ == "__main__":
     # Train heterogeneous GNN (uses all edge types)
     # train_hetero_example()
@@ -236,3 +253,4 @@ if __name__ == "__main__":
     # Or train homogeneous GNN (citation edges only)
     train_homo_example()
     # train_caselink_example()
+    # train_mlp_baseline_example()
