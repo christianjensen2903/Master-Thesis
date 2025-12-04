@@ -296,7 +296,7 @@ class DualEncoderGNN(nn.Module):
         self.date_encoder = SinusoidalDateEncoder(output_dim, num_dates=1)
         # Learnable scales for each date type - starts small, model learns to amplify
         # [judgment_date, application_date, duration]
-        self.date_scales = nn.Parameter(torch.tensor([0.1, 0.0, 0.0]))
+        self.date_scales = nn.Parameter(torch.tensor([0.1, 0.1, 0.1]))
 
         # Embedding fusion: combine text, keywords, subject, caselaw
         if fusion_mode == "cross_attention":
