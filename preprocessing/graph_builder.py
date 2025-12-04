@@ -6,7 +6,7 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 import re
-
+from tqdm import tqdm
 import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -834,7 +834,11 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         accumulated_indices: list[int] = []
         nodes_processed = 0
 
-        for time_idx, t in enumerate(unique_times):
+        for time_idx, t in tqdm(
+            enumerate(unique_times),
+            total=len(unique_times),
+            desc="Processing time groups chronologically",
+        ):
             group_indices = time_to_indices[t]
             group_size = len(group_indices)
 
@@ -956,7 +960,7 @@ class SemanticGraphBuilder(BaseGraphBuilder):
             time_to_indices[times[idx]].append(idx)
 
         unique_times = sorted(time_to_indices.keys())
-        print(f"  Processing {len(unique_times)} time groups chronologically...")
+        print(f"  Processing {len(unique_times)} time groups chronologically 2...")
 
         index = faiss.IndexFlatIP(d)
         faiss_to_orig: list[int] = []
@@ -964,7 +968,11 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         edges = []
         nodes_processed = 0
 
-        for time_idx, t in enumerate(unique_times):
+        for time_idx, t in tqdm(
+            enumerate(unique_times),
+            total=len(unique_times),
+            desc="Processing time groups chronologically",
+        ):
             group_indices = time_to_indices[t]
             group_size = len(group_indices)
 
