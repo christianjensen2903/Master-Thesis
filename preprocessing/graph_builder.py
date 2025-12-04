@@ -10,6 +10,7 @@ from tqdm import tqdm
 import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sparse_dot_topn import sp_matmul_topn
 import torch
 from torch_geometric.data import Data, HeteroData  # type: ignore
 from torch_geometric.utils import add_self_loops  # type: ignore
@@ -785,25 +786,26 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         tfidf_matrix: csr_matrix,
         batch_size: int,
     ) -> list[tuple[int, int]]:
-        """Compute TF-IDF edges without temporal constraints."""
+        """Compute TF-IDF edges without temporal constraints using sparse_dot_topn."""
         n = tfidf_matrix.shape[0]
+
+        # Use sparse_dot_topn to find top-k similar documents efficiently
+        # Request extra neighbors to account for self-similarity filtering
+        top_k = min(self.semantic_max_neighbors + 1, n)
+        topn_matrix = sp_matmul_topn(
+            tfidf_matrix,
+            tfidf_matrix.T,
+            top_n=top_k,
+            threshold=0.0,  # No threshold filtering
+            sort=True,
+        )
+
+        # Extract edges from sparse result, filtering out self-loops
         edges = []
-
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            batch = tfidf_matrix[start:end]
-
-            # Compute similarities (already L2 normalized, so dot product = cosine sim)
-            similarities = batch.dot(tfidf_matrix.T).toarray()
-
-            for i, orig_idx in enumerate(range(start, end)):
-                row_sims = similarities[i]
-                row_sims[orig_idx] = 0  # Zero out self-similarity
-
-                # Get top-k neighbors (no threshold for paragraphs)
-                top_indices = np.argsort(row_sims)[::-1][: self.semantic_max_neighbors]
-                for neighbor_idx in top_indices:
-                    edges.append((orig_idx, int(neighbor_idx)))
+        coo = topn_matrix.tocoo()
+        for row_idx, col_idx in zip(coo.row, coo.col):
+            if row_idx != col_idx:  # Skip self-similarity
+                edges.append((row_idx, col_idx))
 
         return edges
 
@@ -813,7 +815,7 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         times: np.ndarray,
         batch_size: int,
     ) -> list[tuple[int, int]]:
-        """Compute TF-IDF edges with temporal constraints."""
+        """Compute TF-IDF edges with temporal constraints using sparse_dot_topn."""
         n = tfidf_matrix.shape[0]
 
         # Group indices by time
@@ -837,29 +839,27 @@ class SemanticGraphBuilder(BaseGraphBuilder):
             group_size = len(group_indices)
 
             if accumulated_indices and group_size > 0:
-                # Get TF-IDF vectors for current group
+                # Get TF-IDF vectors for current group and accumulated (earlier) nodes
                 group_tfidf = tfidf_matrix[group_indices]
-                # Get TF-IDF vectors for accumulated (earlier) nodes
                 accumulated_tfidf = tfidf_matrix[accumulated_indices]
 
-                # Process in batches
-                for batch_start in range(0, group_size, batch_size):
-                    batch_end = min(batch_start + batch_size, group_size)
-                    batch_indices = group_indices[batch_start:batch_end]
-                    batch_tfidf = group_tfidf[batch_start:batch_end]
+                # Use sparse_dot_topn to find top-k similar documents efficiently
+                # This keeps everything sparse and avoids dense matrix conversion
+                top_k = min(self.semantic_max_neighbors, len(accumulated_indices))
+                topn_matrix = sp_matmul_topn(
+                    group_tfidf,
+                    accumulated_tfidf.T,
+                    top_n=top_k,
+                    threshold=0.0,  # No threshold filtering
+                    sort=True,
+                )
 
-                    # Compute similarities with accumulated nodes
-                    similarities = batch_tfidf.dot(accumulated_tfidf.T).toarray()
-
-                    for i, orig_idx in enumerate(batch_indices):
-                        row_sims = similarities[i]
-                        top_local_indices = np.argsort(row_sims)[::-1][
-                            : self.semantic_max_neighbors
-                        ]
-                        for local_idx in top_local_indices:
-                            # No threshold for paragraphs
-                            neighbor_orig_idx = accumulated_indices[local_idx]
-                            edges.append((orig_idx, neighbor_orig_idx))
+                # Extract edges from sparse result matrix
+                coo = topn_matrix.tocoo()
+                for row_idx, col_idx in zip(coo.row, coo.col):
+                    orig_idx = group_indices[row_idx]
+                    neighbor_orig_idx = accumulated_indices[col_idx]
+                    edges.append((orig_idx, neighbor_orig_idx))
 
             # Add current group to accumulated indices
             accumulated_indices.extend(group_indices)
