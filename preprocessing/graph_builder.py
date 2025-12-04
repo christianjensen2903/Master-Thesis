@@ -615,7 +615,6 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         preprocessed_dir: str,
         judgments_path: str,
         include_only_citing: bool = True,
-        semantic_threshold: float = 0.3,
         semantic_max_neighbors: int = 10,
         use_temporal_constraint: bool = True,
         include_article_nodes: bool = True,
@@ -629,9 +628,8 @@ class SemanticGraphBuilder(BaseGraphBuilder):
             preprocessed_dir: Directory containing preprocessed embeddings and metadata
             judgments_path: Path to judgments JSON file (required for TF-IDF)
             include_only_citing: Only include paragraphs involved in citations
-            semantic_threshold: TF-IDF cosine similarity threshold
             semantic_max_neighbors: Max neighbors per node for semantic edges
-            use_temporal_constraint: Only link to earlier paragraphs
+            use_temporal_constraint: Only link to earlier paragraphs (always True for TF-IDF)
             include_article_nodes: Include article nodes in the graph
             article_threshold: Cosine similarity threshold for article edges
             semantic_cache_path: Path to cache semantic edges (skips recomputation if exists)
@@ -639,7 +637,6 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         super().__init__(preprocessed_dir)
         self.judgments_path = judgments_path
         self.include_only_citing = include_only_citing
-        self.semantic_threshold = semantic_threshold
         self.semantic_max_neighbors = semantic_max_neighbors
         self.use_temporal_constraint = use_temporal_constraint
         self.include_article_nodes = include_article_nodes
@@ -700,9 +697,8 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         import hashlib
 
         # Include all parameters that affect the edges
-        params = (
-            f"{self.semantic_threshold}_{self.semantic_max_neighbors}_{use_temporal}"
-        )
+        # Note: semantic_threshold removed - paragraphs no longer use threshold
+        params = f"{self.semantic_max_neighbors}_{use_temporal}"
         par_ids_hash = hashlib.md5("_".join(sorted(par_ids)).encode()).hexdigest()[:16]
         return f"semantic_edges_{params}_{par_ids_hash}"
 
@@ -736,11 +732,12 @@ class SemanticGraphBuilder(BaseGraphBuilder):
     def _compute_tfidf_semantic_edges(
         self,
         par_ids: list[str],
-        times: np.ndarray | None = None,
+        times: np.ndarray,
         batch_size: int = 512,
     ) -> list[tuple[int, int]]:
         """Compute semantic similarity edges using TF-IDF with temporal constraints."""
-        use_temporal = times is not None and self.use_temporal_constraint
+        # Always use temporal for TF-IDF semantic edges
+        use_temporal = True
         cache_key = self._get_cache_key(par_ids, use_temporal)
 
         # Try to load from cache
@@ -773,10 +770,8 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         print("  Transforming texts to TF-IDF vectors...")
         tfidf_matrix = self.tfidf_vectorizer.transform(texts)
 
-        if not use_temporal:
-            edges = self._compute_tfidf_edges_no_temporal(tfidf_matrix, batch_size)
-        else:
-            edges = self._compute_tfidf_edges_temporal(tfidf_matrix, times, batch_size)
+        # Always use temporal constraints for TF-IDF semantic edges
+        edges = self._compute_tfidf_edges_temporal(tfidf_matrix, times, batch_size)
 
         print(f"  Found {len(edges)} TF-IDF semantic similarity edges")
 
@@ -805,11 +800,10 @@ class SemanticGraphBuilder(BaseGraphBuilder):
                 row_sims = similarities[i]
                 row_sims[orig_idx] = 0  # Zero out self-similarity
 
-                # Get top-k neighbors above threshold
+                # Get top-k neighbors (no threshold for paragraphs)
                 top_indices = np.argsort(row_sims)[::-1][: self.semantic_max_neighbors]
                 for neighbor_idx in top_indices:
-                    if row_sims[neighbor_idx] >= self.semantic_threshold:
-                        edges.append((orig_idx, int(neighbor_idx)))
+                    edges.append((orig_idx, int(neighbor_idx)))
 
         return edges
 
@@ -863,9 +857,9 @@ class SemanticGraphBuilder(BaseGraphBuilder):
                             : self.semantic_max_neighbors
                         ]
                         for local_idx in top_local_indices:
-                            if row_sims[local_idx] >= self.semantic_threshold:
-                                neighbor_orig_idx = accumulated_indices[local_idx]
-                                edges.append((orig_idx, neighbor_orig_idx))
+                            # No threshold for paragraphs
+                            neighbor_orig_idx = accumulated_indices[local_idx]
+                            edges.append((orig_idx, neighbor_orig_idx))
 
             # Add current group to accumulated indices
             accumulated_indices.extend(group_indices)
@@ -1109,9 +1103,10 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         ]
         par_times_array = np.array(par_times)
 
+        # Always use temporal constraints for TF-IDF semantic edges
         semantic_edges = self._compute_tfidf_semantic_edges(
             par_ids_in_order,
-            times=par_times_array if self.use_temporal_constraint else None,
+            times=par_times_array,
         )
         for src_idx, tgt_idx in semantic_edges:
             edge_list.append([src_idx, tgt_idx])
