@@ -111,6 +111,9 @@ class GNNEvaluator:
         self.map_ci: tuple[float, float] | None = None
         self.recall_cis: dict[int, tuple[float, float]] | None = None
 
+        # Per-query results for detailed analysis
+        self.per_query_results: list[dict] | None = None
+
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -624,6 +627,23 @@ class GNNEvaluator:
         upper = float(np.quantile(means, 1.0 - alpha / 2.0))
         return lower, upper
 
+    def get_per_query_results(self) -> list[dict]:
+        """Return per-query results for detailed analysis."""
+        if self.per_query_results is None:
+            raise RuntimeError("Evaluation not run yet. Call run() first.")
+        return self.per_query_results
+
+    def save_per_query_results(self, path: str) -> None:
+        """Save per-query results to JSON file."""
+        import json
+
+        if self.per_query_results is None:
+            raise RuntimeError("Evaluation not run yet. Call run() first.")
+
+        with open(path, "w") as f:
+            json.dump(self.per_query_results, f, indent=2)
+        print(f"Saved {len(self.per_query_results)} per-query results to {path}")
+
     def run(self, k_values: list[int] = [5, 10, 100]) -> float:
         """Run full incremental evaluation using FAISS for efficient similarity search."""
         df = pd.read_csv(self.par_to_par_path)
@@ -655,6 +675,9 @@ class GNNEvaluator:
 
         ap_scores = []
         recall_scores: dict[int, list[float]] = {k: [] for k in k_values}
+
+        # Per-query results for detailed analysis
+        per_query_results: list[dict] = []
 
         for date, group in tqdm(df.groupby("DATE_FROM"), desc="Evaluating"):
             date_str = date.normalize().strftime("%Y-%m-%d")
@@ -712,13 +735,26 @@ class GNNEvaluator:
                 idx = query_ids.index((celex_from, number_from))
                 ranked_array: NDArray = np.asarray(ranked_ids[idx], dtype=object)
 
-                ap_scores.append(compute_ap(ranked_array, relevant_set))
+                ap = compute_ap(ranked_array, relevant_set)
+                ap_scores.append(ap)
+
+                query_recalls = {}
                 for k in k_values:
-                    recall_scores[k].append(
-                        compute_recall_at_k(
-                            ranked_array, relevant_set, min(k, len(ranked_array))
-                        )
+                    recall = compute_recall_at_k(
+                        ranked_array, relevant_set, min(k, len(ranked_array))
                     )
+                    recall_scores[k].append(recall)
+                    query_recalls[k] = recall
+
+                # Store per-query result
+                per_query_results.append(
+                    {
+                        "query_celex": celex_from,
+                        "query_number": number_from,
+                        "ap": ap,
+                        "recall": query_recalls,
+                    }
+                )
 
             # Add ALL nodes at this timestamp to FAISS and update affected neighbors
             new_indices = [idx for idx in nodes_at_time.tolist() if idx not in in_index]
@@ -755,6 +791,9 @@ class GNNEvaluator:
             self.recall_scores[k] = float(np.mean(recall_array))
             self.recall_cis[k] = self._bootstrap_confidence_interval(recall_array)
 
+        # Store per-query results
+        self.per_query_results = per_query_results
+
         # Print results
         confidence_pct = int(self.confidence * 100)
         print(
@@ -773,32 +812,44 @@ class GNNEvaluator:
 
 
 if __name__ == "__main__":
-    from models import DualEncoderGNN, SymmetricGNN, MLPBaseline
+    from models import DualEncoderGNN, SymmetricGNN, MLPBaseline, CaseLinkGNN
 
+    # layers = 2
+
+    # model = MLPBaseline(
+    #     input_dim=1024,
+    #     output_dim=1024,
+    #     num_layers=layers,
+    #     fusion_mode="cross_attention",
+    #     use_language=False,
+    # )
+    in_channels = 1024
     layers = 1
 
-    model = DualEncoderGNN(
-        input_dim=1024,
-        output_dim=1024,
+    model = CaseLinkGNN(
+        input_dim=in_channels,
         num_layers=layers,
-        fusion_mode="cross_attention",
-        use_language=False,
+        dropout=0.5,
+        num_heads=4,
     )
-    model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
+
+    model.load_state_dict(torch.load("checkpoints/caselink_gnn2/best_model.pt"))
 
     # Option 1: Citation-based graph (HomogeneousGraphBuilder)
-    graph_builder = HomogeneousGraphBuilder(
-        preprocessed_dir="data/preprocessed_new",
-        include_only_citing=False,
-    )
-
-    # Option 2: Semantic similarity graph (SemanticGraphBuilder / CaseLink-style)
-    # graph_builder = SemanticGraphBuilder(
-    #     preprocessed_dir="data/preprocessed",
-    #     judgments_path="data/judgments_cleaned.json",
-    #     semantic_threshold=0.3,
-    #     include_article_nodes=True,
+    # graph_builder = HomogeneousGraphBuilder(
+    #     preprocessed_dir="data/preprocessed_new",
+    #     # include_only_citing=False,
     # )
+
+    graph_builder = SemanticGraphBuilder(
+        "data/preprocessed_new",
+        "data/judgments_cleaned.json",
+        semantic_cache_path="data/semantic_cache",
+        semantic_threshold=0.0,
+        semantic_max_neighbors=3,
+        include_article_nodes=False,
+        # include_only_citing=False,
+    )
 
     evaluator = GNNEvaluator(
         gnn_model=model,
@@ -807,8 +858,10 @@ if __name__ == "__main__":
         train_cutoff_year=2018,  # Evaluate on data after this year
         k_hops=layers,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        mode="all_paragraphs",
+        # mode="all_paragraphs",
         top_k=10000,
     )
 
     evaluator.run()
+
+    evaluator.save_per_query_results("artifacts/per_query_results/caselink_gnn.json")

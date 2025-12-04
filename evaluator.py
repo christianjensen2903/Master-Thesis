@@ -122,6 +122,9 @@ class Evaluator:
         self.map_ci: tuple[float, float] | None = None
         self.recall_cis: dict[int, tuple[float, float]] | None = None
 
+        # Per-query results for detailed analysis
+        self.per_query_results: list[dict] | None = None
+
     def load_and_prepare(self) -> None:
         self._load_paragraphs()
         self._load_citation_pairs()
@@ -328,6 +331,8 @@ class Evaluator:
         assert self.query_pids is not None
         assert self.query_embeddings is not None
         assert self.paragraph_dates is not None
+        assert self.paragraph_celex is not None
+        assert self.paragraph_number is not None
 
         # Get test queries with relevance judgments
         test_query_pids = [
@@ -369,6 +374,9 @@ class Evaluator:
         ranked_pids_list: list[NDArray] = []
         relevant_pids_list: list[NDArray] = []
         max_ranks: list[int] = []
+
+        # Per-query results for detailed analysis
+        per_query_results: list[dict] = []
 
         top_k = self.top_k if self.top_k else 10000
         metric_name = f"MAP@{self.top_k}" if self.top_k else "MAP"
@@ -422,6 +430,18 @@ class Evaluator:
                     relevant_pids_list.append(relevant_in_candidates)
                     max_ranks.append(max_rank)
 
+                    # Store query identifier for per-query analysis
+                    celex = str(self.paragraph_celex[query_pid])
+                    number = int(self.paragraph_number[query_pid])
+                    per_query_results.append(
+                        {
+                            "query_celex": celex,
+                            "query_number": number,
+                            "query_pid": query_pid,
+                            "ranked_idx": len(ranked_pids_list) - 1,
+                        }
+                    )
+
                     pbar.update(1)
 
             # Then, add documents with this timestamp to the index
@@ -438,6 +458,7 @@ class Evaluator:
         if not ranked_pids_list:
             self.map_score = 0.0
             self.recall_scores = {k: 0.0 for k in k_values}
+            self.per_query_results = []
             return self.map_score, self.recall_scores
 
         # Compute metrics using numba
@@ -463,6 +484,17 @@ class Evaluator:
             for idx, k in enumerate(k_values)
         }
 
+        # Store per-query metrics
+        for result in per_query_results:
+            idx = result["ranked_idx"]
+            result["ap"] = float(avg_precs[idx])
+            result["recall"] = {
+                k: float(recall_matrix[idx, i]) for i, k in enumerate(k_values)
+            }
+            del result["ranked_idx"]  # Remove internal index
+
+        self.per_query_results = per_query_results
+
         return self.map_score, self.recall_scores
 
     def _bootstrap_confidence_interval(
@@ -487,6 +519,21 @@ class Evaluator:
         lower = float(np.quantile(means, alpha / 2.0))
         upper = float(np.quantile(means, 1.0 - alpha / 2.0))
         return lower, upper
+
+    def get_per_query_results(self) -> list[dict]:
+        """Return per-query results for detailed analysis."""
+        if self.per_query_results is None:
+            raise RuntimeError("Evaluation not run yet. Call run() first.")
+        return self.per_query_results
+
+    def save_per_query_results(self, path: str) -> None:
+        """Save per-query results to JSON file."""
+        if self.per_query_results is None:
+            raise RuntimeError("Evaluation not run yet. Call run() first.")
+
+        with open(path, "w") as f:
+            json.dump(self.per_query_results, f, indent=2)
+        print(f"Saved {len(self.per_query_results)} per-query results to {path}")
 
     def run(self) -> float:
         print(f"Mode: {self.mode}")
@@ -565,16 +612,17 @@ if __name__ == "__main__":
     #     stop_words="english",
     # )
     retriever = DenseRetriever(
-        preprocessed_dir="data/preprocessed_new",
+        preprocessed_dir="data/preprocessed_new_og",
     )
 
     evaluator = Evaluator(
         retriever=retriever,
-        # mode="all_paragraphs",
+        mode="all_paragraphs",
         judgments_path="data/judgments_cleaned.json",
-        par_to_par_path="data/par-to-par-cleaned.csv",
+        par_to_par_path="data/par-to-par-og-no-numbers.csv",
         train_cutoff_year=2018,
         top_k=10000,
     )
 
     evaluator.run()
+    # evaluator.save_per_query_results("artifacts/per_query_results/tfidf.json")
