@@ -6,7 +6,6 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 import re
-from typing import cast
 from tqdm import tqdm
 import numpy as np
 from scipy.sparse import csr_matrix
@@ -777,13 +776,7 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         if not use_temporal:
             edges = self._compute_tfidf_edges_no_temporal(tfidf_matrix, batch_size)
         else:
-            # times is guaranteed to be not None when use_temporal is True
-            if times is None:
-                raise ValueError("times must not be None when use_temporal is True")
-            times_array = cast(np.ndarray, times)
-            edges = self._compute_tfidf_edges_temporal(
-                tfidf_matrix, times_array, batch_size
-            )
+            edges = self._compute_tfidf_edges_temporal(tfidf_matrix, times, batch_size)
 
         print(f"  Found {len(edges)} TF-IDF semantic similarity edges")
 
@@ -826,9 +819,8 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         times: np.ndarray,
         batch_size: int,
     ) -> list[tuple[int, int]]:
-        """Compute TF-IDF edges with temporal constraints using FAISS with incremental dense conversion."""
+        """Compute TF-IDF edges with temporal constraints."""
         n = tfidf_matrix.shape[0]
-        d = tfidf_matrix.shape[1]
 
         # Group indices by time
         time_to_indices: dict[int, list[int]] = defaultdict(list)
@@ -838,12 +830,8 @@ class SemanticGraphBuilder(BaseGraphBuilder):
         unique_times = sorted(time_to_indices.keys())
         print(f"  Processing {len(unique_times)} time groups chronologically...")
 
-        # Use FAISS for efficient incremental search
-        # We'll convert sparse vectors to dense only in small batches
-        index = faiss.IndexFlatIP(d)
-        faiss_to_orig: list[int] = []
-
         edges = []
+        accumulated_indices: list[int] = []
         nodes_processed = 0
 
         for time_idx, t in tqdm(
@@ -854,56 +842,40 @@ class SemanticGraphBuilder(BaseGraphBuilder):
             group_indices = time_to_indices[t]
             group_size = len(group_indices)
 
-            if index.ntotal > 0 and group_size > 0:
-                # Get sparse vectors for current group
-                group_tfidf_sparse = tfidf_matrix[group_indices]
+            if accumulated_indices and group_size > 0:
+                # Get TF-IDF vectors for current group
+                group_tfidf = tfidf_matrix[group_indices]
+                # Get TF-IDF vectors for accumulated (earlier) nodes
+                accumulated_tfidf = tfidf_matrix[accumulated_indices]
 
-                # Process in batches to limit memory usage
+                # Process in batches
                 for batch_start in range(0, group_size, batch_size):
                     batch_end = min(batch_start + batch_size, group_size)
                     batch_indices = group_indices[batch_start:batch_end]
-                    batch_tfidf_sparse = group_tfidf_sparse[batch_start:batch_end]
+                    batch_tfidf = group_tfidf[batch_start:batch_end]
 
-                    # Convert only this small batch to dense for FAISS search
-                    # TF-IDF vectors are already L2 normalized by sklearn, so we can use them directly
-                    batch_tfidf_dense = batch_tfidf_sparse.toarray().astype(np.float32)
-
-                    if not batch_tfidf_dense.flags["C_CONTIGUOUS"]:
-                        batch_tfidf_dense = np.ascontiguousarray(batch_tfidf_dense)
-
-                    k = min(self.semantic_max_neighbors, index.ntotal)
-                    similarities, faiss_neighbors = index.search(batch_tfidf_dense, k)
+                    # Compute similarities with accumulated nodes
+                    similarities = batch_tfidf.dot(accumulated_tfidf.T).toarray()
 
                     for i, orig_idx in enumerate(batch_indices):
-                        for j in range(k):
-                            sim = similarities[i, j]
-                            if sim >= self.semantic_threshold:
-                                faiss_idx = faiss_neighbors[i, j]
-                                neighbor_orig_idx = faiss_to_orig[faiss_idx]
+                        row_sims = similarities[i]
+                        top_local_indices = np.argsort(row_sims)[::-1][
+                            : self.semantic_max_neighbors
+                        ]
+                        for local_idx in top_local_indices:
+                            if row_sims[local_idx] >= self.semantic_threshold:
+                                neighbor_orig_idx = accumulated_indices[local_idx]
                                 edges.append((orig_idx, neighbor_orig_idx))
 
-            # Add current group to the index incrementally
-            # Convert only this group to dense (not the whole matrix)
-            if group_size > 0:
-                group_tfidf_sparse = tfidf_matrix[group_indices]
-                # Convert only this group to dense
-                # TF-IDF vectors are already L2 normalized by sklearn
-                group_tfidf_dense = group_tfidf_sparse.toarray().astype(np.float32)
-
-                if not group_tfidf_dense.flags["C_CONTIGUOUS"]:
-                    group_tfidf_dense = np.ascontiguousarray(group_tfidf_dense)
-
-                # Add to FAISS index (this stores the vectors efficiently)
-                index.add(group_tfidf_dense)
-                faiss_to_orig.extend(group_indices)
-
+            # Add current group to accumulated indices
+            accumulated_indices.extend(group_indices)
             nodes_processed += group_size
 
             if (time_idx + 1) % max(1, len(unique_times) // 10) == 0:
                 pct = 100 * (time_idx + 1) / len(unique_times)
-                print(
-                    f"    {pct:.0f}% complete ({nodes_processed}/{n} nodes, {len(edges)} edges)"
-                )
+        print(
+            f"    {pct:.0f}% complete ({nodes_processed}/{n} nodes, {len(edges)} edges)"
+        )
 
         return edges
 
