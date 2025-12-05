@@ -26,11 +26,15 @@ class EmbeddingPreprocessor:
         batch_size: int = 32,
         mask_token: str = "[MASK]",
         precision: Literal["fp32", "fp16", "bf16"] = "fp32",
+        use_prefixes: bool = True,
+        include_metadata: bool = False,
     ):
         self.encoder_name = encoder_name
         self.batch_size = batch_size
         self.mask_token = mask_token
         self.precision = precision
+        self.use_prefixes = use_prefixes
+        self.include_metadata = include_metadata
         self.encoder = SentenceTransformer(encoder_name, trust_remote_code=True)
 
         # Apply precision
@@ -40,6 +44,50 @@ class EmbeddingPreprocessor:
         elif precision == "bf16":
             self.encoder.to(torch.bfloat16)
             print(f"Using bf16 (bfloat16) precision")
+
+    def _get_metadata_text(self, meta: dict[str, Any]) -> str:
+        """Get formatted metadata text for a judgment."""
+        lines = []
+
+        subject_matter = self._format_list(meta.get("subject_matter"))
+        if subject_matter:
+            lines.append(f"Subject: {subject_matter}")
+
+        keywords = self._format_list(meta.get("keywords"))
+        if keywords:
+            lines.append(f"Keywords: {keywords}")
+
+        case_law_about = self._format_case_law_about(meta.get("case_law_about"))
+        if case_law_about:
+            lines.append(f"About: {case_law_about}")
+
+        return "\n\n".join(lines)
+
+    def _format_text(self, text: str, meta: dict[str, Any], is_query: bool) -> str:
+        """Format text with optional prefix and metadata.
+
+        Format:
+            Subject: ...
+
+            Keywords: ...
+
+            About: ...
+
+
+            <text>
+        """
+        # Add prefix if enabled
+        if self.use_prefixes:
+            prefix = "query: " if is_query else "passage: "
+            text = f"{prefix}{text}"
+
+        # Add metadata before text if enabled
+        if self.include_metadata:
+            metadata_text = self._get_metadata_text(meta)
+            if metadata_text:
+                text = f"{metadata_text}\n\n\n{text}"
+
+        return text
 
     def process_judgments(
         self,
@@ -67,14 +115,15 @@ class EmbeddingPreprocessor:
         print("Loading par-to-par citations...")
         df = pd.read_csv(par_to_par_path)
 
-        # Create mapping from paragraph ID to TEXT_FROM (masked text)
-        text_from_map: dict[str, str] = {}
+        # Create mapping from paragraph ID to TEXT_FROM (masked text) and CELEX
+        text_from_map: dict[str, tuple[str, str]] = {}
         for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing TEXT_FROM"):
             par_id = f"par:{row['CELEX_FROM']}:{row['NUMBER_FROM']}"
             text_from = str(row["TEXT_FROM"])
+            celex_from = str(row["CELEX_FROM"])
             # Use the first occurrence (they should all be the same for a given paragraph)
             if par_id not in text_from_map:
-                text_from_map[par_id] = f"query: {text_from}"
+                text_from_map[par_id] = (text_from, celex_from)
 
         print(f"Found masked text for {len(text_from_map)} citing paragraphs")
 
@@ -99,10 +148,10 @@ class EmbeddingPreprocessor:
                     {
                         "id": par_id,
                         "type": "paragraph",
-                        "text": f"passage: {text}",
+                        "text": self._format_text(text, meta, is_query=False),
                         "text_from": text_from_map.get(
                             par_id
-                        ),  # Masked text if available
+                        ),  # (text, celex) if available
                         "celex": celex,
                         "paragraph_number": int(par_num),
                         "date": date.isoformat() if date else None,
@@ -129,12 +178,17 @@ class EmbeddingPreprocessor:
         paragraphs_with_masked_text = 0
         for p in paragraphs_data:
             if p["text_from"] is not None:
-                # Use masked text from par-to-par (already has "query: " prefix)
-                query_texts.append(p["text_from"])
+                # Use masked text from par-to-par
+                text_from, celex_from = p["text_from"]
+                meta_from = judgments.get(celex_from, {}).get("meta", {})
+                query_texts.append(
+                    self._format_text(text_from, meta_from, is_query=True)
+                )
                 paragraphs_with_masked_text += 1
             else:
                 # Fallback: use mask token for paragraphs that never cite
-                query_texts.append(f"query: {self.mask_token}")
+                fallback = self._format_text(self.mask_token, {}, is_query=True)
+                query_texts.append(fallback)
 
         print(
             f"Using TEXT_FROM for {paragraphs_with_masked_text}/{len(paragraphs_data)} paragraphs"
@@ -166,20 +220,21 @@ class EmbeddingPreprocessor:
             )
 
         # Encode case-level metadata
+        prefix = "passage: " if self.use_prefixes else ""
         subject_matter_embeddings = self.encoder.encode(
-            [f"passage: {c['subject_matter_text']}" for c in case_metadata_data],
+            [f"{prefix}{c['subject_matter_text']}" for c in case_metadata_data],
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
         )
         keywords_embeddings = self.encoder.encode(
-            [f"passage: {c['keywords_text']}" for c in case_metadata_data],
+            [f"{prefix}{c['keywords_text']}" for c in case_metadata_data],
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
         )
         case_law_about_embeddings = self.encoder.encode(
-            [f"passage: {c['case_law_about_text']}" for c in case_metadata_data],
+            [f"{prefix}{c['case_law_about_text']}" for c in case_metadata_data],
             batch_size=self.batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
@@ -251,6 +306,7 @@ class EmbeddingPreprocessor:
             legal_acts = json.load(f)
 
         # Collect all articles with metadata
+        prefix = "passage: " if self.use_prefixes else ""
         articles_data = []
         for celex, act in tqdm(legal_acts.items(), desc="Processing legal acts"):
             for i, article in enumerate(act.get("articles", [])):
@@ -265,7 +321,7 @@ class EmbeddingPreprocessor:
                     {
                         "id": f"art:{celex}:{art_num}{i}",
                         "type": "article",
-                        "text": f"passage: {text}",
+                        "text": f"{prefix}{text}",
                         "celex": celex,
                         "article_number": art_num,
                         "title": act.get("title", ""),
@@ -278,7 +334,7 @@ class EmbeddingPreprocessor:
 
         # Encode all texts
         print("Encoding articles...")
-        texts = [a["text"] for a in articles_data]  # Already has "passage: " prefix
+        texts = [a["text"] for a in articles_data]
         embeddings = self.encoder.encode(
             texts,
             batch_size=self.batch_size,
@@ -451,12 +507,24 @@ def main():
         default="fp32",
         help="Model precision: fp32 (default), fp16 (faster on GPU), bf16 (faster on newer GPUs)",
     )
+    parser.add_argument(
+        "--no-prefixes",
+        action="store_true",
+        help="Disable 'query:' and 'passage:' prefixes",
+    )
+    parser.add_argument(
+        "--include-metadata",
+        action="store_true",
+        help="Include subject matter, keywords, and case law about metadata in text",
+    )
     args = parser.parse_args()
 
     preprocessor = EmbeddingPreprocessor(
         encoder_name=args.encoder,
         batch_size=args.batch_size,
         precision=args.precision,
+        use_prefixes=not args.no_prefixes,
+        include_metadata=args.include_metadata,
     )
 
     # Process paragraphs
