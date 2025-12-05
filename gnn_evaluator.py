@@ -133,7 +133,11 @@ class GNNEvaluator:
         self.faiss_index: faiss.IndexIDMap | None = None
 
     def _remove_wandb_hooks(self) -> None:
-        """Remove wandb hooks from the model to prevent errors during evaluation."""
+        """Remove all forward hooks from the model to prevent errors during evaluation.
+
+        Wandb hooks are lambdas that are hard to detect, so we just clear all hooks
+        since we don't need any during inference.
+        """
         try:
             import wandb
 
@@ -143,43 +147,14 @@ class GNNEvaluator:
         except (ImportError, AttributeError):
             pass
 
-        # Manually remove any forward hooks that might be from wandb
-        # wandb registers hooks on forward_pre and forward hooks
+        # Clear all hooks from all modules - we don't need any during evaluation
         for module in self.gnn_model.modules():
-            # Remove forward_pre hooks (wandb uses these)
             if hasattr(module, "_forward_pre_hooks"):
-                hooks_to_remove = []
-                for hook_id, hook in list(module._forward_pre_hooks.items()):
-                    # Check if hook is from wandb by checking various attributes
-                    hook_str = str(hook)
-                    hook_fn = getattr(hook, "__func__", None) or getattr(
-                        hook, "__self__", None
-                    )
-                    if hook_fn is not None:
-                        hook_module = getattr(hook_fn, "__module__", "")
-                        if "wandb" in str(hook_module).lower():
-                            hooks_to_remove.append(hook_id)
-                    elif "wandb" in hook_str.lower():
-                        hooks_to_remove.append(hook_id)
-                for hook_id in hooks_to_remove:
-                    module._forward_pre_hooks.pop(hook_id, None)
-
-            # Remove forward hooks (wandb also uses these)
+                module._forward_pre_hooks.clear()
             if hasattr(module, "_forward_hooks"):
-                hooks_to_remove = []
-                for hook_id, hook in list(module._forward_hooks.items()):
-                    hook_str = str(hook)
-                    hook_fn = getattr(hook, "__func__", None) or getattr(
-                        hook, "__self__", None
-                    )
-                    if hook_fn is not None:
-                        hook_module = getattr(hook_fn, "__module__", "")
-                        if "wandb" in str(hook_module).lower():
-                            hooks_to_remove.append(hook_id)
-                    elif "wandb" in hook_str.lower():
-                        hooks_to_remove.append(hook_id)
-                for hook_id in hooks_to_remove:
-                    module._forward_hooks.pop(hook_id, None)
+                module._forward_hooks.clear()
+            if hasattr(module, "_backward_hooks"):
+                module._backward_hooks.clear()
 
     def _build_graph(self) -> Data | HeteroData:
         """Build the evaluation graph using the provided graph builder.
@@ -863,43 +838,49 @@ class GNNEvaluator:
 
 if __name__ == "__main__":
     from models import DualEncoderGNN, SymmetricGNN, MLPBaseline, CaseLinkGNN
+    from models.simple_homo_gnn import SimpleHomoGNN
 
-    layers = 1
-
-    model = SymmetricGNN(
-        input_dim=1024,
-        output_dim=1024,
-        num_layers=layers,
-        fusion_mode="cross_attention",
-        use_language=False,
-    )
-    # in_channels = 1024
     # layers = 1
 
-    # model = CaseLinkGNN(
-    #     input_dim=in_channels,
+    # model = SymmetricGNN(
+    #     input_dim=1024,
+    #     output_dim=1024,
     #     num_layers=layers,
-    #     dropout=0.5,
-    #     num_heads=4,
+    #     fusion_mode="cross_attention",
+    #     use_language=False,
     # )
+    in_channels = 1024
+    layers = 1
 
-    model.load_state_dict(torch.load("checkpoints/homo_gnn_ablation2/best_model.pt"))
-
-    # Option 1: Citation-based graph (HomogeneousGraphBuilder)
-    graph_builder = HomogeneousGraphBuilder(
-        preprocessed_dir="data/preprocessed_new",
-        # include_only_citing=False,
+    model = CaseLinkGNN(
+        input_dim=in_channels,
+        num_layers=layers,
+        dropout=0.5,
+        num_heads=4,
     )
 
-    # graph_builder = SemanticGraphBuilder(
-    #     "data/preprocessed_new",
-    #     "data/judgments_cleaned.json",
-    #     semantic_cache_path="data/semantic_cache",
-    #     semantic_threshold=0.0,
-    #     semantic_max_neighbors=3,
-    #     include_article_nodes=False,
+    # in_channels = 384
+    # layers = 1
+    # model = SimpleHomoGNN(
+    #     input_dim=in_channels, output_dim=in_channels, num_layers=layers, dropout=0.4
+    # )
+
+    model.load_state_dict(torch.load("checkpoints/caselink_gnn2/best_model.pt"))
+
+    # Option 1: Citation-based graph (HomogeneousGraphBuilder)
+    # graph_builder = HomogeneousGraphBuilder(
+    #     preprocessed_dir="data/preprocessed",
     #     # include_only_citing=False,
     # )
+
+    graph_builder = SemanticGraphBuilder(
+        "data/preprocessed_new",
+        "data/judgments_cleaned.json",
+        semantic_cache_path="data/semantic_cache",
+        semantic_max_neighbors=3,
+        include_article_nodes=False,
+        include_only_citing=False,
+    )
 
     evaluator = GNNEvaluator(
         gnn_model=model,
@@ -908,10 +889,10 @@ if __name__ == "__main__":
         train_cutoff_year=2018,  # Evaluate on data after this year
         k_hops=layers,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        # mode="all_paragraphs",
-        top_k=10000,
+        mode="all_paragraphs",
+        top_k=1000,
     )
 
     evaluator.run()
 
-    # evaluator.save_per_query_results("artifacts/per_query_results/caselink_gnn.json")
+    evaluator.save_per_query_results("artifacts/per_query_results/caselink_gnn.json")
