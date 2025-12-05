@@ -117,14 +117,44 @@ class DenseRetrieverTrainer:
         train_dataset = Dataset.from_list(train_data)
         return train_dataset, val_df, train_df
 
-    def train(self, paragraph_file: str, cutoff_year: int) -> SentenceTransformer:
-        """Train a sentence embedding model using SIMCSE with MultipleNegativesRankingLoss."""
+    def train(
+        self,
+        paragraph_file: str,
+        cutoff_year: int,
+        resume_from_checkpoint: str | bool | None = None,
+    ) -> SentenceTransformer:
+        """Train a sentence embedding model using SIMCSE with MultipleNegativesRankingLoss.
 
+        Args:
+            paragraph_file: Path to the CSV file with paragraph data.
+            cutoff_year: Year to split train/validation data.
+            resume_from_checkpoint: Path to checkpoint directory to resume from,
+                True to resume from latest checkpoint in output_dir, or None to start fresh.
+        """
         train_dataset, val_df, train_df = self.get_simcse_data(
             paragraph_file, cutoff_year
         )
 
-        model = SentenceTransformer(self.model_name)
+        # Load model from checkpoint if resuming, otherwise from base model
+        if isinstance(resume_from_checkpoint, str) and os.path.isdir(
+            resume_from_checkpoint
+        ):
+            print(f"Resuming from checkpoint: {resume_from_checkpoint}")
+            model = SentenceTransformer(resume_from_checkpoint)
+        elif resume_from_checkpoint is True:
+            # Find latest checkpoint in output_dir
+            checkpoint = self._get_latest_checkpoint()
+            if checkpoint:
+                print(f"Resuming from latest checkpoint: {checkpoint}")
+                model = SentenceTransformer(checkpoint)
+                resume_from_checkpoint = checkpoint
+            else:
+                print("No checkpoint found, starting fresh")
+                model = SentenceTransformer(self.model_name)
+                resume_from_checkpoint = None
+        else:
+            model = SentenceTransformer(self.model_name)
+
         if self.max_seq_length is not None:
             model.max_seq_length = self.max_seq_length
 
@@ -144,7 +174,7 @@ class DenseRetrieverTrainer:
             args=self.training_args,
         )
 
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         output_dir = self.training_args.output_dir
         if output_dir is None:
             raise ValueError("output_dir must be set in training_args")
@@ -152,6 +182,25 @@ class DenseRetrieverTrainer:
 
         print(f"Training finished. Model saved to {output_dir}")
         return model
+
+    def _get_latest_checkpoint(self) -> str | None:
+        """Find the latest checkpoint in the output directory."""
+        output_dir = self.training_args.output_dir
+        if output_dir is None or not os.path.isdir(output_dir):
+            return None
+
+        checkpoints = [
+            d
+            for d in os.listdir(output_dir)
+            if d.startswith("checkpoint-")
+            and os.path.isdir(os.path.join(output_dir, d))
+        ]
+        if not checkpoints:
+            return None
+
+        # Sort by step number and return the latest
+        checkpoints.sort(key=lambda x: int(x.split("-")[1]))
+        return os.path.join(output_dir, checkpoints[-1])
 
 
 if __name__ == "__main__":
