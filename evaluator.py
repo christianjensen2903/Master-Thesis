@@ -10,6 +10,7 @@ from tqdm import tqdm  # type: ignore
 from numba import njit, prange  # type: ignore
 
 from retrievers.base_retriever import BaseRetriever
+from retrievers.recency_dense_retriever import RecencyBoostedDenseRetriever
 
 EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
 
@@ -370,6 +371,10 @@ class Evaluator:
         emb_dim = self.embeddings.shape[1]
         self.retriever.create_index(emb_dim)
 
+        # Set document dates for recency boosting if supported
+        if isinstance(self.retriever, RecencyBoostedDenseRetriever):
+            self.retriever.set_document_dates(self.paragraph_dates)
+
         # Results storage
         ranked_pids_list: list[NDArray] = []
         relevant_pids_list: list[NDArray] = []
@@ -395,7 +400,14 @@ class Evaluator:
                 query_embs = self.query_embeddings[query_indices]
 
                 # Search against accumulated index
-                retrieved_pids, _ = self.retriever.search_index(query_embs, top_k)
+                if isinstance(self.retriever, RecencyBoostedDenseRetriever):
+                    # Pass query dates for recency computation
+                    query_dates = np.array([t] * len(query_pids_at_t), dtype=np.int64)
+                    retrieved_pids, _ = self.retriever.search_index(
+                        query_embs, top_k, query_dates=query_dates
+                    )
+                else:
+                    retrieved_pids, _ = self.retriever.search_index(query_embs, top_k)
 
                 # Process results for each query
                 for i, query_pid in enumerate(query_pids_at_t):
@@ -600,7 +612,12 @@ class Evaluator:
 
 
 if __name__ == "__main__":
-    from retrievers import DenseRetriever, TfidfRetriever, BOWRetriever
+    from retrievers import (
+        DenseRetriever,
+        TfidfRetriever,
+        BOWRetriever,
+        RecencyBoostedDenseRetriever,
+    )
 
     # retriever = TfidfRetriever(
     #     stop_words="english",
@@ -611,15 +628,24 @@ if __name__ == "__main__":
     #     lowercase=True,
     #     stop_words="english",
     # )
-    retriever = DenseRetriever(
-        preprocessed_dir="data/preprocessed_new_og",
+    # retriever = DenseRetriever(
+    #     preprocessed_dir="data/preprocessed_new_og",
+    # )
+
+    # Recency boosted retriever: final_score = alpha * semantic + beta * recency
+    retriever = RecencyBoostedDenseRetriever(
+        preprocessed_dir="data/preprocessed_new",
+        alpha=1.0,
+        beta=0.1,  # Start small, tune up if needed
+        recency_decay="exponential",
+        decay_rate=3.0,  # Moderate - doesn't kill old docs too fast
     )
 
     evaluator = Evaluator(
         retriever=retriever,
-        mode="all_paragraphs",
+        # mode="all_paragraphs",
         judgments_path="data/judgments_cleaned.json",
-        par_to_par_path="data/par-to-par-og-no-numbers.csv",
+        par_to_par_path="data/par-to-par-cleaned.csv",
         train_cutoff_year=2018,
         top_k=10000,
     )
