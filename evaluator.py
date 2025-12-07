@@ -10,7 +10,6 @@ from tqdm import tqdm  # type: ignore
 from numba import njit, prange  # type: ignore
 
 from retrievers.base_retriever import BaseRetriever
-from retrievers.bm25_retriever import BM25Retriever
 
 EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
 
@@ -89,7 +88,7 @@ def compute_metrics_batch(
 class Evaluator:
     def __init__(
         self,
-        retriever: BaseRetriever | BM25Retriever,
+        retriever: BaseRetriever,
         embeddings: NDArray | None = None,
         mode: EvaluatorMode = "citation_pairs",
         judgments_path: str = "data/judgments_cleaned.json",
@@ -368,14 +367,8 @@ class Evaluator:
         )
 
         # Create index
-        is_bm25 = isinstance(self.retriever, BM25Retriever)
-        if is_bm25:
-            assert self.query_texts is not None
-            self.retriever.set_corpus(self.pid_to_text, self.query_texts)
-            emb_dim = 0
-        else:
-            emb_dim = self.embeddings.shape[1]
-        self.retriever.create_index(emb_dim)  # type: ignore[union-attr]
+        emb_dim = self.embeddings.shape[1]
+        self.retriever.create_index(emb_dim)
 
         # Results storage
         ranked_pids_list: list[NDArray] = []
@@ -399,11 +392,7 @@ class Evaluator:
             query_pids_at_t = time_to_query_pids.get(t, [])
             if query_pids_at_t:
                 query_indices = [pid_to_query_idx[pid] for pid in query_pids_at_t]
-                if is_bm25:
-                    assert self.query_texts is not None
-                    query_embs = self.query_texts[query_indices]
-                else:
-                    query_embs = self.query_embeddings[query_indices]
+                query_embs = self.query_embeddings[query_indices]
 
                 # Search against accumulated index
                 retrieved_pids, _ = self.retriever.search_index(query_embs, top_k)
@@ -611,7 +600,7 @@ class Evaluator:
 
 
 if __name__ == "__main__":
-    from retrievers import DenseRetriever, TfidfRetriever, BOWRetriever, BM25Retriever
+    from retrievers import DenseRetriever, TfidfRetriever, BOWRetriever
 
     # retriever = TfidfRetriever(
     #     stop_words="english",
@@ -622,16 +611,15 @@ if __name__ == "__main__":
     #     lowercase=True,
     #     stop_words="english",
     # )
-    # retriever = DenseRetriever(
-    #     preprocessed_dir="data/preprocessed_new_og",
-    # )
-    retriever = BM25Retriever()
+    retriever = DenseRetriever(
+        preprocessed_dir="data/preprocessed_new_og",
+    )
 
     evaluator = Evaluator(
         retriever=retriever,
         mode="all_paragraphs",
         judgments_path="data/judgments_cleaned.json",
-        par_to_par_path="data/par-to-par-cleaned.csv",
+        par_to_par_path="data/par-to-par-og-no-numbers.csv",
         train_cutoff_year=2018,
         top_k=10000,
     )
