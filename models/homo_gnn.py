@@ -294,6 +294,8 @@ class DualEncoderGNN(nn.Module):
         # Separate date encoder for each date type (judgment_date, application_date)
         # Each encodes to input_dim to preserve relative-time property in dot products
         self.date_encoder = SinusoidalDateEncoder(output_dim, num_dates=1)
+        # Learned embedding for duration (separate from sinusoidal dates)
+        self.duration_embedding = nn.Linear(1, output_dim)
         # Learnable scales for each date type - starts small, model learns to amplify
         # [judgment_date, application_date, duration]
         self.date_scales = nn.Parameter(torch.tensor([0.1, 0.1, 0.1]))
@@ -360,7 +362,12 @@ class DualEncoderGNN(nn.Module):
 
         for i in range(min(date_feature.size(-1), self.num_date_features)):
             date_col = date_feature[:, i]  # (N,)
-            date_emb = self.date_encoder(date_col)  # (N, output_dim)
+            if i == 2:  # duration: use learned embedding
+                date_emb = self.duration_embedding(
+                    date_col.unsqueeze(-1)
+                )  # (N, 1) -> (N, output_dim)
+            else:  # judgment_date, application_date: use sinusoidal
+                date_emb = self.date_encoder(date_col)  # (N, output_dim)
             scaled_emb = self.date_scales[i] * date_emb
             result = result + scaled_emb
 
@@ -522,6 +529,8 @@ class SymmetricGNN(nn.Module):
 
         # Date encoder (shared)
         self.date_encoder = SinusoidalDateEncoder(output_dim, num_dates=1)
+        # Learned embedding for duration (separate from sinusoidal dates)
+        self.duration_embedding = nn.Linear(1, output_dim)
         self.date_scales = nn.Parameter(torch.tensor([0.1, 0.0, 0.0]))
 
         # Embedding fusion (shared between query and document)
@@ -584,7 +593,12 @@ class SymmetricGNN(nn.Module):
 
         for i in range(min(date_feature.size(-1), self.num_date_features)):
             date_col = date_feature[:, i]
-            date_emb = self.date_encoder(date_col)
+            if i == 2:  # duration: use learned embedding
+                date_emb = self.duration_embedding(
+                    date_col.unsqueeze(-1)
+                )  # (N, 1) -> (N, output_dim)
+            else:  # judgment_date, application_date: use sinusoidal
+                date_emb = self.date_encoder(date_col)
             scaled_emb = self.date_scales[i] * date_emb
             result = result + scaled_emb
 

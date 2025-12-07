@@ -89,26 +89,25 @@ def train_homo_example() -> None:
     print("Training Homogeneous GNN Model")
     print("=" * 80 + "\n")
     from preprocessing.graph_builder import HomogeneousGraphBuilder
+    from models import DualEncoderGNN, SymmetricGNN, CaseLinkGNN
+    from models.simple_homo_gnn import SimpleHomoGNN, SimpleDualHomoGNN
 
-    in_channels = 384
+    in_channels = 1024
 
     layers = 1
 
-    model = DualEncoderGNN(
-        input_dim=in_channels,
-        output_dim=in_channels,
-        num_layers=layers,
-        dropout=0.4,
-        fusion_mode="cross_attention",
-        use_language=True,
+    model = SimpleDualHomoGNN(
+        input_dim=in_channels, output_dim=in_channels, num_layers=layers, dropout=0.4
     )
 
-    graph_builder = HomogeneousGraphBuilder("data/preprocessed")
+    graph_builder = HomogeneousGraphBuilder("data/preprocessed_new")
+
+    save_path = "checkpoints/simple_homo_gnn"
 
     # Initialize trainer with homogeneous graph type
     trainer = GNNTrainer(
         graph_builder=graph_builder,
-        output_path="checkpoints/homo_gnn",
+        output_path=save_path,
         batch_size=256,
         epochs=50,
         learning_rate=1e-4,
@@ -130,7 +129,7 @@ def train_homo_example() -> None:
     print("\nTraining complete!")
 
     # Load best model
-    model.load_state_dict(torch.load("checkpoints/homo_gnn/best_model.pt"))
+    model.load_state_dict(torch.load(f"{save_path}/best_model.pt"))
 
     evaluator = GNNEvaluator(
         gnn_model=model,
@@ -140,9 +139,26 @@ def train_homo_example() -> None:
         k_hops=layers,
         top_k=10000,
     )
+    print("\nRestricted:")
     evaluator.run(k_values=[5, 10, 100])
 
-    print("\nEvaluation complete!")
+    evaluator.save_per_query_results(f"artifacts/per_query_results/homo_dual.json")
+
+    # graph_builder = HomogeneousGraphBuilder(
+    #     "data/preprocessed_new", include_only_citing=False
+    # )
+
+    # evaluator = GNNEvaluator(
+    #     gnn_model=model,
+    #     mode="all_paragraphs",
+    #     graph_builder=graph_builder,
+    #     par_to_par_path="data/par-to-par-cleaned.csv",
+    #     train_cutoff_year=2018,
+    #     k_hops=layers,
+    #     top_k=10000,
+    # )
+    # print("\nAll paragraphs:")
+    # evaluator.run(k_values=[5, 10, 100])
 
 
 def train_mlp_baseline_example() -> None:
@@ -151,12 +167,12 @@ def train_mlp_baseline_example() -> None:
     print("Training MLP Baseline (No Graph Structure)")
     print("=" * 80 + "\n")
     from preprocessing.graph_builder import HomogeneousGraphBuilder
-    from models import MLPBaseline
+    from models import MLPBaseline, SymmetricMLPBaseline
 
     in_channels = 1024
     layers = 2  # MLP depth
 
-    model = MLPBaseline(
+    model = SymmetricMLPBaseline(
         input_dim=in_channels,
         output_dim=in_channels,
         num_layers=layers,
@@ -195,9 +211,9 @@ def train_mlp_baseline_example() -> None:
         gnn_model=model,
         graph_builder=graph_builder,
         par_to_par_path="data/par-to-par-cleaned.csv",
-        train_cutoff_year=cutoff_year,
+        train_cutoff_year=2018,
         k_hops=0,
-        top_k=10000,
+        top_k=1000,
     )
     evaluator.run(k_values=[5, 10, 100])
 
@@ -212,38 +228,57 @@ def train_caselink_example() -> None:
     from preprocessing.graph_builder import SemanticGraphBuilder
     from models import CaseLinkGNN
 
-    in_channels = 384
+    in_channels = 1024
     layers = 1
 
     model = CaseLinkGNN(
         input_dim=in_channels,
         num_layers=layers,
-        dropout=0.2,
-        num_heads=1,
+        dropout=0.4,
+        num_heads=4,
     )
 
+    graph_builder = SemanticGraphBuilder(
+        "data/preprocessed_new",
+        "data/judgments_cleaned.json",
+        semantic_cache_path="data/semantic_cache",
+        semantic_threshold=0.0,
+        semantic_max_neighbors=3,
+        include_article_nodes=False,
+    )
     trainer = GNNTrainer(
-        graph_builder=SemanticGraphBuilder(
-            "data/preprocessed",
-            "data/judgments_cleaned.json",
-            semantic_cache_path="data/semantic_cache",
-        ),
-        output_path="checkpoints/caselink_gnn",
-        batch_size=512,
-        epochs=100,
+        graph_builder=graph_builder,
+        output_path="checkpoints/caselink_gnn2",
+        batch_size=256,
+        epochs=50,
         learning_rate=1e-4,
-        weight_decay=1e-6,
-        temperature=0.1,
+        weight_decay=4e-5,
+        temperature=0.03,
         num_hops=layers,
         checkpoint_interval=10,
         wandb_project="caselink-gnn-training",
-        degree_reg_weight=1e-3,
+        degree_reg_weight=5e-4,
+        warmup_epochs=5,
+        early_stopping_patience=5,
+        early_stopping_min_delta=1e-3,
     )
 
-    cutoff_year = 2018
-    trainer.train(model, cutoff_year, 2022)
+    cutoff_year = 2016
+    trainer.train(model, cutoff_year, 2018)
 
     print("\nTraining complete!")
+
+    model.load_state_dict(torch.load("checkpoints/caselink_gnn2/best_model.pt"))
+
+    evaluator = GNNEvaluator(
+        gnn_model=model,
+        graph_builder=graph_builder,
+        par_to_par_path="data/par-to-par-cleaned.csv",
+        train_cutoff_year=2018,
+        k_hops=layers,
+        top_k=10000,
+    )
+    evaluator.run(k_values=[5, 10, 100])
 
 
 if __name__ == "__main__":

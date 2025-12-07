@@ -849,38 +849,38 @@ if __name__ == "__main__":
     #     fusion_mode="cross_attention",
     #     use_language=False,
     # )
+    # in_channels = 1024
+    # layers = 1
+
+    # model = CaseLinkGNN(
+    #     input_dim=in_channels,
+    #     num_layers=layers,
+    #     dropout=0.5,
+    #     num_heads=4,
+    # )
+
     in_channels = 1024
     layers = 1
-
-    model = CaseLinkGNN(
-        input_dim=in_channels,
-        num_layers=layers,
-        dropout=0.5,
-        num_heads=4,
+    model = SimpleHomoGNN(
+        input_dim=in_channels, output_dim=in_channels, num_layers=layers, dropout=0.4
     )
 
-    # in_channels = 384
-    # layers = 1
-    # model = SimpleHomoGNN(
-    #     input_dim=in_channels, output_dim=in_channels, num_layers=layers, dropout=0.4
-    # )
-
-    model.load_state_dict(torch.load("checkpoints/caselink_gnn2/best_model.pt"))
+    model.load_state_dict(torch.load("checkpoints/simple_homo_gnn/best_model.pt"))
 
     # Option 1: Citation-based graph (HomogeneousGraphBuilder)
-    # graph_builder = HomogeneousGraphBuilder(
-    #     preprocessed_dir="data/preprocessed",
-    #     # include_only_citing=False,
-    # )
-
-    graph_builder = SemanticGraphBuilder(
-        "data/preprocessed_new",
-        "data/judgments_cleaned.json",
-        semantic_cache_path="data/semantic_cache",
-        semantic_max_neighbors=3,
-        include_article_nodes=False,
+    graph_builder = HomogeneousGraphBuilder(
+        preprocessed_dir="data/preprocessed_new",
         include_only_citing=False,
     )
+
+    # graph_builder = SemanticGraphBuilder(
+    #     "data/preprocessed_new",
+    #     "data/judgments_cleaned.json",
+    #     semantic_cache_path="data/semantic_cache",
+    #     semantic_max_neighbors=3,
+    #     include_article_nodes=False,
+    #     include_only_citing=False,
+    # )
 
     evaluator = GNNEvaluator(
         gnn_model=model,
@@ -890,9 +890,9 @@ if __name__ == "__main__":
         k_hops=layers,
         device="cuda" if torch.cuda.is_available() else "cpu",
         mode="all_paragraphs",
-        top_k=1000,
+        top_k=10000,
     )
 
     evaluator.run()
 
-    evaluator.save_per_query_results("artifacts/per_query_results/caselink_gnn.json")
+    # evaluator.save_per_query_results("artifacts/per_query_results/simple_homo_gnn.json")
