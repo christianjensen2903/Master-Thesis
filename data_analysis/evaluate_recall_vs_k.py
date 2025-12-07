@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt  # type: ignore
+import seaborn as sns  # type: ignore
 import numpy as np
 import sys
 from pathlib import Path
@@ -115,12 +116,25 @@ def evaluate_recall_vs_k(
     k_sorted = sorted(recall_scores.keys())
     recall_sorted = [recall_scores[k] for k in k_sorted]
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(
-        k_sorted, recall_sorted, marker="o", linestyle="-", linewidth=2, markersize=6
+    # Set academic style
+    sns.set_style("whitegrid")
+    plt.rcParams["font.family"] = "serif"
+    plt.rcParams["font.size"] = 10
+
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=300)
+
+    ax.plot(
+        k_sorted,
+        recall_sorted,
+        marker="o",
+        linestyle="-",
+        linewidth=2,
+        markersize=5,
+        color="#2C5F8D",
     )
-    plt.xlabel("k", fontsize=12)
-    plt.ylabel("Recall", fontsize=12)
+
+    ax.set_xlabel("k", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Recall", fontsize=12, fontweight="bold")
 
     retriever_name = "DenseRetriever"
     if preprocessed_dir:
@@ -128,16 +142,22 @@ def evaluate_recall_vs_k(
     elif model_path:
         retriever_name = Path(model_path).name
 
-    plt.title(f"Recall vs k ({retriever_name})", fontsize=14)
-    plt.grid(True, alpha=0.3)
-    plt.xscale("log")
-    plt.xlim(left=1)
-    plt.ylim(bottom=0, top=1.05)
+    ax.set_title(
+        f"Recall vs k ({retriever_name})", fontsize=14, fontweight="bold", pad=20
+    )
+
+    ax.set_xscale("log")
+    ax.set_xlim(left=1)
+    ax.set_ylim(bottom=0, top=1.05)
+
+    # Grid styling
+    ax.grid(True, alpha=0.3, linestyle="--", linewidth=0.5)
+    ax.set_axisbelow(True)
 
     # Add value annotations for key points
     for i, (k, recall) in enumerate(zip(k_sorted, recall_sorted)):
         if k in [1, 5, 10, 50, 100, 500, 1000] or i % 5 == 0:
-            plt.annotate(
+            ax.annotate(
                 f"{recall:.3f}",
                 (k, recall),
                 textcoords="offset points",
@@ -154,10 +174,104 @@ def evaluate_recall_vs_k(
     return recall_scores
 
 
+def plot_both_modes(
+    preprocessed_dir: str = "data/preprocessed_new_metadata",
+    k_values: list[int] | None = None,
+    output_path: str = "artifacts/recall_vs_k_comparison.png",
+) -> None:
+    """Plot recall vs k for both modes on the same chart."""
+    if k_values is None:
+        k_values = (
+            [1, 5, 10]
+            + list(range(20, 101, 10))
+            + list(range(150, 501, 50))
+            + list(range(600, 1001, 100))
+        )
+
+    # Initialize retriever once
+    print(f"Initializing DenseRetriever with preprocessed_dir: {preprocessed_dir}")
+    retriever = DenseRetriever(preprocessed_dir=preprocessed_dir)
+
+    results = {}
+    for mode, label in [("citation_pairs", "restricted"), ("all_paragraphs", "full")]:
+        print(f"\n{'='*60}")
+        print(f"Evaluating mode: {mode} ({label})")
+        print(f"{'='*60}")
+
+        max_k = max(k_values)
+        evaluator = Evaluator(
+            retriever=retriever,
+            mode=mode,  # type: ignore
+            judgments_path="data/judgments_cleaned.json",
+            par_to_par_path="data/par-to-par-cleaned.csv",
+            train_cutoff_year=2018,
+            top_k=max_k + 100,
+        )
+
+        evaluator.load_and_prepare()
+
+        if evaluator.embeddings is None:
+            print("\nGenerating embeddings from retriever...")
+            train_mask = evaluator.paragraph_set == "train"
+            paragraph_ids = [
+                (evaluator.paragraph_celex[pid], int(evaluator.paragraph_number[pid]))
+                for pid in range(len(evaluator.pid_to_text))
+            ]
+            evaluator.retriever.fit(evaluator.pid_to_text, mask=train_mask)
+            evaluator.embeddings = evaluator.retriever.transform(
+                evaluator.pid_to_text, paragraph_ids=paragraph_ids
+            )
+
+        evaluator._embed_queries()
+        _, recall_scores = evaluator.evaluate_iterative(k_values=k_values)
+        results[label] = recall_scores
+
+        print(f"\nRecall@k results ({label}):")
+        for k in sorted(recall_scores.keys()):
+            print(f"Recall@{k}: {recall_scores[k]:.4f}")
+
+    # Plot both lines
+    sns.set_style("whitegrid")
+    plt.rcParams["font.family"] = "serif"
+    plt.rcParams["font.size"] = 10
+
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=300)
+
+    colors = {"restricted": "#2C5F8D", "full": "#D64545"}
+    for label, recall_scores in results.items():
+        k_sorted = sorted(recall_scores.keys())
+        recall_sorted = [recall_scores[k] for k in k_sorted]
+        ax.plot(
+            k_sorted,
+            recall_sorted,
+            marker="o",
+            linestyle="-",
+            linewidth=2,
+            markersize=5,
+            color=colors[label],
+            label=label,
+        )
+
+    ax.set_xlabel("k", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Recall", fontsize=12, fontweight="bold")
+    ax.set_title("Recall vs k", fontsize=14, fontweight="bold", pad=20)
+
+    ax.set_xscale("log")
+    ax.set_xlim(left=1)
+    ax.set_ylim(bottom=0, top=1.05)
+
+    ax.grid(True, alpha=0.3, linestyle="--", linewidth=0.5)
+    ax.set_axisbelow(True)
+    ax.legend(loc="lower right", fontsize=10)
+
+    plt.tight_layout()
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"\nPlot saved to {output_path}")
+
+
 if __name__ == "__main__":
-    # Example usage with preprocessed embeddings
-    recall_scores = evaluate_recall_vs_k(
+    plot_both_modes(
         preprocessed_dir="data/preprocessed_new",
-        output_path="artifacts/recall_vs_k.png",
-        mode="citation_pairs",
+        output_path="artifacts/recall_vs_k_comparison.png",
     )
