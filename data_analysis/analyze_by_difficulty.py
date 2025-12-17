@@ -181,12 +181,12 @@ def print_summary(all_results: dict[str, dict[str, dict]]) -> None:
         print(f"\n{model_name}:")
         for bin_name in bin_names:
             metrics = results[bin_name]
-            r10 = metrics["recall"].get(10, metrics["recall"].get("10", 0))
+            r100 = metrics["recall"].get(100, metrics["recall"].get("100", 0))
             ci = metrics.get("map_ci", (metrics["map"], metrics["map"]))
             print(
                 f"  {bin_name}: MAP={metrics['map']:.3f} "
                 f"[{ci[0]:.3f}, {ci[1]:.3f}], "
-                f"R@10={r10:.3f}, n={metrics['n_queries']}"
+                f"R@100={r100:.3f}, n={metrics['n_queries']}"
             )
 
 
@@ -220,23 +220,17 @@ def plot_results(
     colors = {
         "TF-IDF": "#D62728",  # red
         "BOW": "#FF7F0E",  # orange
-        "DPR": "#1F77B4",  # blue
         "Dense": "#1F77B4",  # blue (alias)
-        "Homogeneous GNN": "#2CA02C",  # green
-        "HomoGNN": "#2CA02C",  # green (alias)
-        "MLP": "#9467BD",  # purple
-        "CaseLink": "#8C564B",  # brown (distinct color)
+        "Dense+Recency": "#2CA02C",  # green
+        "Dense+Metadata": "#9467BD",  # purple
     }
 
     markers = {
         "TF-IDF": "s",
         "BOW": "^",
-        "DPR": "o",
         "Dense": "o",
-        "Homogeneous GNN": "D",
-        "HomoGNN": "D",
-        "MLP": "v",
-        "CaseLink": "s",
+        "Dense+Recency": "D",
+        "Dense+Metadata": "v",
     }
 
     # Single MAP plot with academic styling
@@ -326,6 +320,77 @@ def plot_results(
     plt.savefig(output_path / "difficulty_map.png", dpi=300, bbox_inches="tight")
     plt.close()
     print(f"Saved MAP plot to {output_path / 'difficulty_map.png'}")
+
+    # Recall@10 plot with academic styling
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=300)
+
+    for model_name, results in all_results.items():
+        recall_scores = []
+        for bn in bin_names:
+            r100 = results[bn]["recall"].get(100, results[bn]["recall"].get("100", 0))
+            recall_scores.append(r100)
+
+        color = colors.get(model_name, "#7F7F7F")
+        marker = markers.get(model_name, "o")
+
+        ax.plot(
+            x,
+            recall_scores,
+            marker=marker,
+            linewidth=2,
+            markersize=7,
+            label=model_name,
+            color=color,
+            alpha=0.9,
+        )
+
+    ax.set_xlabel("Verbatim Overlap (%)", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Recall@100", fontsize=12, fontweight="bold")
+    ax.set_title(
+        "Recall@100 by Citation Difficulty",
+        fontsize=14,
+        fontweight="bold",
+        pad=15,
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(bin_names, fontsize=9, rotation=45, ha="right")
+    ax.tick_params(axis="y", labelsize=10)
+
+    ax.grid(True, alpha=0.3, linestyle="--", linewidth=0.5)
+    ax.set_axisbelow(True)
+
+    ax.set_ylim(0, None)
+
+    ax.legend(
+        loc="lower right",
+        fontsize=9,
+        frameon=True,
+        fancybox=True,
+        shadow=True,
+    )
+
+    ax.annotate(
+        "← Harder",
+        xy=(0.02, 0.95),
+        xycoords="axes fraction",
+        fontsize=9,
+        color="#7F7F7F",
+        style="italic",
+    )
+    ax.annotate(
+        "Easier →",
+        xy=(0.88, 0.95),
+        xycoords="axes fraction",
+        fontsize=9,
+        color="#7F7F7F",
+        style="italic",
+    )
+
+    plt.tight_layout()
+    plt.savefig(output_path / "difficulty_recall.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved Recall@100 plot to {output_path / 'difficulty_recall.png'}")
 
     # Sample counts plot with academic styling
     fig, ax = plt.subplots(figsize=(8, 4), dpi=300)
