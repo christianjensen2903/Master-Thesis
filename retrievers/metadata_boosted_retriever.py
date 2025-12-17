@@ -14,13 +14,15 @@ faiss.omp_set_num_threads(1)
 from .base_retriever import BaseRetriever
 
 
-class RecencyBoostedDenseRetriever(BaseRetriever):
-    """Dense retriever with recency boosting.
+class MetadataBoostedDenseRetriever(BaseRetriever):
+    """Dense retriever with learned metadata boosts.
 
     final_score = (alpha * semantic_score) + (beta * recency_score)
+                + (gamma * language_boost) + (delta * duration_boost)
 
-    where recency_score is computed based on how recent a document is
-    relative to a reference date (typically the oldest document in the index).
+    Language and duration boosts can be:
+    - Pre-defined based on empirical analysis
+    - Learned from training data
     """
 
     def __init__(
@@ -31,11 +33,19 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
         normalize_embeddings: bool = True,
         max_seq_length: int | None = None,
         preprocessed_dir: str | None = None,
+        # Score combination weights
         alpha: float = 1.0,
         beta: float = 0.0,
-        recency_decay: str = "linear",  # "linear", "exponential", "log"
-        decay_rate: float = 1.0,  # For exponential decay
-        use_exact_scoring: bool = False,  # If True, compute scores for ALL docs (no FAISS approx)
+        gamma: float = 0.0,  # Language boost weight
+        delta: float = 0.0,  # Duration boost weight
+        # Recency settings
+        recency_decay: str = "exponential",
+        decay_rate: float = 3.0,
+        # Pre-defined language boosts (from empirical analysis)
+        language_boosts: dict[str, float] | None = None,
+        # Duration boost settings
+        duration_peak_years: float = 2.5,  # Optimal duration (from analysis)
+        duration_sigma: float = 1.0,  # Gaussian width
     ):
         self.model_name = model_name
         self.batch_size = batch_size
@@ -44,12 +54,49 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
         self.max_seq_length = max_seq_length
         self.preprocessed_dir = preprocessed_dir
 
-        # Recency boosting parameters
+        # Score weights
         self.alpha = alpha
         self.beta = beta
+        self.gamma = gamma
+        self.delta = delta
+
+        # Recency
         self.recency_decay = recency_decay
         self.decay_rate = decay_rate
-        self.use_exact_scoring = use_exact_scoring
+
+        # Language boosts - empirical values from citation ratio analysis
+        # Ratio > 1 = over-cited, < 1 = under-cited
+        self._default_language_boosts = {
+            "DAN": 1.32,
+            "ENG": 1.21,
+            "NLD": 1.16,
+            "DEU": 1.07,
+            "FRA": 1.00,
+            "MLT": 0.99,
+            "ITA": 0.98,
+            "FIN": 0.96,
+            "SWE": 0.93,
+            "SPA": 0.84,
+            "BUL": 0.83,
+            "HUN": 0.80,
+            "SLK": 0.79,
+            "ELL": 0.71,
+            "POR": 0.70,
+            "SLV": 0.62,
+            "RON": 0.60,
+            "POL": 0.57,
+            "LAV": 0.50,
+            "LIT": 0.42,
+            "CES": 0.42,
+            "EST": 0.40,
+            "HRV": 0.23,
+            "GLE": 0.00,
+        }
+        self.language_boosts = language_boosts or self._default_language_boosts
+
+        # Duration boost (Gaussian around optimal duration)
+        self.duration_peak_years = duration_peak_years
+        self.duration_sigma = duration_sigma
 
         # Precomputed embeddings
         self.precomputed_doc_embeddings: NDArray | None = None
@@ -57,22 +104,22 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
         self.par_id_to_idx: dict[str, int] | None = None
         self.par_metadata: list[dict] | None = None
 
-        # FAISS index for iterative evaluation
+        # FAISS index
         self._index: faiss.IndexFlatIP | None = None
         self._index_to_original: list[int] = []
 
-        # Direct storage for exact scoring
-        self._index_embeddings: NDArray | None = None
-        self._index_to_original_arr: NDArray | None = None
-        self._index_dates_arr: NDArray | None = None
+        # Metadata arrays for indexed documents
+        self._index_dates: list[int] = []
+        self._index_languages: list[str] = []
+        self._index_durations: list[float] = []  # Duration in years
 
-        # Date information for recency boosting
-        self._index_dates: list[int] = []  # Timestamps for indexed documents
-        self._min_date: int | None = None  # Earliest date in index (for normalization)
-        self._max_date: int | None = None  # Latest date in index (for normalization)
+        self._min_date: int | None = None
+        self._max_date: int | None = None
 
-        # Document dates (set via set_document_dates)
+        # Document metadata (set via setters)
         self._document_dates: NDArray | None = None
+        self._document_languages: NDArray | None = None
+        self._document_durations: NDArray | None = None
 
         if preprocessed_dir:
             self._load_precomputed_embeddings()
@@ -84,15 +131,18 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
         self._is_fitted = True
 
     def set_document_dates(self, dates: NDArray) -> None:
-        """Set document dates for recency computation.
-
-        Args:
-            dates: Array of dates as datetime64[ns] or timestamps (int64)
-        """
         if dates.dtype == np.dtype("datetime64[ns]"):
             self._document_dates = dates.astype("datetime64[s]").astype(np.int64)
         else:
             self._document_dates = dates.astype(np.int64)
+
+    def set_document_languages(self, languages: NDArray) -> None:
+        """Set language for each document (3-letter codes like 'ENG', 'DEU')."""
+        self._document_languages = np.asarray(languages, dtype=object)
+
+    def set_document_durations(self, durations: NDArray) -> None:
+        """Set case duration in years for each document."""
+        self._document_durations = np.asarray(durations, dtype=np.float32)
 
     def _load_precomputed_embeddings(self) -> None:
         if self.preprocessed_dir is None:
@@ -103,8 +153,7 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
         doc_emb_path = preprocessed_path / "paragraph_embeddings_doc.npy"
         if not doc_emb_path.exists():
             raise FileNotFoundError(
-                f"Precomputed document embeddings not found at {doc_emb_path}. "
-                "Run precompute_embeddings.py first."
+                f"Precomputed doc embeddings not found at {doc_emb_path}"
             )
 
         doc_embeddings = np.load(doc_emb_path)
@@ -142,9 +191,7 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
     ) -> NDArray:
         if self.precomputed_doc_embeddings is not None and paragraph_ids is not None:
             if len(paragraph_ids) != len(texts):
-                raise ValueError(
-                    f"paragraph_ids length ({len(paragraph_ids)}) must match texts length ({len(texts)})"
-                )
+                raise ValueError("paragraph_ids length must match texts length")
 
             if self.par_id_to_idx is None:
                 raise ValueError("Metadata not loaded.")
@@ -190,9 +237,7 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
     ) -> NDArray:
         if self.precomputed_query_embeddings is not None and paragraph_ids is not None:
             if len(paragraph_ids) != len(query_texts):
-                raise ValueError(
-                    f"paragraph_ids length ({len(paragraph_ids)}) must match query_texts length ({len(query_texts)})"
-                )
+                raise ValueError("paragraph_ids length must match query_texts length")
 
             if self.par_id_to_idx is None:
                 raise ValueError("Metadata not loaded.")
@@ -216,15 +261,14 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
 
         return self._encode_texts(query_texts)
 
-    # --- Iterative index methods with recency boosting ---
+    # --- Index methods ---
 
     def create_index(self, dim: int) -> None:
         self._index = faiss.IndexFlatIP(dim)
         self._index_to_original = []
         self._index_dates = []
-        self._index_embeddings = None
-        self._index_to_original_arr = None
-        self._index_dates_arr = None
+        self._index_languages = []
+        self._index_durations = []
         self._min_date = None
         self._max_date = None
 
@@ -236,50 +280,33 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
         self._index.add(embeddings)
         self._index_to_original.extend(indices.tolist())
 
-        # Also store for exact scoring
-        if self._index_embeddings is None:
-            self._index_embeddings = embeddings
-            self._index_to_original_arr = indices.astype(np.int64)
-        else:
-            self._index_embeddings = np.vstack([self._index_embeddings, embeddings])
-            self._index_to_original_arr = np.concatenate(
-                [self._index_to_original_arr, indices.astype(np.int64)]
-            )
-
-        # Track dates for recency scoring
-        if self._document_dates is not None:
-            new_dates = self._document_dates[indices].astype(np.int64)
-            if self._index_dates_arr is None:
-                self._index_dates_arr = new_dates
-            else:
-                self._index_dates_arr = np.concatenate(
-                    [self._index_dates_arr, new_dates]
-                )
-
-            for idx in indices:
+        for idx in indices:
+            # Track dates
+            if self._document_dates is not None:
                 date = int(self._document_dates[idx])
                 self._index_dates.append(date)
-
-                # Update min/max dates
                 if self._min_date is None or date < self._min_date:
                     self._min_date = date
                 if self._max_date is None or date > self._max_date:
                     self._max_date = date
+            else:
+                self._index_dates.append(0)
+
+            # Track languages
+            if self._document_languages is not None:
+                self._index_languages.append(str(self._document_languages[idx]))
+            else:
+                self._index_languages.append("")
+
+            # Track durations
+            if self._document_durations is not None:
+                self._index_durations.append(float(self._document_durations[idx]))
+            else:
+                self._index_durations.append(0.0)
 
     def _compute_recency_scores(
         self, doc_indices: NDArray, query_date: int | None = None
     ) -> NDArray:
-        """Compute recency scores for documents.
-
-        Args:
-            doc_indices: FAISS indices (not original indices)
-            query_date: Optional query timestamp. If provided, recency is
-                       relative to query date (older than query = higher recency for more recent).
-                       If None, uses index date range for normalization.
-
-        Returns:
-            Recency scores in [0, 1], where 1 = most recent
-        """
         if self._min_date is None or self._max_date is None:
             return np.zeros(len(doc_indices), dtype=np.float32)
 
@@ -287,7 +314,6 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
         if date_range == 0:
             return np.ones(len(doc_indices), dtype=np.float32)
 
-        # Get dates for each document
         doc_dates = np.array(
             [
                 self._index_dates[idx] if idx >= 0 else self._min_date
@@ -297,29 +323,19 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
         )
 
         if query_date is not None:
-            # Recency relative to query date
-            # Documents closer to query date get higher scores
-            # All docs are older than query (temporal constraint)
-            time_diff = query_date - doc_dates  # Always positive since docs are older
+            time_diff = query_date - doc_dates
             max_diff = query_date - self._min_date
             if max_diff == 0:
                 return np.ones(len(doc_indices), dtype=np.float32)
-
-            normalized_age = time_diff / max_diff  # 0 = same as query, 1 = oldest doc
+            normalized_age = time_diff / max_diff
         else:
-            # Recency relative to index date range
-            normalized_age = (
-                self._max_date - doc_dates
-            ) / date_range  # 0 = newest, 1 = oldest
+            normalized_age = (self._max_date - doc_dates) / date_range
 
         if self.recency_decay == "linear":
-            # Linear: newer = higher score
             recency_scores = 1.0 - normalized_age
         elif self.recency_decay == "exponential":
-            # Exponential decay: sharper preference for recent docs
             recency_scores = np.exp(-self.decay_rate * normalized_age)
         elif self.recency_decay == "log":
-            # Log decay: slower decay for older docs
             recency_scores = 1.0 - np.log1p(
                 normalized_age * self.decay_rate
             ) / np.log1p(self.decay_rate)
@@ -328,26 +344,44 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
 
         return recency_scores.astype(np.float32)
 
+    def _compute_language_scores(self, doc_indices: NDArray) -> NDArray:
+        """Compute language boost scores based on citation bias."""
+        scores = np.zeros(len(doc_indices), dtype=np.float32)
+
+        for i, idx in enumerate(doc_indices):
+            if idx >= 0 and idx < len(self._index_languages):
+                lang = self._index_languages[idx]
+                # Normalize: under-cited languages get boost, over-cited get penalty
+                # Convert ratio to boost: log(ratio) maps ratio=1->0, ratio>1->negative, ratio<1->positive
+                ratio = self.language_boosts.get(lang, 1.0)
+                # Invert so under-cited (low ratio) get higher score
+                scores[i] = 1.0 / ratio if ratio > 0 else 1.0
+
+        # Normalize to [0, 1]
+        if scores.max() > scores.min():
+            scores = (scores - scores.min()) / (scores.max() - scores.min())
+
+        return scores
+
+    def _compute_duration_scores(self, doc_indices: NDArray) -> NDArray:
+        """Compute duration boost using Gaussian centered on optimal duration."""
+        scores = np.zeros(len(doc_indices), dtype=np.float32)
+
+        for i, idx in enumerate(doc_indices):
+            if idx >= 0 and idx < len(self._index_durations):
+                duration = self._index_durations[idx]
+                # Gaussian boost: cases near peak duration get highest score
+                diff = duration - self.duration_peak_years
+                scores[i] = np.exp(-0.5 * (diff / self.duration_sigma) ** 2)
+
+        return scores
+
     def search_index(
         self,
         query_embeddings: NDArray,
         top_k: int,
         query_dates: NDArray | None = None,
     ) -> tuple[NDArray, NDArray]:
-        """Search with recency boosting.
-
-        Args:
-            query_embeddings: Query vectors
-            top_k: Number of results to return
-            query_dates: Optional timestamps for each query (for relative recency)
-
-        Returns:
-            (indices, scores) where scores are the combined semantic + recency scores
-        """
-        # Use exact scoring if enabled and beta > 0
-        if self.use_exact_scoring and self.beta > 0:
-            return self._search_exact(query_embeddings, top_k, query_dates)
-
         if self._index is None or self._index.ntotal == 0:
             n_queries = len(query_embeddings)
             return np.full((n_queries, 0), -1, dtype=np.int64), np.zeros(
@@ -356,9 +390,9 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
 
         query_embeddings = np.ascontiguousarray(query_embeddings.astype(np.float32))
 
-        # If beta > 0, retrieve more candidates for re-ranking
-        if self.beta > 0 and self._document_dates is not None:
-            # Retrieve more candidates to re-rank
+        # Retrieve more candidates if we're re-ranking
+        needs_rerank = self.beta > 0 or self.gamma > 0 or self.delta > 0
+        if needs_rerank:
             retrieval_k = min(top_k * 3, self._index.ntotal)
         else:
             retrieval_k = min(top_k, self._index.ntotal)
@@ -367,9 +401,8 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
             query_embeddings, retrieval_k
         )
 
-        # If no recency boosting, just return top-k
-        if self.beta == 0 or self._document_dates is None:
-            # Map to original indices and return top-k
+        # If no boosting needed, return directly
+        if not needs_rerank:
             original_indices = np.array(
                 [
                     [self._index_to_original[idx] if idx >= 0 else -1 for idx in row]
@@ -379,7 +412,7 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
             )
             return original_indices[:, :top_k], semantic_scores[:, :top_k]
 
-        # Apply recency boosting
+        # Apply all boosts and re-rank
         n_queries = len(query_embeddings)
         result_indices = np.full((n_queries, top_k), -1, dtype=np.int64)
         result_scores = np.zeros((n_queries, top_k), dtype=np.float32)
@@ -388,7 +421,6 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
             row_faiss_indices = faiss_indices[i]
             row_semantic_scores = semantic_scores[i]
 
-            # Filter valid indices
             valid_mask = row_faiss_indices >= 0
             valid_faiss_indices = row_faiss_indices[valid_mask]
             valid_semantic_scores = row_semantic_scores[valid_mask]
@@ -396,17 +428,7 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
             if len(valid_faiss_indices) == 0:
                 continue
 
-            # Get query date if available
-            query_date = None
-            if query_dates is not None and i < len(query_dates):
-                query_date = int(query_dates[i])
-
-            # Compute recency scores
-            recency_scores = self._compute_recency_scores(
-                valid_faiss_indices, query_date
-            )
-
-            # Normalize semantic scores to [0, 1] for this query
+            # Normalize semantic scores
             sem_min, sem_max = valid_semantic_scores.min(), valid_semantic_scores.max()
             if sem_max > sem_min:
                 normalized_semantic = (valid_semantic_scores - sem_min) / (
@@ -415,15 +437,31 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
             else:
                 normalized_semantic = np.ones_like(valid_semantic_scores)
 
-            # Combine scores
-            combined_scores = (self.alpha * normalized_semantic) + (
-                self.beta * recency_scores
-            )
+            # Compute all boost scores
+            combined_scores = self.alpha * normalized_semantic
 
-            # Re-rank by combined score
+            if self.beta > 0:
+                query_date = (
+                    int(query_dates[i])
+                    if query_dates is not None and i < len(query_dates)
+                    else None
+                )
+                recency_scores = self._compute_recency_scores(
+                    valid_faiss_indices, query_date
+                )
+                combined_scores += self.beta * recency_scores
+
+            if self.gamma > 0:
+                language_scores = self._compute_language_scores(valid_faiss_indices)
+                combined_scores += self.gamma * language_scores
+
+            if self.delta > 0:
+                duration_scores = self._compute_duration_scores(valid_faiss_indices)
+                combined_scores += self.delta * duration_scores
+
+            # Re-rank
             rerank_order = np.argsort(-combined_scores)[:top_k]
 
-            # Map to original indices
             for j, rerank_idx in enumerate(rerank_order):
                 faiss_idx = valid_faiss_indices[rerank_idx]
                 result_indices[i, j] = self._index_to_original[faiss_idx]
@@ -431,106 +469,45 @@ class RecencyBoostedDenseRetriever(BaseRetriever):
 
         return result_indices, result_scores
 
-    def _search_exact(
-        self,
-        query_embeddings: NDArray,
-        top_k: int,
-        query_dates: NDArray | None = None,
-    ) -> tuple[NDArray, NDArray]:
-        """Exact search: compute combined scores for ALL documents, then select top-k.
-
-        This avoids the truncation problem of retrieve-then-rerank.
-        """
-        if self._index_embeddings is None or len(self._index_embeddings) == 0:
-            n_queries = len(query_embeddings)
-            return np.full((n_queries, 0), -1, dtype=np.int64), np.zeros(
-                (n_queries, 0), dtype=np.float32
-            )
-
-        n_queries = len(query_embeddings)
-        n_docs = len(self._index_embeddings)
-        actual_k = min(top_k, n_docs)
-
-        query_embeddings = query_embeddings.astype(np.float32)
-
-        # Compute ALL semantic scores: (n_queries, n_docs)
-        semantic_scores = query_embeddings @ self._index_embeddings.T
-
-        # No recency? Just return top-k by semantic
-        if self._index_dates_arr is None:
-            if actual_k == n_docs:
-                sorted_idx = np.argsort(-semantic_scores, axis=1)
-            else:
-                top_k_idx = np.argpartition(-semantic_scores, actual_k, axis=1)[
-                    :, :actual_k
-                ]
-                top_k_scores = np.take_along_axis(semantic_scores, top_k_idx, axis=1)
-                sort_idx = np.argsort(-top_k_scores, axis=1)
-                sorted_idx = np.take_along_axis(top_k_idx, sort_idx, axis=1)
-            result_indices = self._index_to_original_arr[sorted_idx[:, :actual_k]]
-            result_scores = np.take_along_axis(
-                semantic_scores, sorted_idx[:, :actual_k], axis=1
-            )
-            return result_indices, result_scores
-
-        # Normalize semantic scores per query to [0, 1]
-        sem_min = semantic_scores.min(axis=1, keepdims=True)
-        sem_max = semantic_scores.max(axis=1, keepdims=True)
-        sem_range = np.maximum(sem_max - sem_min, 1e-8)
-        normalized_semantic = (semantic_scores - sem_min) / sem_range
-
-        # Compute recency scores for all docs
-        date_range = self._max_date - self._min_date
-        if date_range == 0:
-            recency_scores = np.ones(n_docs, dtype=np.float32)
-        else:
-            doc_dates = self._index_dates_arr.astype(np.float64)
-            if query_dates is not None:
-                # Per-query recency: (n_queries, n_docs)
-                query_dates_float = query_dates.astype(np.float64)[:, None]
-                time_diff = query_dates_float - doc_dates[None, :]
-                max_diff = np.maximum(query_dates_float - self._min_date, 1.0)
-                normalized_age = np.clip(time_diff / max_diff, 0.0, 1.0)
-            else:
-                # Global recency: (n_docs,)
-                normalized_age = (self._max_date - doc_dates) / date_range
-
-            if self.recency_decay == "exponential":
-                recency_scores = np.exp(-self.decay_rate * normalized_age)
-            elif self.recency_decay == "log":
-                recency_scores = 1.0 - np.log1p(
-                    normalized_age * self.decay_rate
-                ) / np.log1p(self.decay_rate)
-            else:  # linear
-                recency_scores = 1.0 - normalized_age
-
-        # Combine: (n_queries, n_docs)
-        combined_scores = self.alpha * normalized_semantic + self.beta * recency_scores
-
-        # Get top-k
-        if actual_k == n_docs:
-            sorted_idx = np.argsort(-combined_scores, axis=1)
-        else:
-            top_k_idx = np.argpartition(-combined_scores, actual_k, axis=1)[
-                :, :actual_k
-            ]
-            top_k_scores = np.take_along_axis(combined_scores, top_k_idx, axis=1)
-            sort_idx = np.argsort(-top_k_scores, axis=1)
-            sorted_idx = np.take_along_axis(top_k_idx, sort_idx, axis=1)
-
-        result_indices = self._index_to_original_arr[sorted_idx[:, :actual_k]]
-        result_scores = np.take_along_axis(
-            combined_scores, sorted_idx[:, :actual_k], axis=1
-        )
-
-        return result_indices.astype(np.int64), result_scores.astype(np.float32)
-
     def reset_index(self) -> None:
         self._index = None
         self._index_to_original = []
         self._index_dates = []
-        self._index_embeddings = None
-        self._index_to_original_arr = None
-        self._index_dates_arr = None
+        self._index_languages = []
+        self._index_durations = []
         self._min_date = None
         self._max_date = None
+
+    def get_boost_params(self) -> dict[str, float]:
+        """Return current boost parameters for optimization."""
+        return {
+            "alpha": self.alpha,
+            "beta": self.beta,
+            "gamma": self.gamma,
+            "delta": self.delta,
+            "duration_peak_years": self.duration_peak_years,
+            "duration_sigma": self.duration_sigma,
+        }
+
+    def set_boost_params(
+        self,
+        alpha: float | None = None,
+        beta: float | None = None,
+        gamma: float | None = None,
+        delta: float | None = None,
+        duration_peak_years: float | None = None,
+        duration_sigma: float | None = None,
+    ) -> None:
+        """Update boost parameters (for hyperparameter tuning)."""
+        if alpha is not None:
+            self.alpha = alpha
+        if beta is not None:
+            self.beta = beta
+        if gamma is not None:
+            self.gamma = gamma
+        if delta is not None:
+            self.delta = delta
+        if duration_peak_years is not None:
+            self.duration_peak_years = duration_peak_years
+        if duration_sigma is not None:
+            self.duration_sigma = duration_sigma

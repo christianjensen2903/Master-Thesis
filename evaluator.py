@@ -11,6 +11,7 @@ from numba import njit, prange  # type: ignore
 
 from retrievers.base_retriever import BaseRetriever
 from retrievers.recency_dense_retriever import RecencyBoostedDenseRetriever
+from retrievers.metadata_boosted_retriever import MetadataBoostedDenseRetriever
 
 EvaluatorMode = Literal["citation_pairs", "all_paragraphs"]
 
@@ -372,7 +373,9 @@ class Evaluator:
         self.retriever.create_index(emb_dim)
 
         # Set document dates for recency boosting if supported
-        if isinstance(self.retriever, RecencyBoostedDenseRetriever):
+        if isinstance(self.retriever, RecencyBoostedDenseRetriever) or isinstance(
+            self.retriever, MetadataBoostedDenseRetriever
+        ):
             self.retriever.set_document_dates(self.paragraph_dates)
 
         # Results storage
@@ -617,6 +620,7 @@ if __name__ == "__main__":
         TfidfRetriever,
         BOWRetriever,
         RecencyBoostedDenseRetriever,
+        MetadataBoostedDenseRetriever,
     )
 
     # retriever = TfidfRetriever(
@@ -628,18 +632,26 @@ if __name__ == "__main__":
     #     lowercase=True,
     #     stop_words="english",
     # )
-    # retriever = DenseRetriever(
-    #     preprocessed_dir="data/preprocessed_new_og",
-    # )
+    retriever = DenseRetriever(
+        preprocessed_dir="data/preprocessed_new",
+    )
 
     # Recency boosted retriever: final_score = alpha * semantic + beta * recency
-    retriever = RecencyBoostedDenseRetriever(
-        preprocessed_dir="data/preprocessed_new",
-        alpha=1.0,
-        beta=0.1,  # Start small, tune up if needed
-        recency_decay="exponential",
-        decay_rate=3.0,  # Moderate - doesn't kill old docs too fast
-    )
+    # retriever = RecencyBoostedDenseRetriever(
+    #     preprocessed_dir="data/preprocessed_new",
+    #     alpha=1.0,
+    #     beta=0.15,  # Start small, tune up if needed
+    #     recency_decay="exponential",
+    #     decay_rate=3.0,  # Moderate - doesn't kill old docs too fast
+    # )
+
+    # retriever = MetadataBoostedDenseRetriever(
+    #     preprocessed_dir="data/preprocessed_new",
+    #     alpha=1.0,
+    #     beta=0.1,
+    #     gamma=0.0,
+    #     delta=0.1,
+    # )
 
     evaluator = Evaluator(
         retriever=retriever,
@@ -651,4 +663,4 @@ if __name__ == "__main__":
     )
 
     evaluator.run()
-    # evaluator.save_per_query_results("artifacts/per_query_results/tfidf.json")
+    evaluator.save_per_query_results("artifacts/per_query_results/dense.json")
