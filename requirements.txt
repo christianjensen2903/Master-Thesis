@@ -170,9 +170,12 @@ zstandard==0.25.0
 langdetect==1.0.9
 wandb==0.18.0
 torch-geometric==2.6.1
-torch-scatter==2.1.2
-torch-sparse==0.6.18
-torch-cluster==1.6.3
-pyg-lib==0.5.0+pt28
+# The packages below have NO macOS/arm64 wheels and must compile from source.
+# torch-geometric>=2.3 does not require them (uses torch.scatter_reduce instead).
+# Re-enable only if you hit an op that needs them, and expect a slow source build.
+# torch-scatter==2.1.2
+# torch-sparse==0.6.18
+# torch-cluster==1.6.3
+# pyg-lib==0.5.0+pt28  # Linux-only, no macOS build exists at all
 FlagEmbedding
 optuna>=3.5.0
