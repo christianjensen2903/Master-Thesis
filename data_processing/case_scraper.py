@@ -1,4 +1,5 @@
 import asyncio
+import random
 from pathlib import Path
 import dotenv
 import aiohttp
@@ -11,12 +12,85 @@ dotenv.load_dotenv()
 
 cookies: dict[str, str] = {}
 
+# EUR-Lex content URLs use ISO 639-1 (2-letter, uppercase) codes,
+# not the 3-letter codes used as our on-disk filename prefixes.
+_URL_LANG = {
+    "eng": "EN",
+    "fra": "FR",
+    "deu": "DE",
+    "spa": "ES",
+    "ita": "IT",
+    "nld": "NL",
+    "por": "PT",
+    "ell": "EL",
+    "dan": "DA",
+    "swe": "SV",
+    "fin": "FI",
+    "pol": "PL",
+    "ces": "CS",
+    "slk": "SK",
+    "slv": "SL",
+    "hun": "HU",
+    "ron": "RO",
+    "bul": "BG",
+    "hrv": "HR",
+    "est": "ET",
+    "lav": "LV",
+    "lit": "LT",
+    "mlt": "MT",
+    "gle": "GA",
+}
+
+
+def _url_lang(lang: str) -> str:
+    """Map a 3-letter ISO 639-3 code (or already-2-letter code) to EUR-Lex's URL code."""
+    if len(lang) == 2:
+        return lang.upper()
+    return _URL_LANG.get(lang.lower(), lang.upper())
+
+
+# Markers that identify EUR-Lex's anti-bot challenge page. The page is served
+# with HTTP 200, so we have to recognize it by body content. Any of these
+# substrings (case-insensitive) in the response means the WAF caught us and
+# the body is NOT real content — discard it so the file stays missing and a
+# later re-run can retry from a fresh IP.
+_WAF_MARKERS: tuple[bytes, ...] = (
+    b"not a robot",
+    b"JavaScript is disabled",
+)
+
+
+def _looks_like_waf(content: bytes) -> bool:
+    if not content:
+        return False
+    # Cheap fast-path: the challenge page is tiny (<2 KB). Skip the substring
+    # scan on responses that are obviously real content.
+    if len(content) > 8192:
+        return False
+    lowered = content.lower()
+    return any(marker.lower() in lowered for marker in _WAF_MARKERS)
+
 
 class CaseScraper:
 
-    def __init__(self, proxy: str | None = None):
+    def __init__(self, proxy: str | None = None, proxy_pool_size: int = 20000):
+        """
+        proxy: a proxy URL. May contain "{n}" as a placeholder; if present, a
+               random integer in [1, proxy_pool_size] is substituted per request.
+               Example for Webshare rotating residential (per-username sessions):
+                   http://USER-{n}:PASS@p.webshare.io:80
+        """
         self.ua = UserAgent()
-        self.proxy = proxy
+        self.proxy_template = proxy
+        self.proxy_pool_size = proxy_pool_size
+
+    def _proxy_url(self) -> str | None:
+        if not self.proxy_template:
+            return None
+        if "{n}" in self.proxy_template:
+            n = random.randint(1, self.proxy_pool_size)
+            return self.proxy_template.replace("{n}", str(n))
+        return self.proxy_template
 
     async def save_bytes(self, path: Path, data: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -34,10 +108,14 @@ class CaseScraper:
                 url,
                 headers=headers,
                 cookies=cookies,
-                proxy=self.proxy,
+                proxy=self._proxy_url(),
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 content = await resp.read()
+                if _looks_like_waf(content):
+                    # Treat WAF challenge pages as a failure so they don't
+                    # get saved to disk and the case can be retried later.
+                    return None, resp.status
                 return content, resp.status
         except Exception:
             return None, None
@@ -91,7 +169,7 @@ class CaseScraper:
     ) -> bytes | None:
         """Fetch metadata content for a specific language."""
         headers = self._build_headers("text/html,application/xhtml+xml,application/xml")
-        url = f"https://eur-lex.europa.eu/legal-content/{lang}/TXT/XML/?uri=CELEX:{case_id}"
+        url = f"https://eur-lex.europa.eu/legal-content/{_url_lang(lang)}/TXT/XML/?uri=CELEX:{case_id}"
         content, status = await self.fetch_single(session, url, headers)
         if content and status != 404:
             return content
@@ -105,7 +183,7 @@ class CaseScraper:
     ) -> bytes | None:
         """Fetch judgment content for a specific language."""
         headers = self._build_headers("text/html,application/xhtml+xml")
-        url = f"https://eur-lex.europa.eu/legal-content/{lang}/TXT/HTML/?uri=CELEX:{case_id}"
+        url = f"https://eur-lex.europa.eu/legal-content/{_url_lang(lang)}/TXT/HTML/?uri=CELEX:{case_id}"
         content, status = await self.fetch_single(session, url, headers)
         if content and status != 404:
             return content

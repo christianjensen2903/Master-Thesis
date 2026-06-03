@@ -66,10 +66,10 @@ async def scrape_many_async(
 
 
 def main() -> None:
-    celex_file = Path("artifacts/missing_cj_summaries.txt")
+    celex_file = Path("cj_cases_2022-2026.txt")
     output_dir = Path("judgments")
-    max_concurrency = 5
-    base_delay = 0.5  # seconds
+    max_concurrency = 8
+    base_delay = 0.2  # seconds
     jitter = 0.3  # additional random delay in [0, jitter]
 
     dotenv.load_dotenv()
@@ -77,6 +77,16 @@ def main() -> None:
 
     with celex_file.open("r", encoding="utf-8") as f:
         ids = [line.strip() for line in f if line.strip()]
+
+    # Skip cases whose folder already exists — assume they're done.
+    # Delete a case folder (or specific files inside it) to force re-scraping.
+    before = len(ids)
+    ids = [cid for cid in ids if not (output_dir / cid).exists()]
+    skipped = before - len(ids)
+    print(f"Skipping {skipped} already-scraped cases; {len(ids)} remaining.")
+
+    if not ids:
+        return
 
     asyncio.run(
         scrape_many_async(

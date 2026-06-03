@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Final
 
@@ -8,7 +9,30 @@ from dotenv import load_dotenv
 from tqdm import tqdm  # type: ignore
 
 from eur_lex_client import EurLexClient
-from eur_lex_rdf import parse_celex_ids_from_search_xml
+
+
+def _local(tag: str) -> str:
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def parse_celex_ids_from_search_xml(xml_text: str) -> list[str]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as err:
+        raise ValueError(f"Invalid XML provided: {err}") from err
+
+    celex_ids: list[str] = []
+    for elem in root.iter():
+        if _local(elem.tag) == "ID_CELEX":
+            for child in elem:
+                if _local(child.tag) == "VALUE" and child.text:
+                    value = child.text.strip()
+                    if value and value not in celex_ids:
+                        celex_ids.append(value)
+                    break
+    return celex_ids
 
 
 class CelexIdCollector:
@@ -31,7 +55,7 @@ class CelexIdCollector:
 
     def retrieve_all_cases(self) -> None:
         all_case_ids: set[str] = set()
-        years = range(1954, 2026)  # 2025 included
+        years = range(2022, 2027)  # 2022–2026 inclusive
 
         # Create progress bar for years
         with tqdm(total=len(years), desc="Processing years", unit="year") as pbar:
@@ -97,7 +121,7 @@ class CelexIdCollector:
 
 def main() -> None:
     """Main function to run the case retriever."""
-    retriever = CelexIdCollector()
+    retriever = CelexIdCollector(output_file="cj_cases_2022-2026.txt")
     retriever.retrieve_all_cases()
 
 
