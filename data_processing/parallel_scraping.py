@@ -66,22 +66,33 @@ async def scrape_many_async(
 
 
 def main() -> None:
-    celex_file = Path("cj_cases_2022-2026.txt")
+    # Optional CLI arg: path to a file with one CELEX id per line.
+    # Defaults to the cited-cases list produced by collect_cited_celexes.py.
+    import sys
+
+    celex_file = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("cited_cases_to_scrape.txt")
     output_dir = Path("judgments")
-    max_concurrency = 8
-    base_delay = 0.2  # seconds
-    jitter = 0.3  # additional random delay in [0, jitter]
+    max_concurrency = 1
+    base_delay = 0.05  # seconds
+    jitter = 0.15  # additional random delay in [0, jitter]
 
     dotenv.load_dotenv()
-    proxy = os.getenv("PROXY")
+    # Proxy disabled for now — scrape directly.
+    proxy = None
 
     with celex_file.open("r", encoding="utf-8") as f:
         ids = [line.strip() for line in f if line.strip()]
 
-    # Skip cases whose folder already exists — assume they're done.
-    # Delete a case folder (or specific files inside it) to force re-scraping.
+    # Skip cases whose folder already exists AND is non-empty. scrape_case
+    # creates the folder before fetching, so a fully-failed case (WAF/timeout)
+    # leaves an empty folder behind; skipping only non-empty folders lets those
+    # be retried on a re-run instead of being locked in as permanently "done".
+    def _already_done(cid: str) -> bool:
+        d = output_dir / cid
+        return d.exists() and any(d.iterdir())
+
     before = len(ids)
-    ids = [cid for cid in ids if not (output_dir / cid).exists()]
+    ids = [cid for cid in ids if not _already_done(cid)]
     skipped = before - len(ids)
     print(f"Skipping {skipped} already-scraped cases; {len(ids)} remaining.")
 

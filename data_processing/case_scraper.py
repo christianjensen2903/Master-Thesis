@@ -71,6 +71,20 @@ def _looks_like_waf(content: bytes) -> bool:
     return any(marker.lower() in lowered for marker in _WAF_MARKERS)
 
 
+# When a judgment has no HTML rendition in the requested language (only a PDF),
+# EUR-Lex returns HTTP 200 with a full-page navigation shell that displays a PDF
+# notice instead of the judgment text. The body is a large (~80 KB) page chrome
+# with no numbered paragraphs, so it must be recognized by content. This class is
+# only present on those PDF-only shell pages, never on real HTML judgments.
+_PDF_SHELL_MARKER: bytes = b"subtitle-extraction-info-pdf"
+
+
+def _looks_like_pdf_only_shell(content: bytes) -> bool:
+    if not content:
+        return False
+    return _PDF_SHELL_MARKER in content.lower()
+
+
 class CaseScraper:
 
     def __init__(self, proxy: str | None = None, proxy_pool_size: int = 20000):
@@ -102,23 +116,48 @@ class CaseScraper:
         session: aiohttp.ClientSession,
         url: str,
         headers: dict,
+        max_retries: int = 4,
+        base_backoff: float = 2.5,
     ) -> tuple[bytes | None, int | None]:
-        try:
-            async with session.get(
-                url,
-                headers=headers,
-                cookies=cookies,
-                proxy=self._proxy_url(),
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                content = await resp.read()
-                if _looks_like_waf(content):
-                    # Treat WAF challenge pages as a failure so they don't
-                    # get saved to disk and the case can be retried later.
-                    return None, resp.status
-                return content, resp.status
-        except Exception:
-            return None, None
+        """Fetch a URL, retrying on WAF challenges and transient errors.
+
+        EUR-Lex's anti-bot WAF throttles bursts (especially when scraping
+        directly without a rotating proxy). Those challenge pages are
+        transient, so on detection we back off exponentially and retry rather
+        than giving up. A genuine 404 is returned immediately (not retried).
+        """
+        last_status: int | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    cookies=cookies,
+                    proxy=self._proxy_url(),
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    content = await resp.read()
+                    last_status = resp.status
+                    if resp.status == 404:
+                        # Genuine "not found" — no point retrying.
+                        return content, resp.status
+                    if _looks_like_waf(content):
+                        # Throttled: back off and retry from a fresh request.
+                        if attempt < max_retries:
+                            await asyncio.sleep(
+                                base_backoff * (2**attempt) + random.uniform(0.0, 1.0)
+                            )
+                            continue
+                        return None, resp.status
+                    return content, resp.status
+            except Exception:
+                if attempt < max_retries:
+                    await asyncio.sleep(
+                        base_backoff * (2**attempt) + random.uniform(0.0, 1.0)
+                    )
+                    continue
+                return None, last_status
+        return None, last_status
 
     def _build_headers(self, accept: str) -> dict[str, str]:
         headers: dict[str, str] = {
@@ -185,7 +224,7 @@ class CaseScraper:
         headers = self._build_headers("text/html,application/xhtml+xml")
         url = f"https://eur-lex.europa.eu/legal-content/{_url_lang(lang)}/TXT/HTML/?uri=CELEX:{case_id}"
         content, status = await self.fetch_single(session, url, headers)
-        if content and status != 404:
+        if content and status != 404 and not _looks_like_pdf_only_shell(content):
             return content
         return None
 
